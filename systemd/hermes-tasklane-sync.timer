@@ -1,0 +1,10 @@
+[Unit]
+Description=Run hermes-tasklane sync every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=hermes-tasklane-sync.service
+
+[Install]
+WantedBy=timers.target

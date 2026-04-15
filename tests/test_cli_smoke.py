@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from hermes_tasklane.cli import command_init, command_sync, load_config, load_state
+from hermes_tasklane import cli
+from hermes_tasklane.cli import command_init, command_reconcile, command_sync, load_config, load_state
 
 
 def write_config(path: Path, *, hermes_home: Path, task_root: Path) -> None:
@@ -59,3 +60,52 @@ def test_sync_moves_inbox_task_to_submitted_and_writes_queue_payload(tmp_path: P
     assert payload["metadata"]["source"] == "tasklane-file-bridge"
     state = load_state(cfg)
     assert len(state["submitted"]) == 1
+
+
+def test_reconcile_keeps_pending_delivery_run_submitted(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    submitted_task = task_root / "submitted" / "demo.md"
+    submitted_task.parent.mkdir(parents=True, exist_ok=True)
+    submitted_task.write_text("demo task\n", encoding="utf-8")
+
+    run_id = "tasklane_demo_pending"
+    run_payload = {
+        "id": run_id,
+        "kind": "coding_task",
+        "state": "blocked",
+        "repo": {"key": "repo:///tmp/demo", "path": "/tmp/demo", "working_branch": "feat/demo"},
+        "workflow": {"current_stage": "monitoring_ci", "issue_id": None, "stage_history": []},
+        "blocked_reason": "ci-pending",
+        "metadata": {},
+    }
+    (hermes_home / "runs").mkdir(parents=True, exist_ok=True)
+    (hermes_home / "runs" / f"{run_id}.json").write_text(json.dumps(run_payload), encoding="utf-8")
+
+    state = {
+        "submitted": {
+            "demo-uid": {
+                "source_path": str(submitted_task),
+                "original_name": "demo.md",
+                "run_id": run_id,
+                "queue_file": "/tmp/demo.json",
+                "repo_key": "repo:///tmp/demo",
+                "submitted_at": "2026-01-01T00:00:00+00:00",
+            }
+        }
+    }
+    (task_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    monkeypatch.setattr(cli, "reconcile_delivery", lambda cfg, rid, payload: {"status": "blocked", "ci": {"status": "pending"}})
+
+    command_reconcile(cfg)
+
+    post_state = load_state(cfg)
+    assert "demo-uid" in post_state["submitted"]
+    assert submitted_task.exists()
+    assert not list((task_root / "failed").glob("demo.md"))

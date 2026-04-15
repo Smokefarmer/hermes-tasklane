@@ -612,7 +612,21 @@ def command_reconcile(cfg: Config) -> int:
             finalize_submitted_task(cfg, task_uid, entry, cfg.completed_dir, {"run_id": run_id, "state": run_state, "result_preview": run_payload.get("result_preview")})
             actions.append({"task_uid": task_uid, "status": "completed", "run_id": run_id})
             continue
-        if run_state == "failed" or run_state == "blocked":
+        if run_state == "blocked":
+            current_stage = str(((run_payload.get("workflow") or {}).get("current_stage") or "")).lower()
+            current_blocked_reason = str(run_payload.get("blocked_reason") or "").lower()
+            if current_blocked_reason in DELIVERY_BLOCKERS and current_stage in {"opening_pr", "monitoring_ci", "ready_for_review"}:
+                remaining[task_uid] = entry
+                actions.append(
+                    {
+                        "task_uid": task_uid,
+                        "status": "waiting-delivery",
+                        "run_id": run_id,
+                        "blocked_reason": run_payload.get("blocked_reason"),
+                        "stage": (run_payload.get("workflow") or {}).get("current_stage"),
+                    }
+                )
+                continue
             finalize_submitted_task(cfg, task_uid, entry, cfg.failed_dir, {"run_id": run_id, "state": run_state, "blocked_reason": run_payload.get("blocked_reason"), "error": run_payload.get("error")})
             actions.append({"task_uid": task_uid, "status": "failed", "run_id": run_id, "blocked_reason": run_payload.get("blocked_reason")})
             continue

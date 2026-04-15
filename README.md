@@ -42,6 +42,18 @@ You still need a Hermes install with:
 
 ## Install
 
+### Fast path
+
+```bash
+git clone https://github.com/Smokefarmer/hermes-tasklane.git
+cd hermes-tasklane
+./scripts/install.sh --systemd
+```
+
+That installs the package, initializes config and folders, and enables user-level systemd timers when available. If the machine has no usable user systemd session, the installer skips timers cleanly and you can use the cron fallback instead.
+
+### Manual path
+
 ### 1. Clone the repo
 
 ```bash
@@ -133,9 +145,19 @@ This:
 hermes-tasklane status
 ```
 
-## Recommended cron setup
+## Recommended automation
 
-Run both of these periodically:
+### systemd user timers (recommended)
+
+```bash
+./scripts/install.sh --systemd
+systemctl --user status hermes-tasklane-sync.timer
+systemctl --user status hermes-tasklane-reconcile.timer
+```
+
+### cron fallback
+
+If you do not use systemd user timers, run both of these periodically:
 
 ```bash
 */5 * * * * /usr/bin/env hermes-tasklane sync
@@ -256,6 +278,12 @@ An inbox directory of text files is enough.
 4. Drop tasks into `inbox/`.
 5. Run `sync` + `reconcile` on a timer.
 6. Let Hermes do the implementation work.
+
+## Tell another Hermes to install it
+
+A ready-to-paste install prompt for another Hermes instance lives in:
+
+- `docs/hermes-install-prompt.md`
 
 ## Development
 

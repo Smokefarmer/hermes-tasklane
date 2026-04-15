@@ -12,6 +12,14 @@
 ```bash
 git clone https://github.com/Smokefarmer/hermes-tasklane.git
 cd hermes-tasklane
+./scripts/install.sh --systemd
+```
+
+## Manual install
+
+```bash
+git clone https://github.com/Smokefarmer/hermes-tasklane.git
+cd hermes-tasklane
 python3 -m pip install .
 hermes-tasklane init
 hermes-tasklane doctor
@@ -35,6 +43,28 @@ Example:
   "max_pending_per_repo": 1,
   "github_owner_hint": "your-github-user"
 }
+```
+
+## Systemd user units
+
+The repo ships ready-made user units in `systemd/` and the installer can place them automatically. During install, the script resolves the absolute `hermes-tasklane` executable path and writes it into the unit files so the timers still work even when `~/.local/bin` is not in the systemd user PATH.
+
+```bash
+./scripts/install.sh --systemd
+```
+
+Manual setup is also possible by copying the files from `systemd/` into:
+
+```text
+~/.config/systemd/user/
+```
+
+Then:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-tasklane-sync.timer
+systemctl --user enable --now hermes-tasklane-reconcile.timer
 ```
 
 ## Cron example
