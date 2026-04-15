@@ -1,0 +1,7 @@
+{
+  "hermes_home": "/home/your-user/.hermes",
+  "task_root": "/home/your-user/.local/share/hermes-tasklane",
+  "poll_repo_idle": true,
+  "max_pending_per_repo": 1,
+  "github_owner_hint": "your-github-user"
+}
