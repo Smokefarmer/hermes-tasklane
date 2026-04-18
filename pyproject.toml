@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hermes-tasklane"
 version = "0.1.0"
-description = "File-based task inbox and delivery reconciliation for Hermes governed runs"
+description = "File-based task inbox and delivery reconciliation for Hermes JobStore runs"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

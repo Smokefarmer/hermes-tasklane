@@ -4,7 +4,7 @@
 
 - Python 3.10+
 - Hermes already installed
-- Hermes queue watcher enabled
+- Hermes v10 JobStore watcher enabled in the gateway
 - Git configured for the repos you want to automate
 
 ## Minimal install

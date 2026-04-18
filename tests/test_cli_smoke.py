@@ -33,7 +33,7 @@ def test_init_writes_example_outside_inbox(tmp_path: Path) -> None:
     assert not (task_root / "inbox" / "example-task.md").exists()
 
 
-def test_sync_moves_inbox_task_to_submitted_and_writes_queue_payload(tmp_path: Path) -> None:
+def test_sync_moves_inbox_task_to_submitted_and_writes_jobstore_record(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"
     config_path = tmp_path / "config.json"
@@ -53,13 +53,93 @@ def test_sync_moves_inbox_task_to_submitted_and_writes_queue_payload(tmp_path: P
 
     submitted_task = task_root / "submitted" / "demo.md"
     assert submitted_task.exists()
-    incoming = list((hermes_home / "autocode_queue" / "incoming").glob("*.json"))
-    assert len(incoming) == 1
-    payload = json.loads(incoming[0].read_text(encoding="utf-8"))
-    assert payload["task"] == "Implement the demo task."
-    assert payload["metadata"]["source"] == "tasklane-file-bridge"
+    ready = list((hermes_home / "jobs" / "ready").glob("*.json"))
+    assert len(ready) == 1
+    payload = json.loads(ready[0].read_text(encoding="utf-8"))
+    assert payload["state"] == "ready"
+    assert payload["spec"]["request"]["body"] == "Implement the demo task."
+    assert payload["spec"]["request"]["type"] == "task-small"
+    assert payload["spec"]["branch"]["mode"] == "new-branch"
+    assert payload["spec"]["branch"]["base_branch"] == "main"
+    assert payload["spec"]["branch"]["pr_target"] == "main"
+    assert payload["spec"]["delivery_mode"] == "pull-request"
     state = load_state(cfg)
     assert len(state["submitted"]) == 1
+    entry = next(iter(state["submitted"].values()))
+    assert entry["job_id"] == payload["id"]
+
+
+def test_sync_supports_scope_and_mode_frontmatter(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_file = task_root / "inbox" / "demo.md"
+    task_file.write_text(
+        f"---\nrepo_path: {repo}\nbase_branch: development\nwork_branch: tasklane/demo\nrequest_type: feature\ndelivery_mode: pr\nallowed_paths: README.md, docs/usage.md\nallow_unlisted_paths: false\nreview_loops: 2\nsecurity_review: false\n---\nImplement the demo task.\n",
+        encoding="utf-8",
+    )
+
+    command_sync(cfg)
+
+    ready = list((hermes_home / "jobs" / "ready").glob("*.json"))
+    payload = json.loads(ready[0].read_text(encoding="utf-8"))
+    spec = payload["spec"]
+    assert spec["request"]["type"] == "feature-large"
+    assert spec["branch"]["work_branch"] == "tasklane/demo"
+    assert spec["scope"]["allowed_paths"] == ["README.md", "docs/usage.md"]
+    assert spec["scope"]["allow_unlisted_paths"] is False
+    assert spec["pipeline"]["budgets"]["review_loops"] == 2
+    assert spec["pipeline"]["security_review"] is False
+
+
+def test_reconcile_moves_completed_job_to_completed(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    submitted_task = task_root / "submitted" / "demo.md"
+    submitted_task.parent.mkdir(parents=True, exist_ok=True)
+    submitted_task.write_text("demo task\n", encoding="utf-8")
+
+    job_id = "tasklane_done"
+    job_payload = {
+        "id": job_id,
+        "state": "completed",
+        "spec": {"repo": {"key": "repo:///tmp/demo"}, "request": {"title": "Demo"}},
+        "result": {"final_response": "done"},
+    }
+    (hermes_home / "jobs" / "completed").mkdir(parents=True, exist_ok=True)
+    (hermes_home / "jobs" / "completed" / f"{job_id}.json").write_text(json.dumps(job_payload), encoding="utf-8")
+
+    state = {
+        "submitted": {
+            "demo-uid": {
+                "source_path": str(submitted_task),
+                "original_name": "demo.md",
+                "job_id": job_id,
+                "repo_key": "repo:///tmp/demo",
+                "submitted_at": "2026-01-01T00:00:00+00:00",
+            }
+        }
+    }
+    (task_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    command_reconcile(cfg)
+
+    assert not load_state(cfg)["submitted"]
+    assert (task_root / "completed" / "demo.md").exists()
+    result = json.loads((task_root / "completed" / "demo.md.result.json").read_text(encoding="utf-8"))
+    assert result["job_id"] == job_id
+    assert result["state"] == "completed"
 
 
 def test_reconcile_keeps_pending_delivery_run_submitted(tmp_path: Path, monkeypatch) -> None:

@@ -26,6 +26,8 @@ DELIVERY_BLOCKERS = {
     "ci-pending",
 }
 ACTIVE_RUN_STATES = {"queued", "running"}
+ACTIVE_JOB_STATES = {"ready", "running"}
+JOB_STATES = {"draft", "ready", "running", "blocked", "completed", "failed", "needs-human"}
 TASK_SUFFIXES = {".md", ".txt"}
 
 
@@ -79,24 +81,16 @@ class Config:
         return self.task_root / "state.json"
 
     @property
-    def queue_base(self) -> Path:
-        return self.hermes_home / "autocode_queue"
+    def jobs_dir(self) -> Path:
+        return self.hermes_home / "jobs"
 
     @property
-    def incoming_dir(self) -> Path:
-        return self.queue_base / "incoming"
+    def job_events_dir(self) -> Path:
+        return self.jobs_dir / "events"
 
     @property
-    def processing_dir(self) -> Path:
-        return self.queue_base / "processing"
-
-    @property
-    def queue_completed_dir(self) -> Path:
-        return self.queue_base / "completed"
-
-    @property
-    def queue_failed_dir(self) -> Path:
-        return self.queue_base / "failed"
+    def job_locks_dir(self) -> Path:
+        return self.jobs_dir / "locks"
 
     @property
     def runs_dir(self) -> Path:
@@ -139,13 +133,13 @@ def ensure_layout(cfg: Config) -> None:
         cfg.completed_dir,
         cfg.failed_dir,
         cfg.cancelled_dir,
-        cfg.incoming_dir,
-        cfg.processing_dir,
-        cfg.queue_completed_dir,
-        cfg.queue_failed_dir,
         cfg.runs_dir,
+        cfg.job_events_dir,
+        cfg.job_locks_dir,
     ]:
         path.mkdir(parents=True, exist_ok=True)
+    for state in JOB_STATES:
+        (cfg.jobs_dir / state).mkdir(parents=True, exist_ok=True)
 
 
 def load_state(cfg: Config) -> dict[str, Any]:
@@ -180,18 +174,94 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     return meta, body.strip()
 
 
+def slugify(value: str, fallback: str = "task") -> str:
+    return re.sub(r"[^a-z0-9._-]+", "-", value.lower()).strip("-._") or fallback
+
+
+def normalize_choice(value: str | None, aliases: dict[str, str], default: str) -> str:
+    if not value:
+        return default
+    key = " ".join(value.strip().lower().replace("_", " ").replace("-", " ").split()).replace(" ", "-")
+    if key not in aliases:
+        raise ValueError(f"unsupported value {value!r}; expected one of: {', '.join(sorted(set(aliases.values())))}")
+    return aliases[key]
+
+
+def parse_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_bool(value: str | None, *, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    text = value.strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value {value!r}")
+
+
+REQUEST_TYPE_ALIASES = {
+    "bug": "bug-small",
+    "bugfix": "bug-small",
+    "bug-small": "bug-small",
+    "task": "task-small",
+    "task-small": "task-small",
+    "feature": "feature-large",
+    "feature-large": "feature-large",
+    "refactor": "refactor-large",
+    "refactor-large": "refactor-large",
+}
+
+BRANCH_MODE_ALIASES = {
+    "new": "new-branch",
+    "new-branch": "new-branch",
+    "existing": "existing-branch",
+    "existing-branch": "existing-branch",
+    "detached": "detached-review",
+    "detached-review": "detached-review",
+    "review": "detached-review",
+}
+
+DELIVERY_MODE_ALIASES = {
+    "direct": "direct-push",
+    "direct-push": "direct-push",
+    "push": "direct-push",
+    "pr": "pull-request",
+    "pull-request": "pull-request",
+    "pullrequest": "pull-request",
+    "pr-required": "pull-request",
+    "report": "report-only",
+    "report-only": "report-only",
+    "report-only-allowed": "report-only",
+}
+
+
 @dataclass
 class TaskFile:
     uid: str
     path: Path
     repo_path: Path
     base_branch: str
+    work_branch: str
+    branch_mode: str
+    delivery_mode: str
+    request_type: str
     prompt: str
     metadata: dict[str, Any]
     platform: str | None
     chat_id: str | None
     thread_id: str | None
     project: str | None
+    title: str
+    allowed_paths: list[str]
+    denied_paths: list[str]
+    allow_unlisted_paths: bool
+    review_loops: int
+    security_review: bool
 
 
 def load_task_file(path: Path) -> TaskFile:
@@ -204,17 +274,66 @@ def load_task_file(path: Path) -> TaskFile:
         raise ValueError(f"repo_path missing in {path}")
     base_branch = meta.get("branch_base") or meta.get("base_branch") or "main"
     uid = meta.get("id") or f"{path.stem}-{sha_id(str(path.resolve()))}"
+    branch_mode = normalize_choice(meta.get("branch_mode") or meta.get("mode"), BRANCH_MODE_ALIASES, "new-branch")
+    delivery_mode = normalize_choice(meta.get("delivery_mode") or meta.get("delivery"), DELIVERY_MODE_ALIASES, "pull-request")
+    request_type = normalize_choice(meta.get("request_type") or meta.get("type"), REQUEST_TYPE_ALIASES, "task-small")
+    work_branch = meta.get("work_branch") or meta.get("working_branch") or meta.get("branch")
+    if not work_branch and branch_mode == "new-branch":
+        work_branch = f"tasklane/{slugify(path.stem)}-{sha_id(uid)}"
+    if not work_branch and branch_mode == "existing-branch":
+        raise ValueError(f"work_branch is required for existing-branch tasks: {path}")
+    if delivery_mode == "pull-request" and branch_mode == "detached-review":
+        raise ValueError(f"pull-request delivery is not valid for detached-review tasks: {path}")
     return TaskFile(
         uid=uid,
         path=path,
         repo_path=repo_path,
         base_branch=base_branch,
+        work_branch=work_branch or "",
+        branch_mode=branch_mode,
+        delivery_mode=delivery_mode,
+        request_type=request_type,
         prompt=prompt,
-        metadata={k: v for k, v in meta.items() if k not in {"repo_path", "branch_base", "base_branch", "platform", "chat_id", "thread_id", "project", "id"}},
+        metadata={
+            k: v
+            for k, v in meta.items()
+            if k
+            not in {
+                "repo_path",
+                "branch_base",
+                "base_branch",
+                "work_branch",
+                "working_branch",
+                "branch",
+                "branch_mode",
+                "mode",
+                "delivery_mode",
+                "delivery",
+                "request_type",
+                "type",
+                "platform",
+                "chat_id",
+                "thread_id",
+                "project",
+                "id",
+                "title",
+                "allowed_paths",
+                "denied_paths",
+                "allow_unlisted_paths",
+                "review_loops",
+                "security_review",
+            }
+        },
         platform=meta.get("platform"),
         chat_id=meta.get("chat_id"),
         thread_id=meta.get("thread_id"),
         project=meta.get("project"),
+        title=meta.get("title") or path.stem.replace("-", " ").replace("_", " ").strip() or uid,
+        allowed_paths=parse_csv(meta.get("allowed_paths")),
+        denied_paths=parse_csv(meta.get("denied_paths")),
+        allow_unlisted_paths=parse_bool(meta.get("allow_unlisted_paths"), default=True),
+        review_loops=int(meta.get("review_loops") or 3),
+        security_review=parse_bool(meta.get("security_review"), default=True),
     )
 
 
@@ -266,48 +385,109 @@ def repo_lock_exists(cfg: Config, expected_repo_key: str) -> bool:
     return (cfg.repo_locks_dir / f"{digest}.json").exists()
 
 
-def pending_queue_items_for_repo(cfg: Config, expected_repo_key: str) -> list[dict[str, Any]]:
-    found: list[dict[str, Any]] = []
-    for directory in [cfg.incoming_dir, cfg.processing_dir]:
+def job_path(cfg: Config, job_id: str, state: str) -> Path:
+    return cfg.jobs_dir / state / f"{job_id}.json"
+
+
+def job_event_log_path(cfg: Config, job_id: str) -> Path:
+    return cfg.job_events_dir / f"{job_id}.jsonl"
+
+
+def iter_job_records(cfg: Config, states: set[str] | None = None) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    selected = states or JOB_STATES
+    for state in selected:
+        directory = cfg.jobs_dir / state
         if not directory.exists():
             continue
-        for path in directory.glob("*.json"):
+        for path in sorted(directory.glob("*.json")):
             payload = load_json(path)
-            if not isinstance(payload, dict):
-                continue
-            meta = payload.get("metadata") or {}
-            if meta.get("repo_key") == expected_repo_key:
-                found.append(payload)
-    return found
+            if isinstance(payload, dict):
+                records.append(payload)
+    return records
 
 
-def task_queue_filename(task: TaskFile) -> str:
-    base = re.sub(r"[^a-zA-Z0-9._-]+", "-", task.path.stem).strip("-") or "task"
-    return f"{base}-{sha_id(task.uid)}.json"
+def active_jobs_for_repo(cfg: Config, expected_repo_key: str) -> list[dict[str, Any]]:
+    active: list[dict[str, Any]] = []
+    for payload in iter_job_records(cfg, ACTIVE_JOB_STATES):
+        spec = payload.get("spec") or {}
+        if ((spec.get("repo") or {}).get("key") or "") == expected_repo_key:
+            active.append(payload)
+    return active
 
 
-def queue_payload(task: TaskFile, run_id: str) -> dict[str, Any]:
+def find_job_record(cfg: Config, job_id: str) -> dict[str, Any] | None:
+    for state in JOB_STATES:
+        payload = load_json(job_path(cfg, job_id, state))
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def job_spec(task: TaskFile, job_id: str) -> dict[str, Any]:
     repo_root = canonical_repo_path(task.repo_path)
-    payload: dict[str, Any] = {
-        "repo_path": str(repo_root),
-        "task": task.prompt,
-        "task_id": run_id,
-        "source_branch": task.base_branch,
+    source: dict[str, Any] = {
+        "type": "tasklane-file",
+        "label": task.project or repo_root.name,
+        "task_file": str(task.path),
+    }
+    if task.platform and task.chat_id:
+        source["type"] = task.platform
+        source["chat_id"] = task.chat_id
+        if task.thread_id:
+            source["thread_id"] = task.thread_id
+    return {
+        "schema_version": 1,
+        "id": job_id,
+        "source": source,
+        "project": task.project or repo_root.name,
+        "repo": {
+            "key": repo_key(repo_root),
+            "path": str(repo_root),
+        },
+        "request": {
+            "type": task.request_type,
+            "title": task.title,
+            "body": task.prompt,
+        },
+        "branch": {
+            "mode": task.branch_mode,
+            "base_branch": task.base_branch if task.branch_mode == "new-branch" else None,
+            "work_branch": task.work_branch or None,
+            "pr_target": task.base_branch if task.delivery_mode == "pull-request" else None,
+        },
+        "delivery_mode": task.delivery_mode,
+        "dependencies": parse_csv(str(task.metadata.get("dependencies") or "")),
+        "pipeline": {
+            "budgets": {"review_loops": task.review_loops},
+            "security_review": task.security_review,
+        },
+        "scope": {
+            "allowed_paths": task.allowed_paths,
+            "denied_paths": task.denied_paths,
+            "allow_unlisted_paths": task.allow_unlisted_paths,
+        },
         "metadata": {
             "source": "tasklane-file-bridge",
-            "summary": task.path.stem,
             "uid": task.uid,
-            "repo_key": repo_key(repo_root),
-            "project": task.project or repo_root.name,
+            "summary": task.path.stem,
             **task.metadata,
         },
     }
-    if task.platform and task.chat_id:
-        payload["platform"] = task.platform
-        payload["chat_id"] = task.chat_id
-        if task.thread_id:
-            payload["thread_id"] = task.thread_id
-    return payload
+
+
+def job_record(task: TaskFile, job_id: str) -> dict[str, Any]:
+    spec = job_spec(task, job_id)
+    timestamp = now_iso()
+    return {
+        "id": job_id,
+        "state": "ready",
+        "spec": spec,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "attempt": 0,
+        "last_error": None,
+    }
 
 
 def run_path(cfg: Config, run_id: str) -> Path:
@@ -333,7 +513,9 @@ def command_doctor(cfg: Config) -> int:
     report = {
         "hermes_home": str(cfg.hermes_home),
         "task_root": str(cfg.task_root),
-        "incoming_exists": cfg.incoming_dir.exists(),
+        "jobs_ready_exists": (cfg.jobs_dir / "ready").exists(),
+        "jobs_running_exists": (cfg.jobs_dir / "running").exists(),
+        "job_events_exists": cfg.job_events_dir.exists(),
         "runs_exists": cfg.runs_dir.exists(),
         "repo_locks_exists": cfg.repo_locks_dir.exists(),
         "inbox_files": len(list(cfg.inbox_dir.glob("*.md"))) + len(list(cfg.inbox_dir.glob("*.txt"))),
@@ -360,31 +542,35 @@ def command_sync(cfg: Config) -> int:
         expected_repo_key = repo_key(task.repo_path)
         if cfg.poll_repo_idle:
             active = active_runs_for_repo(cfg, expected_repo_key)
-            pending = pending_queue_items_for_repo(cfg, expected_repo_key)
+            active_jobs = active_jobs_for_repo(cfg, expected_repo_key)
             if active:
                 actions.append({"task": path.name, "status": "deferred", "reason": "repo-active-run", "run_ids": [item.get("id") for item in active]})
+                continue
+            if active_jobs:
+                actions.append({"task": path.name, "status": "deferred", "reason": "repo-active-job", "job_ids": [item.get("id") for item in active_jobs]})
                 continue
             if repo_lock_exists(cfg, expected_repo_key):
                 actions.append({"task": path.name, "status": "deferred", "reason": "repo-lock-active"})
                 continue
-            if len(pending) >= cfg.max_pending_per_repo:
-                actions.append({"task": path.name, "status": "deferred", "reason": "repo-pending-queue", "count": len(pending)})
-                continue
-        run_id = f"tasklane_{sha_id(task.uid)}"
-        payload = queue_payload(task, run_id)
-        filename = task_queue_filename(task)
-        queue_path = cfg.incoming_dir / filename
-        atomic_write_json(queue_path, payload)
+        job_id = f"tasklane_{sha_id(task.uid)}"
+        record = job_record(task, job_id)
+        ready_path = job_path(cfg, job_id, "ready")
+        if find_job_record(cfg, job_id):
+            actions.append({"task": path.name, "status": "already-job-recorded", "job_id": job_id})
+            continue
+        atomic_write_json(ready_path, record)
+        append_jsonl(job_event_log_path(cfg, job_id), {"timestamp": now_iso(), "job_id": job_id, "event_type": "job_created", "state": "ready", "reason": "tasklane-sync", "metadata": {"source_file": str(path)}})
         new_task_path = move_task_file(path, cfg.submitted_dir)
         submitted[task.uid] = {
             "source_path": str(new_task_path),
             "original_name": path.name,
-            "run_id": run_id,
-            "queue_file": str(queue_path),
-            "repo_key": payload["metadata"]["repo_key"],
+            "job_id": job_id,
+            "run_id": job_id,
+            "job_file": str(ready_path),
+            "repo_key": record["spec"]["repo"]["key"],
             "submitted_at": now_iso(),
         }
-        actions.append({"task": path.name, "status": "queued", "run_id": run_id, "queue_file": str(queue_path)})
+        actions.append({"task": path.name, "status": "job-ready", "job_id": job_id, "job_file": str(ready_path)})
     state["submitted"] = submitted
     save_state(cfg, state)
     print(json.dumps({"actions": actions}, indent=2))
@@ -593,13 +779,32 @@ def command_reconcile(cfg: Config) -> int:
     remaining: dict[str, Any] = {}
     actions: list[dict[str, Any]] = []
     for task_uid, entry in submitted.items():
-        run_id = entry.get("run_id")
-        if not run_id:
-            actions.append({"task_uid": task_uid, "status": "missing-run-id"})
+        job_id = entry.get("job_id") or entry.get("run_id")
+        run_id = entry.get("run_id") or job_id
+        if not job_id:
+            actions.append({"task_uid": task_uid, "status": "missing-job-id"})
             continue
+        job_payload = find_job_record(cfg, job_id)
+        if isinstance(job_payload, dict):
+            job_state = str(job_payload.get("state") or "").lower()
+            if job_state == "completed":
+                result = dict(job_payload.get("result") or {})
+                finalize_submitted_task(cfg, task_uid, entry, cfg.completed_dir, {"job_id": job_id, "state": job_state, "result": result})
+                actions.append({"task_uid": task_uid, "status": "completed", "job_id": job_id})
+                continue
+            if job_state == "failed":
+                finalize_submitted_task(cfg, task_uid, entry, cfg.failed_dir, {"job_id": job_id, "state": job_state, "error": job_payload.get("last_error")})
+                actions.append({"task_uid": task_uid, "status": "failed", "job_id": job_id, "error": job_payload.get("last_error")})
+                continue
+            if job_state in {"ready", "running", "blocked", "needs-human"}:
+                remaining[task_uid] = entry
+                actions.append({"task_uid": task_uid, "status": "still-active", "job_id": job_id, "job_state": job_state, "error": job_payload.get("last_error")})
+                continue
+        # Backward compatibility for tasklane submissions created before the
+        # Hermes v10 JobStore migration.
         run_payload = load_json(run_path(cfg, run_id))
         if not isinstance(run_payload, dict):
-            actions.append({"task_uid": task_uid, "status": "missing-run-record"})
+            actions.append({"task_uid": task_uid, "status": "missing-job-record"})
             remaining[task_uid] = entry
             continue
         run_state = str(run_payload.get("state") or "").lower()
@@ -648,6 +853,8 @@ def command_status(cfg: Config) -> int:
     submitted = dict(state.get("submitted") or {})
     active_runs: list[dict[str, Any]] = []
     blocked_runs: list[dict[str, Any]] = []
+    active_jobs: list[dict[str, Any]] = []
+    blocked_jobs: list[dict[str, Any]] = []
     for path in cfg.runs_dir.glob("*.json"):
         payload = load_json(path)
         if not isinstance(payload, dict) or payload.get("kind") != "coding_task":
@@ -663,12 +870,28 @@ def command_status(cfg: Config) -> int:
             active_runs.append(item)
         if item["state"] == "blocked":
             blocked_runs.append(item)
+    for payload in iter_job_records(cfg, {"ready", "running", "blocked", "needs-human"}):
+        spec = payload.get("spec") or {}
+        item = {
+            "id": payload.get("id"),
+            "state": payload.get("state"),
+            "repo_key": ((spec.get("repo") or {}).get("key")),
+            "project": spec.get("project"),
+            "title": ((spec.get("request") or {}).get("title")),
+            "error": payload.get("last_error"),
+        }
+        if item["state"] in {"ready", "running"}:
+            active_jobs.append(item)
+        if item["state"] in {"blocked", "needs-human"}:
+            blocked_jobs.append(item)
     report = {
         "inbox": len([p for p in cfg.inbox_dir.iterdir() if p.is_file()]) if cfg.inbox_dir.exists() else 0,
         "submitted": len(submitted),
         "completed": len([p for p in cfg.completed_dir.iterdir() if p.is_file() and p.suffix in TASK_SUFFIXES]) if cfg.completed_dir.exists() else 0,
         "failed": len([p for p in cfg.failed_dir.iterdir() if p.is_file() and p.suffix in TASK_SUFFIXES]) if cfg.failed_dir.exists() else 0,
         "cancelled": len([p for p in cfg.cancelled_dir.iterdir() if p.is_file() and p.suffix in TASK_SUFFIXES]) if cfg.cancelled_dir.exists() else 0,
+        "active_jobs": active_jobs,
+        "blocked_jobs": blocked_jobs,
         "active_runs": active_runs,
         "blocked_runs": blocked_runs,
     }
@@ -696,7 +919,7 @@ def command_init(cfg: Config, config_path_override: str | None = None) -> int:
     example = examples_dir / "example-task.md"
     if not example.exists():
         example.write_text(
-            "---\nrepo_path: /absolute/path/to/repo\nbranch_base: main\nplatform: telegram\nchat_id: -1001234567890\nproject: Example\n---\nImplement the task here and run the strongest relevant verification before opening a PR.\n",
+            "---\nrepo_path: /absolute/path/to/repo\nbase_branch: main\nbranch_mode: new-branch\ndelivery_mode: pull-request\nrequest_type: task-small\nplatform: telegram\nchat_id: -1001234567890\nproject: Example\nallowed_paths: README.md\nallow_unlisted_paths: false\n---\nImplement the task here and run the strongest relevant verification before opening a PR.\n",
             encoding="utf-8",
         )
     print(json.dumps({"config": str(config_path), "task_root": str(cfg.task_root), "example_task": str(example)}, indent=2))

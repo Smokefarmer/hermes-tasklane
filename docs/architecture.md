@@ -1,6 +1,6 @@
 # Architecture
 
-`hermes-tasklane` sits in front of Hermes' existing autocode queue.
+`hermes-tasklane` sits in front of Hermes v10's file-backed JobStore.
 
 ## Inputs
 
@@ -20,10 +20,16 @@ Tasklane stores local submission state in:
 
 ## Hermes integration points
 
-Queue input:
+JobStore input:
 
 ```text
-~/.hermes/autocode_queue/incoming/*.json
+~/.hermes/jobs/ready/*.json
+```
+
+JobStore state:
+
+```text
+~/.hermes/jobs/{ready,running,blocked,completed,failed,needs-human}/*.json
 ```
 
 Governed run state:
@@ -43,18 +49,19 @@ Repo locks:
 1. `sync`
    - parse inbox files
    - derive repo key
-   - check active runs, locks, pending queue items
-   - write queue payload
+   - check active jobs, active runs, and repo locks
+   - write a JobStore record
    - move task file to `submitted/`
 
-2. Hermes executes the queue item
+2. Hermes gateway claims and executes the ready job
 
 3. `reconcile`
-   - inspect matching governed run
+   - inspect matching JobStore record
+   - fall back to governed run records for older submissions
    - normalize stale delivery blockers from GitHub reality when possible
    - move task file to `completed/`, `failed/`, or `cancelled/`
    - write a `.result.json` sidecar
 
 ## Why this approach works
 
-It keeps all source-of-truth task editing simple while reusing Hermes' governed execution model instead of rebuilding it.
+It keeps all source-of-truth task editing simple while reusing Hermes' gateway execution model instead of rebuilding it.

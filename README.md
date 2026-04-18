@@ -1,13 +1,13 @@
 # hermes-tasklane
 
-A polished, file-based task inbox for Hermes governed runs.
+A polished, file-based task inbox for Hermes v10 JobStore runs.
 
 `hermes-tasklane` gives you the useful parts of a production Hermes queue setup without forcing your team onto Nextcloud. Instead of CalDAV tasks, your teammates drop plain text/Markdown task files into an inbox folder. The package:
 
-- turns inbox files into Hermes autocode queue items
+- turns inbox files into Hermes JobStore records
 - gates submission so only one active coding run per repo is launched by default
 - tracks submitted tasks locally
-- reconciles tasks back out of governed run state
+- reconciles tasks back out of JobStore and governed run state
 - repairs common delivery-state drift by checking GitHub PR + CI reality
 
 It is designed for teams that already run Hermes and want a simple, shareable “task lane” on top.
@@ -19,15 +19,15 @@ It is designed for teams that already run Hermes and want a simple, shareable �
 - no Nextcloud dependency
 - one task file = one launchable governed run
 
-2. Safe queue bridging
-- writes Hermes queue payloads into `~/.hermes/autocode_queue/incoming/`
-- checks active governed runs
+2. Safe JobStore bridging
+- writes Hermes job records into `~/.hermes/jobs/ready/`
+- checks active JobStore jobs and governed runs
 - checks repo locks
-- checks pending queue items
 - avoids duplicate launches per repo by default
 
 3. Reconciliation helpers
-- watches governed run records in `~/.hermes/runs/`
+- watches JobStore records in `~/.hermes/jobs/`
+- keeps compatibility with governed run records in `~/.hermes/runs/`
 - moves submitted task files into `completed/`, `failed/`, or `cancelled/`
 - normalizes stale delivery blockers by checking GitHub PR + CI state
 
@@ -36,8 +36,7 @@ It is designed for teams that already run Hermes and want a simple, shareable �
 This is not a full replacement for Hermes itself.
 
 You still need a Hermes install with:
-- governed runs enabled
-- the autocode queue watcher active
+- the Hermes v10 JobStore watcher active in the gateway
 - Git + GitHub access configured for the repos you want Hermes to operate on
 
 ## Install
@@ -106,6 +105,9 @@ Drop a Markdown file into your inbox, for example:
 ---
 repo_path: /mnt/data/workspace/Alvin
 branch_base: develop
+branch_mode: new-branch
+delivery_mode: pull-request
+request_type: task-small
 platform: telegram
 chat_id: -5246337506
 project: Alvin
@@ -119,10 +121,10 @@ Fix the login flow regression, add or update focused tests, run the strongest re
 hermes-tasklane sync
 ```
 
-If the repo is idle, the task is converted into a queue payload under:
+If the repo is idle, the task is converted into a JobStore record under:
 
 ```text
-~/.hermes/autocode_queue/incoming/
+~/.hermes/jobs/ready/
 ```
 
 If the repo is busy, the task stays deferred in the inbox and will be eligible on the next sync.
@@ -134,7 +136,8 @@ hermes-tasklane reconcile
 ```
 
 This:
-- checks governed run state
+- checks JobStore state
+- checks legacy governed run state when needed
 - moves task files out of `submitted/`
 - writes a small `.result.json` note beside the moved task file
 - attempts delivery reconciliation for stale PR/CI blockers
@@ -175,12 +178,21 @@ Required fields:
 - `branch_base` or `base_branch`
 
 Optional fields:
+- `request_type`: `bug-small`, `task-small`, `feature-large`, or `refactor-large`
+- `branch_mode`: `new-branch`, `existing-branch`, or `detached-review`
+- `work_branch`: required for `existing-branch`, generated for `new-branch` when omitted
+- `delivery_mode`: `pull-request`, `direct-push`, or `report-only`
+- `allowed_paths`: comma-separated path allowlist
+- `denied_paths`: comma-separated path denylist
+- `allow_unlisted_paths`: `true` or `false`
+- `review_loops`: max self-review loops, default `3`
+- `security_review`: `true` or `false`
 - `platform`
 - `chat_id`
 - `thread_id`
 - `project`
 - `id`
-- any extra metadata fields you want copied into the queue payload metadata block
+- any extra metadata fields you want copied into local task metadata
 
 Example:
 
@@ -189,10 +201,15 @@ Example:
 id: invoice-export-hardening
 repo_path: /srv/work/finance-app
 branch_base: main
+branch_mode: new-branch
+delivery_mode: pull-request
+request_type: task-small
 project: Finance App
 platform: telegram
 chat_id: -1001234567890
 thread_id: 55
+allowed_paths: README.md, docs/
+allow_unlisted_paths: false
 priority: high
 owner: alice
 ---
@@ -208,13 +225,13 @@ Create config, folders, and an example task.
 Check whether the expected Hermes and tasklane directories exist.
 
 ### `hermes-tasklane sync`
-Read inbox files and write eligible Hermes queue payloads.
+Read inbox files and write eligible Hermes JobStore records.
 
 ### `hermes-tasklane reconcile`
-Reconcile submitted tasks from governed run state and attempt PR/CI normalization.
+Reconcile submitted tasks from JobStore/governed run state and attempt PR/CI normalization.
 
 ### `hermes-tasklane status`
-Show inbox/submitted/completed counts and current governed run states.
+Show inbox/submitted/completed counts and current JobStore/governed run states.
 
 ## Delivery reconciliation behavior
 
@@ -249,11 +266,11 @@ Markdown task file
       ↓
 hermes-tasklane sync
       ↓
-~/.hermes/autocode_queue/incoming/*.json
+~/.hermes/jobs/ready/*.json
       ↓
-Hermes queue watcher
+Hermes JobStore watcher
       ↓
-Governed run + PR + CI
+Agent run + PR + CI
       ↓
 hermes-tasklane reconcile
       ↓
@@ -295,7 +312,7 @@ hermes-tasklane doctor
 
 ## Safety note
 
-This package writes queue payloads for Hermes to execute. Only point it at repos and branches you actually want Hermes to work on.
+This package writes JobStore records for Hermes to execute. Only point it at repos and branches you actually want Hermes to work on.
 
 ## License
 
