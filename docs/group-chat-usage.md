@@ -88,6 +88,8 @@ For ten tasks that should become one PR:
 - give all ten the same `delivery_group`
 - give serial tasks stable IDs and `depends_on`
 - omit `depends_on` for tasks that do not require ordering
+- use `delivery_mode: direct-push` for implementation tasks
+- add one final integration task with `delivery_mode: pull-request` and `depends_on` all implementation task IDs
 
 For two big features:
 
@@ -108,7 +110,18 @@ delivery_group: checkout-v2
 ---
 id: checkout-api
 delivery_group: checkout-v2
+delivery_mode: direct-push
 depends_on: checkout-schema
+---
+```
+
+```md
+---
+id: checkout-final-pr
+delivery_group: checkout-v2
+branch_mode: existing-branch
+delivery_mode: pull-request
+depends_on: checkout-schema, checkout-api
 ---
 ```
 

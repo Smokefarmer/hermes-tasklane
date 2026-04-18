@@ -281,7 +281,7 @@ def load_task_file(path: Path) -> TaskFile:
     request_type = normalize_choice(meta.get("request_type") or meta.get("type"), REQUEST_TYPE_ALIASES, "task-small")
     work_branch = meta.get("work_branch") or meta.get("working_branch") or meta.get("branch")
     delivery_group = meta.get("delivery_group") or meta.get("pr_group") or meta.get("epic")
-    if not work_branch and delivery_group and branch_mode == "new-branch":
+    if not work_branch and delivery_group and branch_mode in {"new-branch", "existing-branch"}:
         work_branch = f"tasklane/{slugify(delivery_group)}"
     if not work_branch and branch_mode == "new-branch":
         work_branch = f"tasklane/{slugify(path.stem)}-{sha_id(uid)}"

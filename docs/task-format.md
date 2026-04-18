@@ -59,3 +59,4 @@ Clean up the auth flow, add regression tests, run verification, and prepare a co
 - Use the same `delivery_group` when multiple task files should land in one final PR.
 - Use different `delivery_group` values when two big features need separate PRs.
 - Use `depends_on` for serial work; omit it for work that can be scheduled independently.
+- For a many-task single-PR batch, use `direct-push` for implementation tasks and one final `pull-request` task that depends on all implementation tasks.

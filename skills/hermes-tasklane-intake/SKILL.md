@@ -34,13 +34,20 @@ Never choose `direct-push` unless the user explicitly says direct push is accept
 
 ## PR Grouping
 
-Use `delivery_group` to define final PR shape:
+Use `delivery_group` to define final branch/PR shape:
 
-- One final PR for many tasks: same `delivery_group`, same `base_branch`, same generated branch.
+- One final PR for many tasks: use one shared `delivery_group`.
 - Two big features: two different `delivery_group` values.
 - Independent small fixes with separate PRs: omit `delivery_group` or give each a different group.
 
 Current gateway execution is conservative and may run jobs serially even when tasks have no dependencies. Still model the dependency graph correctly so later concurrency can use it safely.
+
+For a many-task single-PR batch, prefer:
+
+1. Implementation tasks use the same `delivery_group` and `delivery_mode: direct-push`.
+2. The final integration/review task uses the same `delivery_group`, `branch_mode: existing-branch`, `delivery_mode: pull-request`, and `depends_on` all implementation task IDs.
+
+This avoids multiple jobs fighting to create or update the same PR.
 
 ## Dependencies
 
@@ -58,6 +65,7 @@ Rules:
 - A task that depends on another task must list that task's `id`.
 - Parallelizable tasks in the same PR group should omit `depends_on`.
 - Serial tasks in one PR group should all share `delivery_group` and form a dependency chain.
+- One-PR batches should have exactly one final PR-opening task.
 
 ## Task File Template
 
@@ -108,4 +116,3 @@ hermes jobs list --json
 ```
 
 7. Report the created job IDs and any deferred/invalid tasks.
-
