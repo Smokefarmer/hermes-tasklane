@@ -296,6 +296,10 @@ An inbox directory of text files is enough.
 5. Run `sync` + `reconcile` on a timer.
 6. Let Hermes do the implementation work.
 
+For group-chat usage before full production hardening, use:
+
+- `docs/group-chat-usage.md`
+
 ## Tell another Hermes to install it
 
 A ready-to-paste install prompt for another Hermes instance lives in:
