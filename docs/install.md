@@ -15,6 +15,14 @@ cd hermes-tasklane
 ./scripts/install.sh --systemd
 ```
 
+The installer also copies bundled Hermes skills to:
+
+```text
+~/.hermes/skills/software-development/
+```
+
+Pass `--no-skills` to skip that step.
+
 ## Manual install
 
 ```bash

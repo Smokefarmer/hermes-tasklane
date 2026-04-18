@@ -51,6 +51,14 @@ cd hermes-tasklane
 
 That installs the package, initializes config and folders, and enables user-level systemd timers when available. If the machine has no usable user systemd session, the installer skips timers cleanly and you can use the cron fallback instead.
 
+Bundled Hermes skills, including `hermes-tasklane-intake`, are installed to:
+
+```text
+~/.hermes/skills/software-development/
+```
+
+Use `--no-skills` if you only want the CLI.
+
 ### Manual path
 
 ### 1. Clone the repo
