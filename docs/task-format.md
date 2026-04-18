@@ -14,6 +14,8 @@ Each task is a `.md` or `.txt` file inside the inbox directory.
 - `branch_mode`: `new-branch`, `existing-branch`, or `detached-review`
 - `work_branch`: required for `existing-branch`, generated for `new-branch` when omitted
 - `delivery_mode`: `pull-request`, `direct-push`, or `report-only`
+- `delivery_group`: shared branch/PR group for multiple task files
+- `depends_on`: comma-separated task IDs that must complete first
 - `allowed_paths`: comma-separated path allowlist
 - `denied_paths`: comma-separated path denylist
 - `allow_unlisted_paths`: `true` or `false`
@@ -35,6 +37,7 @@ branch_base: main
 branch_mode: new-branch
 delivery_mode: pull-request
 request_type: task-small
+delivery_group: auth-cleanup
 project: App
 platform: telegram
 chat_id: -1001234567890
@@ -53,3 +56,6 @@ Clean up the auth flow, add regression tests, run verification, and prepare a co
 - If no explicit `id` is set, tasklane generates one from the file path.
 - New-branch pull-request delivery is the safest default for group-chat usage.
 - Use `direct-push` only for low-risk fixes on a pre-agreed branch.
+- Use the same `delivery_group` when multiple task files should land in one final PR.
+- Use different `delivery_group` values when two big features need separate PRs.
+- Use `depends_on` for serial work; omit it for work that can be scheduled independently.

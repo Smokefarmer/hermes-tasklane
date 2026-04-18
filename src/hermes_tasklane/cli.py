@@ -262,6 +262,8 @@ class TaskFile:
     allow_unlisted_paths: bool
     review_loops: int
     security_review: bool
+    dependencies: list[str]
+    delivery_group: str | None
 
 
 def load_task_file(path: Path) -> TaskFile:
@@ -278,6 +280,9 @@ def load_task_file(path: Path) -> TaskFile:
     delivery_mode = normalize_choice(meta.get("delivery_mode") or meta.get("delivery"), DELIVERY_MODE_ALIASES, "pull-request")
     request_type = normalize_choice(meta.get("request_type") or meta.get("type"), REQUEST_TYPE_ALIASES, "task-small")
     work_branch = meta.get("work_branch") or meta.get("working_branch") or meta.get("branch")
+    delivery_group = meta.get("delivery_group") or meta.get("pr_group") or meta.get("epic")
+    if not work_branch and delivery_group and branch_mode == "new-branch":
+        work_branch = f"tasklane/{slugify(delivery_group)}"
     if not work_branch and branch_mode == "new-branch":
         work_branch = f"tasklane/{slugify(path.stem)}-{sha_id(uid)}"
     if not work_branch and branch_mode == "existing-branch":
@@ -322,6 +327,11 @@ def load_task_file(path: Path) -> TaskFile:
                 "allow_unlisted_paths",
                 "review_loops",
                 "security_review",
+                "dependencies",
+                "depends_on",
+                "delivery_group",
+                "pr_group",
+                "epic",
             }
         },
         platform=meta.get("platform"),
@@ -334,6 +344,8 @@ def load_task_file(path: Path) -> TaskFile:
         allow_unlisted_paths=parse_bool(meta.get("allow_unlisted_paths"), default=True),
         review_loops=int(meta.get("review_loops") or 3),
         security_review=parse_bool(meta.get("security_review"), default=True),
+        dependencies=parse_csv(meta.get("dependencies") or meta.get("depends_on")),
+        delivery_group=delivery_group,
     )
 
 
@@ -424,6 +436,21 @@ def find_job_record(cfg: Config, job_id: str) -> dict[str, Any] | None:
     return None
 
 
+def task_job_id(task: TaskFile) -> str:
+    return f"tasklane_{sha_id(task.uid)}"
+
+
+def dependency_job_ids(task: TaskFile, uid_to_job_id: dict[str, str]) -> list[str]:
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for dependency in task.dependencies:
+        job_id = uid_to_job_id.get(dependency, dependency)
+        if job_id and job_id not in seen:
+            resolved.append(job_id)
+            seen.add(job_id)
+    return resolved
+
+
 def job_spec(task: TaskFile, job_id: str) -> dict[str, Any]:
     repo_root = canonical_repo_path(task.repo_path)
     source: dict[str, Any] = {
@@ -457,7 +484,7 @@ def job_spec(task: TaskFile, job_id: str) -> dict[str, Any]:
             "pr_target": task.base_branch if task.delivery_mode == "pull-request" else None,
         },
         "delivery_mode": task.delivery_mode,
-        "dependencies": parse_csv(str(task.metadata.get("dependencies") or "")),
+        "dependencies": task.dependencies,
         "pipeline": {
             "budgets": {"review_loops": task.review_loops},
             "security_review": task.security_review,
@@ -471,6 +498,7 @@ def job_spec(task: TaskFile, job_id: str) -> dict[str, Any]:
             "source": "tasklane-file-bridge",
             "uid": task.uid,
             "summary": task.path.stem,
+            "delivery_group": task.delivery_group,
             **task.metadata,
         },
     }
@@ -530,19 +558,24 @@ def command_sync(cfg: Config) -> int:
     submitted = dict(state.get("submitted") or {})
     actions: list[dict[str, Any]] = []
     task_paths = sorted([p for p in cfg.inbox_dir.iterdir() if p.is_file() and p.suffix.lower() in TASK_SUFFIXES])
+    loaded_tasks: dict[Path, TaskFile] = {}
     for path in task_paths:
         try:
             task = load_task_file(path)
         except Exception as exc:
             actions.append({"task": path.name, "status": "invalid", "error": str(exc)})
             continue
+        loaded_tasks[path] = task
+    uid_to_job_id = {task.uid: task_job_id(task) for task in loaded_tasks.values()}
+    batch_job_ids = set(uid_to_job_id.values())
+    for path, task in loaded_tasks.items():
         if task.uid in submitted:
             actions.append({"task": path.name, "status": "already-submitted", "run_id": submitted[task.uid].get("run_id")})
             continue
         expected_repo_key = repo_key(task.repo_path)
         if cfg.poll_repo_idle:
             active = active_runs_for_repo(cfg, expected_repo_key)
-            active_jobs = active_jobs_for_repo(cfg, expected_repo_key)
+            active_jobs = [job for job in active_jobs_for_repo(cfg, expected_repo_key) if job.get("id") not in batch_job_ids]
             if active:
                 actions.append({"task": path.name, "status": "deferred", "reason": "repo-active-run", "run_ids": [item.get("id") for item in active]})
                 continue
@@ -552,7 +585,8 @@ def command_sync(cfg: Config) -> int:
             if repo_lock_exists(cfg, expected_repo_key):
                 actions.append({"task": path.name, "status": "deferred", "reason": "repo-lock-active"})
                 continue
-        job_id = f"tasklane_{sha_id(task.uid)}"
+        job_id = uid_to_job_id[task.uid]
+        task.dependencies = dependency_job_ids(task, uid_to_job_id)
         record = job_record(task, job_id)
         ready_path = job_path(cfg, job_id, "ready")
         if find_job_record(cfg, job_id):

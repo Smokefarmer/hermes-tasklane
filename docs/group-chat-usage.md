@@ -24,6 +24,7 @@ Preferred defaults:
 - `delivery_mode: pull-request`
 - `allow_unlisted_paths: false` when the change can be scoped
 - small `allowed_paths` lists
+- one `delivery_group` per desired final PR
 
 ## Avoid For Now
 
@@ -45,6 +46,8 @@ Make sure the task says:
 - acceptance criteria
 - allowed paths or a reason why broad scope is needed
 - whether tests should be added, updated, or only run
+- whether the task belongs to a larger `delivery_group`
+- whether it depends on another task ID
 
 ## After Submitting
 
@@ -78,3 +81,40 @@ Acceptance criteria:
 - open a PR against development
 ```
 
+## Ten-Task Batches
+
+For ten tasks that should become one PR:
+
+- give all ten the same `delivery_group`
+- give serial tasks stable IDs and `depends_on`
+- omit `depends_on` for tasks that do not require ordering
+
+For two big features:
+
+- use two `delivery_group` values
+- each group becomes its own branch/PR target
+- keep dependencies inside the feature group unless one feature truly depends on the other
+
+Example:
+
+```md
+---
+id: checkout-schema
+delivery_group: checkout-v2
+---
+```
+
+```md
+---
+id: checkout-api
+delivery_group: checkout-v2
+depends_on: checkout-schema
+---
+```
+
+```md
+---
+id: inventory-ui
+delivery_group: inventory-v1
+---
+```

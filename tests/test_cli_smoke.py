@@ -98,6 +98,37 @@ def test_sync_supports_scope_and_mode_frontmatter(tmp_path: Path) -> None:
     assert spec["pipeline"]["security_review"] is False
 
 
+def test_sync_resolves_dependencies_and_delivery_group_branch(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (task_root / "inbox" / "one.md").write_text(
+        f"---\nid: feature-one\nrepo_path: {repo}\nbase_branch: development\ndelivery_group: checkout-v2\n---\nBuild part one.\n",
+        encoding="utf-8",
+    )
+    (task_root / "inbox" / "two.md").write_text(
+        f"---\nid: feature-two\nrepo_path: {repo}\nbase_branch: development\ndelivery_group: checkout-v2\ndepends_on: feature-one\n---\nBuild part two.\n",
+        encoding="utf-8",
+    )
+
+    command_sync(cfg)
+
+    records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((hermes_home / "jobs" / "ready").glob("*.json"))]
+    by_title = {item["spec"]["request"]["title"]: item for item in records}
+    first = by_title["one"]
+    second = by_title["two"]
+    assert first["spec"]["branch"]["work_branch"] == "tasklane/checkout-v2"
+    assert second["spec"]["branch"]["work_branch"] == "tasklane/checkout-v2"
+    assert second["spec"]["dependencies"] == [first["id"]]
+    assert second["spec"]["metadata"]["delivery_group"] == "checkout-v2"
+
+
 def test_reconcile_moves_completed_job_to_completed(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"

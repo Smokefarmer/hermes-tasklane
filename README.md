@@ -182,6 +182,8 @@ Optional fields:
 - `branch_mode`: `new-branch`, `existing-branch`, or `detached-review`
 - `work_branch`: required for `existing-branch`, generated for `new-branch` when omitted
 - `delivery_mode`: `pull-request`, `direct-push`, or `report-only`
+- `delivery_group`: shared branch/PR group for multiple task files
+- `depends_on`: comma-separated task IDs that must complete first
 - `allowed_paths`: comma-separated path allowlist
 - `denied_paths`: comma-separated path denylist
 - `allow_unlisted_paths`: `true` or `false`
@@ -204,6 +206,7 @@ branch_base: main
 branch_mode: new-branch
 delivery_mode: pull-request
 request_type: task-small
+delivery_group: invoice-export
 project: Finance App
 platform: telegram
 chat_id: -1001234567890
