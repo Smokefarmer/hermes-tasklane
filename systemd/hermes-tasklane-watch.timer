@@ -1,0 +1,10 @@
+[Unit]
+Description=Run hermes-tasklane watch every 15 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+Unit=hermes-tasklane-watch.service
+
+[Install]
+WantedBy=timers.target

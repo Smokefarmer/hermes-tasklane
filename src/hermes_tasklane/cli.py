@@ -29,6 +29,24 @@ ACTIVE_RUN_STATES = {"queued", "running"}
 ACTIVE_JOB_STATES = {"ready", "running"}
 JOB_STATES = {"draft", "ready", "running", "blocked", "completed", "failed", "needs-human"}
 TASK_SUFFIXES = {".md", ".txt"}
+SAFE_RETRY_ERROR_PATTERNS = (
+    "connection reset",
+    "gateway stopped",
+    "gateway restart",
+    "rate limit",
+    "temporary",
+    "timeout",
+    "timed out",
+    "transport",
+    "worker lost",
+)
+UNSAFE_RETRY_ERROR_PATTERNS = (
+    "invalid execution_mode",
+    "invalid request_type",
+    "no code changes",
+    "planning-invalid-packet",
+    "worktree has uncommitted",
+)
 
 
 def now_iso() -> str:
@@ -58,6 +76,7 @@ class Config:
     default_platform: str | None
     default_chat_id: str | None
     default_thread_id: str | None
+    watch: dict[str, Any]
 
     @property
     def inbox_dir(self) -> Path:
@@ -129,6 +148,7 @@ def load_config(explicit_path: str | None = None) -> Config:
         default_platform=raw.get("default_platform"),
         default_chat_id=raw.get("default_chat_id"),
         default_thread_id=raw.get("default_thread_id"),
+        watch=dict(raw.get("watch") or {}),
     )
 
 
@@ -909,6 +929,374 @@ def command_reconcile(cfg: Config) -> int:
     return 0
 
 
+def parse_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def minutes_since(value: Any) -> int | None:
+    parsed = parse_timestamp(value)
+    if not parsed:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - parsed).total_seconds() // 60))
+
+
+def compact_job(payload: dict[str, Any]) -> dict[str, Any]:
+    spec = payload.get("spec") or {}
+    branch = spec.get("branch") or {}
+    request = spec.get("request") or {}
+    return {
+        "id": payload.get("id"),
+        "state": payload.get("state"),
+        "attempt": payload.get("attempt"),
+        "project": spec.get("project"),
+        "repo_key": ((spec.get("repo") or {}).get("key")),
+        "title": request.get("title"),
+        "mode": branch.get("mode"),
+        "base_branch": branch.get("base_branch"),
+        "work_branch": branch.get("work_branch"),
+        "delivery_mode": spec.get("delivery_mode"),
+        "claimed_by": payload.get("claimed_by"),
+        "runtime_minutes": minutes_since(payload.get("claimed_at")) if payload.get("state") == "running" else None,
+        "error": payload.get("last_error"),
+    }
+
+
+def systemd_gateway_status() -> dict[str, Any]:
+    if not shutil.which("systemctl"):
+        return {"available": False, "state": "unknown", "ok": None, "reason": "systemctl-not-found"}
+    proc = subprocess.run(
+        ["systemctl", "is-active", "hermes-gateway.service"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    state = proc.stdout.strip() or proc.stderr.strip() or "unknown"
+    return {"available": True, "state": state, "ok": proc.returncode == 0 and state == "active"}
+
+
+def claimant_pid(payload: dict[str, Any]) -> int | None:
+    claimed_by = str(payload.get("claimed_by") or "")
+    match = re.fullmatch(r"gateway-(\d+)", claimed_by)
+    return int(match.group(1)) if match else None
+
+
+def process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def watch_expected_base_map(cfg: Config, overrides: list[str] | None = None) -> dict[str, str]:
+    configured = dict(cfg.watch.get("expected_base_branches") or {})
+    for item in overrides or []:
+        if "=" not in item:
+            raise ValueError(f"invalid --expected-base value {item!r}; expected PROJECT_OR_REPO=BRANCH")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value:
+            raise ValueError(f"invalid --expected-base value {item!r}; expected PROJECT_OR_REPO=BRANCH")
+        configured[key] = value
+    return configured
+
+
+def expected_base_for_job(job: dict[str, Any], expected: dict[str, str]) -> str | None:
+    spec = job.get("spec") or {}
+    repo = spec.get("repo") or {}
+    candidates = [
+        str(repo.get("key") or ""),
+        str(repo.get("path") or ""),
+        str(spec.get("project") or ""),
+    ]
+    for candidate in candidates:
+        if candidate in expected:
+            return expected[candidate]
+    return None
+
+
+def watch_ignored_blocked_jobs(cfg: Config, overrides: list[str] | None = None) -> set[str]:
+    ignored = {str(item) for item in cfg.watch.get("ignored_blocked_jobs") or []}
+    ignored.update(str(item) for item in overrides or [])
+    return ignored
+
+
+def add_watch_problem(problems: list[dict[str, Any]], severity: str, code: str, message: str, job: dict[str, Any] | None = None) -> None:
+    entry: dict[str, Any] = {"severity": severity, "code": code, "message": message}
+    if job:
+        entry["job"] = compact_job(job)
+    problems.append(entry)
+
+
+def retry_failed_job(cfg: Config, job: dict[str, Any]) -> dict[str, Any]:
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        return {"status": "skipped", "reason": "missing-job-id"}
+    failed_path = job_path(cfg, job_id, "failed")
+    if not failed_path.exists():
+        return {"job_id": job_id, "status": "skipped", "reason": "failed-record-missing"}
+    payload = load_json(failed_path)
+    if not isinstance(payload, dict):
+        return {"job_id": job_id, "status": "skipped", "reason": "failed-record-invalid"}
+    payload["state"] = "ready"
+    payload["updated_at"] = now_iso()
+    payload["last_error"] = None
+    metadata = dict(payload.get("metadata") or {})
+    metadata["watchdog_retry"] = {"at": now_iso(), "reason": "safe-transient-failure"}
+    payload["metadata"] = metadata
+    ready_path = job_path(cfg, job_id, "ready")
+    atomic_write_json(ready_path, payload)
+    failed_path.unlink()
+    append_jsonl(
+        job_event_log_path(cfg, job_id),
+        {
+            "timestamp": now_iso(),
+            "job_id": job_id,
+            "event_type": "job_state_changed",
+            "state": "ready",
+            "reason": "tasklane-watchdog-safe-retry",
+        },
+    )
+    return {"job_id": job_id, "status": "retried", "from": str(failed_path), "to": str(ready_path)}
+
+
+def safe_to_retry(job: dict[str, Any], max_attempts: int) -> tuple[bool, str]:
+    attempt = int(job.get("attempt") or 0)
+    if attempt >= max_attempts:
+        return False, "max-attempts-reached"
+    error = str(job.get("last_error") or "").lower()
+    if any(pattern in error for pattern in UNSAFE_RETRY_ERROR_PATTERNS):
+        return False, "unsafe-error"
+    if any(pattern in error for pattern in SAFE_RETRY_ERROR_PATTERNS):
+        return True, "safe-transient-error"
+    return False, "unclassified-error"
+
+
+def build_watch_report(
+    cfg: Config,
+    *,
+    mode: str = "observe",
+    stale_running_minutes: int | None = None,
+    expected_base: dict[str, str] | None = None,
+    ignored_blocked: set[str] | None = None,
+    check_gateway: bool = True,
+) -> dict[str, Any]:
+    ensure_layout(cfg)
+    stale_after = stale_running_minutes or int(cfg.watch.get("stale_running_minutes") or 180)
+    expected = expected_base if expected_base is not None else watch_expected_base_map(cfg)
+    ignored = ignored_blocked if ignored_blocked is not None else watch_ignored_blocked_jobs(cfg)
+    jobs = iter_job_records(cfg)
+    by_state = {state: 0 for state in sorted(JOB_STATES)}
+    for job in jobs:
+        state = str(job.get("state") or "unknown")
+        by_state[state] = by_state.get(state, 0) + 1
+    problems: list[dict[str, Any]] = []
+    notices: list[dict[str, Any]] = []
+    gateway = systemd_gateway_status() if check_gateway else {"available": False, "state": "unchecked", "ok": None}
+    if check_gateway and gateway.get("ok") is False:
+        add_watch_problem(problems, "critical", "gateway-inactive", f"hermes-gateway.service is {gateway.get('state')}")
+    running = [job for job in jobs if job.get("state") == "running"]
+    ready = [job for job in jobs if job.get("state") == "ready"]
+    blocked = [job for job in jobs if job.get("state") == "blocked"]
+    needs_human = [job for job in jobs if job.get("state") == "needs-human"]
+    failed = [job for job in jobs if job.get("state") == "failed"]
+    if ready and check_gateway and gateway.get("ok") is False:
+        add_watch_problem(problems, "critical", "ready-jobs-without-gateway", f"{len(ready)} ready job(s) cannot run while the gateway is inactive")
+    for job in running:
+        runtime = minutes_since(job.get("claimed_at"))
+        if runtime is None:
+            add_watch_problem(problems, "warning", "running-missing-claimed-at", "running job has no claimed_at timestamp", job)
+        elif runtime > stale_after:
+            add_watch_problem(problems, "warning", "running-stale", f"running job has exceeded {stale_after} minutes", job)
+        pid = claimant_pid(job)
+        if pid is not None and not process_is_alive(pid):
+            add_watch_problem(problems, "critical", "running-dead-claimant", f"claimed gateway process {pid} is not alive", job)
+    for job in blocked:
+        job_id = str(job.get("id") or "")
+        if job_id in ignored:
+            notices.append({"code": "blocked-ignored", "job": compact_job(job)})
+            continue
+        add_watch_problem(problems, "warning", "job-blocked", "job is blocked and needs review", job)
+    for job in needs_human:
+        add_watch_problem(problems, "warning", "job-needs-human", "job is waiting for human input", job)
+    for job in failed:
+        add_watch_problem(problems, "warning", "job-failed", "job failed and was not automatically retried", job)
+    for job in ready + running:
+        spec = job.get("spec") or {}
+        branch = spec.get("branch") or {}
+        expected_branch = expected_base_for_job(job, expected)
+        if not expected_branch:
+            continue
+        base_branch = branch.get("base_branch")
+        branch_mode = branch.get("mode")
+        delivery_mode = spec.get("delivery_mode")
+        if base_branch and base_branch != expected_branch:
+            add_watch_problem(problems, "warning", "base-branch-mismatch", f"expected base branch {expected_branch!r}, got {base_branch!r}", job)
+        elif not base_branch and (branch_mode in {"new-branch", "detached-review"} or delivery_mode == "pull-request"):
+            add_watch_problem(problems, "warning", "base-branch-missing", f"expected base branch {expected_branch!r}, but job has no base_branch", job)
+    health = "critical" if any(item["severity"] == "critical" for item in problems) else "warning" if problems else "ok"
+    report = {
+        "timestamp": now_iso(),
+        "mode": mode,
+        "health": health,
+        "gateway": gateway,
+        "counts": by_state,
+        "inbox": len([p for p in cfg.inbox_dir.iterdir() if p.is_file()]) if cfg.inbox_dir.exists() else 0,
+        "running": [compact_job(job) for job in running],
+        "ready": [compact_job(job) for job in ready],
+        "blocked": [compact_job(job) for job in blocked],
+        "needs_human": [compact_job(job) for job in needs_human],
+        "failed": [compact_job(job) for job in failed],
+        "problems": problems,
+        "notices": notices,
+    }
+    return report
+
+
+def apply_guarded_watch_actions(cfg: Config, report: dict[str, Any]) -> list[dict[str, Any]]:
+    max_attempts = int(cfg.watch.get("max_retry_attempts") or 3)
+    actions: list[dict[str, Any]] = []
+    for job in iter_job_records(cfg, {"failed"}):
+        ok, reason = safe_to_retry(job, max_attempts)
+        if not ok:
+            actions.append({"job_id": job.get("id"), "status": "skipped", "reason": reason})
+            continue
+        actions.append(retry_failed_job(cfg, job))
+    report["actions"] = actions
+    return actions
+
+
+def format_watch_report(report: dict[str, Any]) -> str:
+    counts = report.get("counts") or {}
+    lines = [
+        "Tasklane Watch",
+        f"Health: {report.get('health')}",
+        f"Gateway: {(report.get('gateway') or {}).get('state')}",
+        f"Running: {counts.get('running', 0)}",
+        f"Ready: {counts.get('ready', 0)}",
+        f"Failed: {counts.get('failed', 0)}",
+        f"Blocked: {counts.get('blocked', 0)}",
+        f"Needs human: {counts.get('needs-human', 0)}",
+    ]
+    running = report.get("running") or []
+    if running:
+        lines.append("")
+        lines.append("Current:")
+        for job in running[:3]:
+            runtime = job.get("runtime_minutes")
+            runtime_text = f", {runtime} min" if runtime is not None else ""
+            lines.append(f"- {job.get('id')} {job.get('project') or ''}: {job.get('title') or ''}{runtime_text}")
+    problems = report.get("problems") or []
+    if problems:
+        lines.append("")
+        lines.append("Findings:")
+        for problem in problems[:12]:
+            job = problem.get("job") or {}
+            suffix = f" ({job.get('id')})" if job.get("id") else ""
+            lines.append(f"- {problem.get('severity')}: {problem.get('code')}: {problem.get('message')}{suffix}")
+    actions = report.get("actions") or []
+    if actions:
+        lines.append("")
+        lines.append("Actions:")
+        for action in actions[:12]:
+            lines.append(f"- {action.get('job_id')}: {action.get('status')} {action.get('reason') or ''}".rstrip())
+    notices = report.get("notices") or []
+    if notices:
+        lines.append("")
+        lines.append("Notices:")
+        for notice in notices[:8]:
+            job = notice.get("job") or {}
+            lines.append(f"- {notice.get('code')}: {job.get('id')}")
+    return "\n".join(lines)
+
+
+def send_telegram_notification(cfg: Config, text: str) -> dict[str, Any]:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or str(cfg.watch.get("telegram_bot_token") or "")
+    chat_id = str(cfg.watch.get("telegram_chat_id") or cfg.default_chat_id or "")
+    thread_id = str(cfg.watch.get("telegram_thread_id") or cfg.default_thread_id or "")
+    if not token or not chat_id:
+        return {"status": "skipped", "reason": "missing-telegram-token-or-chat-id"}
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": text[:3900], "disable_web_page_preview": True}
+    if thread_id:
+        payload["message_thread_id"] = thread_id
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "hermes-tasklane"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as response:
+        body = response.read().decode("utf-8")
+    return {"status": "sent", "response": json.loads(body) if body.strip() else None}
+
+
+def command_watch(
+    cfg: Config,
+    *,
+    mode: str,
+    stale_minutes: int | None,
+    expected_base_values: list[str] | None,
+    ignored_blocked_values: list[str] | None,
+    notify: bool,
+    quiet_ok: bool,
+    json_output: bool,
+    fail_on_problems: bool,
+) -> int:
+    expected = watch_expected_base_map(cfg, expected_base_values)
+    ignored = watch_ignored_blocked_jobs(cfg, ignored_blocked_values)
+    report = build_watch_report(
+        cfg,
+        mode=mode,
+        stale_running_minutes=stale_minutes,
+        expected_base=expected,
+        ignored_blocked=ignored,
+        check_gateway=True,
+    )
+    if mode == "guarded":
+        apply_guarded_watch_actions(cfg, report)
+        report = {
+            **build_watch_report(
+                cfg,
+                mode=mode,
+                stale_running_minutes=stale_minutes,
+                expected_base=expected,
+                ignored_blocked=ignored,
+                check_gateway=True,
+            ),
+            "actions": report.get("actions") or [],
+        }
+    text = format_watch_report(report)
+    if notify and (not quiet_ok or report.get("health") != "ok"):
+        try:
+            report["notification"] = send_telegram_notification(cfg, text)
+        except Exception as exc:
+            report["notification"] = {"status": "failed", "error": str(exc)}
+    if json_output:
+        if quiet_ok and report.get("health") == "ok":
+            return 0
+        print(json.dumps(report, indent=2))
+    elif not quiet_ok or report.get("health") != "ok":
+        print(text)
+    if fail_on_problems and report.get("health") != "ok":
+        return 2
+    return 0
+
+
 def command_status(cfg: Config) -> int:
     ensure_layout(cfg)
     state = load_state(cfg)
@@ -977,6 +1365,13 @@ def command_init(cfg: Config, config_path_override: str | None = None) -> int:
                 "default_platform": cfg.default_platform,
                 "default_chat_id": cfg.default_chat_id,
                 "default_thread_id": cfg.default_thread_id,
+                "watch": {
+                    "mode": "observe",
+                    "stale_running_minutes": 180,
+                    "max_retry_attempts": 3,
+                    "expected_base_branches": {},
+                    "ignored_blocked_jobs": [],
+                },
             },
         )
     examples_dir = cfg.task_root / "examples"
@@ -1000,6 +1395,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("sync", help="Convert inbox files into Hermes queue items")
     sub.add_parser("reconcile", help="Reconcile submitted tasks from governed run state")
     sub.add_parser("status", help="Show tasklane and run status")
+    watch = sub.add_parser("watch", help="Review queue health and optionally apply guarded recovery")
+    watch.add_argument("--mode", choices=["observe", "guarded"], default=None, help="observe reports only; guarded retries narrowly safe transient failures")
+    watch.add_argument("--stale-minutes", type=int, help="Warn when a running job exceeds this age")
+    watch.add_argument("--expected-base", action="append", default=[], metavar="PROJECT_OR_REPO=BRANCH", help="Expected base branch policy, e.g. Alvin=develop")
+    watch.add_argument("--ignore-blocked", action="append", default=[], metavar="JOB_ID", help="Blocked job ID that should be treated as an expected exception")
+    watch.add_argument("--notify", action="store_true", help="Send Telegram notification using TELEGRAM_BOT_TOKEN plus configured chat ID")
+    watch.add_argument("--quiet-ok", action="store_true", help="Suppress output and notifications when health is ok")
+    watch.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    watch.add_argument("--fail-on-problems", action="store_true", help="Exit 2 when warnings or critical findings exist")
     return parser
 
 
@@ -1018,6 +1422,21 @@ def main(argv: list[str] | None = None) -> int:
             return command_reconcile(cfg)
         if args.command == "status":
             return command_status(cfg)
+        if args.command == "watch":
+            mode = args.mode or str(cfg.watch.get("mode") or "observe")
+            if mode not in {"observe", "guarded"}:
+                raise ValueError("watch mode must be observe or guarded")
+            return command_watch(
+                cfg,
+                mode=mode,
+                stale_minutes=args.stale_minutes,
+                expected_base_values=args.expected_base,
+                ignored_blocked_values=args.ignore_blocked,
+                notify=args.notify,
+                quiet_ok=args.quiet_ok,
+                json_output=args.json,
+                fail_on_problems=args.fail_on_problems,
+            )
     except Exception as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 1

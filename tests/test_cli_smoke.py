@@ -7,6 +7,14 @@ from hermes_tasklane import cli
 from hermes_tasklane.cli import command_init, command_reconcile, command_sync, load_config, load_state
 
 
+def write_job_record(hermes_home: Path, state: str, job_id: str, payload: dict) -> Path:
+    path = hermes_home / "jobs" / state / f"{job_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"id": job_id, "state": state, **payload}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def write_config(path: Path, *, hermes_home: Path, task_root: Path) -> None:
     path.write_text(
         json.dumps(
@@ -345,3 +353,128 @@ def test_reconcile_keeps_pending_delivery_run_submitted(tmp_path: Path, monkeypa
     assert "demo-uid" in post_state["submitted"]
     assert submitted_task.exists()
     assert not list((task_root / "failed").glob("demo.md"))
+
+
+def test_watch_flags_base_branch_policy_mismatch(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    write_job_record(
+        hermes_home,
+        "ready",
+        "tasklane_alvin",
+        {
+            "spec": {
+                "project": "Alvin",
+                "repo": {"key": "repo:///repo/alvin", "path": "/repo/alvin"},
+                "request": {"title": "audit"},
+                "branch": {"mode": "detached-review", "base_branch": "feat/anlageverzeichnis"},
+                "delivery_mode": "report-only",
+            }
+        },
+    )
+
+    report = cli.build_watch_report(cfg, expected_base={"Alvin": "develop"}, ignored_blocked=set(), check_gateway=False)
+
+    assert report["health"] == "warning"
+    assert [problem["code"] for problem in report["problems"]] == ["base-branch-mismatch"]
+
+
+def test_watch_ignores_known_blocked_job(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    write_job_record(
+        hermes_home,
+        "blocked",
+        "tasklane_obsolete",
+        {
+            "last_error": "superseded",
+            "spec": {
+                "project": "Treasure Hunter",
+                "repo": {"key": "repo:///repo/th"},
+                "request": {"title": "obsolete"},
+                "branch": {"mode": "new-branch", "base_branch": "development"},
+            },
+        },
+    )
+
+    report = cli.build_watch_report(cfg, ignored_blocked={"tasklane_obsolete"}, check_gateway=False)
+
+    assert report["health"] == "ok"
+    assert report["problems"] == []
+    assert report["notices"][0]["code"] == "blocked-ignored"
+
+
+def test_watch_flags_stale_running_dead_claimant(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    monkeypatch.setattr(cli, "process_is_alive", lambda pid: False)
+
+    write_job_record(
+        hermes_home,
+        "running",
+        "tasklane_stale",
+        {
+            "claimed_at": "2000-01-01T00:00:00+00:00",
+            "claimed_by": "gateway-999999",
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "long run"},
+                "branch": {"mode": "new-branch", "base_branch": "main"},
+            },
+        },
+    )
+
+    report = cli.build_watch_report(cfg, stale_running_minutes=1, ignored_blocked=set(), check_gateway=False)
+    codes = {problem["code"] for problem in report["problems"]}
+
+    assert report["health"] == "critical"
+    assert {"running-stale", "running-dead-claimant"} <= codes
+
+
+def test_guarded_watch_retries_safe_transient_failed_job(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    write_job_record(
+        hermes_home,
+        "failed",
+        "tasklane_retry",
+        {
+            "attempt": 1,
+            "last_error": "temporary timeout while connecting",
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "retry me"},
+                "branch": {"mode": "new-branch", "base_branch": "main"},
+            },
+        },
+    )
+    report = cli.build_watch_report(cfg, mode="guarded", ignored_blocked=set(), check_gateway=False)
+
+    actions = cli.apply_guarded_watch_actions(cfg, report)
+
+    assert actions == [{"job_id": "tasklane_retry", "status": "retried", "from": str(hermes_home / "jobs" / "failed" / "tasklane_retry.json"), "to": str(hermes_home / "jobs" / "ready" / "tasklane_retry.json")}]
+    assert not (hermes_home / "jobs" / "failed" / "tasklane_retry.json").exists()
+    ready = json.loads((hermes_home / "jobs" / "ready" / "tasklane_retry.json").read_text(encoding="utf-8"))
+    assert ready["state"] == "ready"
+    assert ready["last_error"] is None

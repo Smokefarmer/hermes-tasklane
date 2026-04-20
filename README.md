@@ -31,6 +31,12 @@ It is designed for teams that already run Hermes and want a simple, shareable â€
 - moves submitted task files into `completed/`, `failed/`, or `cancelled/`
 - normalizes stale delivery blockers by checking GitHub PR + CI state
 
+4. Queue watchdog
+- reviews queue health on a timer
+- detects failed, blocked, stale, and dead-gateway jobs
+- checks expected base-branch policy per project or repo
+- defaults to observe-only and can optionally run guarded safe retries
+
 ## What it does not replace
 
 This is not a full replacement for Hermes itself.
@@ -49,6 +55,7 @@ cd hermes-tasklane
 ./scripts/install.sh --systemd
 hermes-tasklane doctor
 hermes-tasklane status
+hermes-tasklane watch
 ```
 
 That installs the package, initializes config and folders, and enables user-level systemd timers when available. If the machine has no usable user systemd session, the installer skips timers cleanly and you can use the cron fallback instead.
@@ -290,6 +297,58 @@ This:
 hermes-tasklane status
 ```
 
+### Night watchdog
+
+```bash
+hermes-tasklane watch
+```
+
+`watch` is the production queue supervisor. It reads Hermes JobStore state and reports:
+
+- gateway health
+- running/ready/failed/blocked/needs-human counts
+- stale running jobs
+- dead `gateway-<pid>` claimants
+- branch policy mismatches
+- blocked jobs that are not explicitly ignored
+
+Configure branch policy and known expected blocked jobs in `~/.config/hermes-tasklane/config.json`:
+
+```json
+{
+  "watch": {
+    "mode": "observe",
+    "stale_running_minutes": 180,
+    "max_retry_attempts": 3,
+    "expected_base_branches": {
+      "Alvin": "develop",
+      "Treasure Hunter": "development"
+    },
+    "ignored_blocked_jobs": [
+      "tasklane_d08a145fbccc"
+    ]
+  }
+}
+```
+
+Use observe mode for unattended production:
+
+```bash
+hermes-tasklane watch --mode observe --quiet-ok
+```
+
+Use guarded mode only after you trust the queue. It retries narrowly classified transient failures, never blocked jobs, never planning/schema errors, and never dirty-worktree failures:
+
+```bash
+hermes-tasklane watch --mode guarded
+```
+
+For Telegram watchdog messages, set `TELEGRAM_BOT_TOKEN` and configure `watch.telegram_chat_id` or `default_chat_id`, then run:
+
+```bash
+hermes-tasklane watch --notify --quiet-ok
+```
+
 ## Recommended automation
 
 ### systemd user timers (recommended)
@@ -298,6 +357,7 @@ hermes-tasklane status
 ./scripts/install.sh --systemd
 systemctl --user status hermes-tasklane-sync.timer
 systemctl --user status hermes-tasklane-reconcile.timer
+systemctl --user status hermes-tasklane-watch.timer
 ```
 
 ### cron fallback
@@ -307,6 +367,7 @@ If you do not use systemd user timers, run both of these periodically:
 ```bash
 */5 * * * * /usr/bin/env hermes-tasklane sync
 */5 * * * * /usr/bin/env hermes-tasklane reconcile
+*/15 * * * * /usr/bin/env hermes-tasklane watch --mode observe --quiet-ok
 ```
 
 That gives you a lightweight, always-on text-file task queue on top of Hermes.
@@ -377,6 +438,9 @@ Reconcile submitted tasks from JobStore/governed run state and attempt PR/CI nor
 
 ### `hermes-tasklane status`
 Show inbox/submitted/completed counts and current JobStore/governed run states.
+
+### `hermes-tasklane watch`
+Review queue health for unattended operation. Defaults to observe-only. Use `--expected-base Project=branch` for one-off branch policy checks, `--ignore-blocked JOB_ID` for known obsolete jobs, `--json` for machine-readable output, and `--mode guarded` for narrowly safe transient retries.
 
 ## Delivery reconciliation behavior
 

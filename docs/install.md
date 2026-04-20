@@ -52,7 +52,16 @@ Example:
   "github_owner_hint": "your-github-user",
   "default_platform": null,
   "default_chat_id": null,
-  "default_thread_id": null
+  "default_thread_id": null,
+  "watch": {
+    "mode": "observe",
+    "stale_running_minutes": 180,
+    "max_retry_attempts": 3,
+    "expected_base_branches": {
+      "Project Name": "develop"
+    },
+    "ignored_blocked_jobs": []
+  }
 }
 ```
 
@@ -78,18 +87,44 @@ Then:
 systemctl --user daemon-reload
 systemctl --user enable --now hermes-tasklane-sync.timer
 systemctl --user enable --now hermes-tasklane-reconcile.timer
+systemctl --user enable --now hermes-tasklane-watch.timer
 ```
+
+The watch timer runs `hermes-tasklane watch --mode observe --quiet-ok` every 15 minutes. It reports failed, blocked, stale, dead-gateway, and branch-policy problems in the systemd journal without mutating the queue.
 
 ## Cron example
 
 ```cron
 */5 * * * * /usr/bin/env hermes-tasklane sync
 */5 * * * * /usr/bin/env hermes-tasklane reconcile
+*/15 * * * * /usr/bin/env hermes-tasklane watch --mode observe --quiet-ok
 ```
 
-## Systemd user units
+## Watchdog command
 
-If you prefer systemd user timers, create one timer for `sync` and one for `reconcile`.
+Manual health check:
+
+```bash
+hermes-tasklane watch
+```
+
+Project/repo branch policy can be configured in `watch.expected_base_branches` or passed per run:
+
+```bash
+hermes-tasklane watch --expected-base Alvin=develop --expected-base "Treasure Hunter=development"
+```
+
+Known obsolete blocked jobs can be ignored:
+
+```bash
+hermes-tasklane watch --ignore-blocked tasklane_d08a145fbccc
+```
+
+Guarded mode retries only narrowly classified transient failures and never retries blocked jobs, schema/planning failures, dirty-worktree failures, or no-code-change failures:
+
+```bash
+hermes-tasklane watch --mode guarded
+```
 
 ## GitHub auth
 
