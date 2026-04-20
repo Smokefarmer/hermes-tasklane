@@ -166,6 +166,43 @@ def test_sync_resolves_dependencies_and_delivery_group_branch(tmp_path: Path) ->
     assert second["spec"]["metadata"]["delivery_group"] == "checkout-v2"
 
 
+def test_sync_resolves_dependencies_from_previously_submitted_active_tasks(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (task_root / "inbox" / "source.md").write_text(
+        f"---\nid: source-pack\nrepo_path: {repo}\nbase_branch: development\n---\nCreate source pack.\n",
+        encoding="utf-8",
+    )
+
+    command_sync(cfg)
+
+    ready_records = list((hermes_home / "jobs" / "ready").glob("*.json"))
+    assert len(ready_records) == 1
+    source_record = json.loads(ready_records[0].read_text(encoding="utf-8"))
+
+    (task_root / "inbox" / "audit.md").write_text(
+        f"---\nid: domain-audit\nrepo_path: {repo}\nbase_branch: development\ndepends_on: source-pack\n---\nAudit one domain.\n",
+        encoding="utf-8",
+    )
+
+    command_sync(cfg)
+
+    child_records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (hermes_home / "jobs" / "ready").glob("*.json")
+    ]
+    by_title = {item["spec"]["request"]["title"]: item for item in child_records}
+    assert set(by_title) == {"source", "audit"}
+    assert by_title["audit"]["spec"]["dependencies"] == [source_record["id"]]
+
+
 def test_existing_branch_delivery_group_derives_work_branch(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"

@@ -446,6 +446,17 @@ def task_job_id(task: TaskFile) -> str:
     return f"tasklane_{sha_id(task.uid)}"
 
 
+def submitted_dependency_ids(submitted: dict[str, Any]) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    for uid, entry in submitted.items():
+        if not isinstance(entry, dict):
+            continue
+        job_id = str(entry.get("job_id") or entry.get("run_id") or "").strip()
+        if job_id:
+            resolved[str(uid)] = job_id
+    return resolved
+
+
 def dependency_job_ids(task: TaskFile, uid_to_job_id: dict[str, str]) -> list[str]:
     resolved: list[str] = []
     seen: set[str] = set()
@@ -572,16 +583,29 @@ def command_sync(cfg: Config) -> int:
             actions.append({"task": path.name, "status": "invalid", "error": str(exc)})
             continue
         loaded_tasks[path] = task
-    uid_to_job_id = {task.uid: task_job_id(task) for task in loaded_tasks.values()}
-    batch_job_ids = set(uid_to_job_id.values())
+    batch_uid_to_job_id = {task.uid: task_job_id(task) for task in loaded_tasks.values()}
+    uid_to_job_id = submitted_dependency_ids(submitted)
+    uid_to_job_id.update(batch_uid_to_job_id)
+    batch_job_ids = set(batch_uid_to_job_id.values())
     for path, task in loaded_tasks.items():
         if task.uid in submitted:
             actions.append({"task": path.name, "status": "already-submitted", "run_id": submitted[task.uid].get("run_id")})
             continue
         expected_repo_key = repo_key(task.repo_path)
+        job_id = batch_uid_to_job_id[task.uid]
+        task.dependencies = dependency_job_ids(task, uid_to_job_id)
         if cfg.poll_repo_idle:
-            active = active_runs_for_repo(cfg, expected_repo_key)
-            active_jobs = [job for job in active_jobs_for_repo(cfg, expected_repo_key) if job.get("id") not in batch_job_ids]
+            dependency_ids = set(task.dependencies)
+            active = [
+                run
+                for run in active_runs_for_repo(cfg, expected_repo_key)
+                if str(run.get("id") or "") not in dependency_ids
+            ]
+            active_jobs = [
+                job
+                for job in active_jobs_for_repo(cfg, expected_repo_key)
+                if job.get("id") not in batch_job_ids and str(job.get("id") or "") not in dependency_ids
+            ]
             if active:
                 actions.append({"task": path.name, "status": "deferred", "reason": "repo-active-run", "run_ids": [item.get("id") for item in active]})
                 continue
@@ -591,8 +615,6 @@ def command_sync(cfg: Config) -> int:
             if repo_lock_exists(cfg, expected_repo_key):
                 actions.append({"task": path.name, "status": "deferred", "reason": "repo-lock-active"})
                 continue
-        job_id = uid_to_job_id[task.uid]
-        task.dependencies = dependency_job_ids(task, uid_to_job_id)
         record = job_record(task, job_id)
         ready_path = job_path(cfg, job_id, "ready")
         if find_job_record(cfg, job_id):
