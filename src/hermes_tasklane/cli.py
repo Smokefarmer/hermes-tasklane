@@ -55,6 +55,9 @@ class Config:
     poll_repo_idle: bool
     max_pending_per_repo: int
     github_owner_hint: str | None
+    default_platform: str | None
+    default_chat_id: str | None
+    default_thread_id: str | None
 
     @property
     def inbox_dir(self) -> Path:
@@ -123,6 +126,9 @@ def load_config(explicit_path: str | None = None) -> Config:
         poll_repo_idle=bool(raw.get("poll_repo_idle", True)),
         max_pending_per_repo=int(raw.get("max_pending_per_repo", 1)),
         github_owner_hint=raw.get("github_owner_hint"),
+        default_platform=raw.get("default_platform"),
+        default_chat_id=raw.get("default_chat_id"),
+        default_thread_id=raw.get("default_thread_id"),
     )
 
 
@@ -266,7 +272,7 @@ class TaskFile:
     delivery_group: str | None
 
 
-def load_task_file(path: Path) -> TaskFile:
+def load_task_file(path: Path, cfg: Config | None = None) -> TaskFile:
     text = path.read_text(encoding="utf-8")
     meta, prompt = parse_frontmatter(text)
     if not prompt:
@@ -334,9 +340,9 @@ def load_task_file(path: Path) -> TaskFile:
                 "epic",
             }
         },
-        platform=meta.get("platform"),
-        chat_id=meta.get("chat_id"),
-        thread_id=meta.get("thread_id"),
+        platform=meta.get("platform") or (cfg.default_platform if cfg else None),
+        chat_id=meta.get("chat_id") or (cfg.default_chat_id if cfg else None),
+        thread_id=meta.get("thread_id") or (cfg.default_thread_id if cfg else None),
         project=meta.get("project"),
         title=meta.get("title") or path.stem.replace("-", " ").replace("_", " ").strip() or uid,
         allowed_paths=parse_csv(meta.get("allowed_paths")),
@@ -561,7 +567,7 @@ def command_sync(cfg: Config) -> int:
     loaded_tasks: dict[Path, TaskFile] = {}
     for path in task_paths:
         try:
-            task = load_task_file(path)
+            task = load_task_file(path, cfg)
         except Exception as exc:
             actions.append({"task": path.name, "status": "invalid", "error": str(exc)})
             continue
@@ -946,6 +952,9 @@ def command_init(cfg: Config, config_path_override: str | None = None) -> int:
                 "poll_repo_idle": True,
                 "max_pending_per_repo": 1,
                 "github_owner_hint": cfg.github_owner_hint,
+                "default_platform": cfg.default_platform,
+                "default_chat_id": cfg.default_chat_id,
+                "default_thread_id": cfg.default_thread_id,
             },
         )
     examples_dir = cfg.task_root / "examples"

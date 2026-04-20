@@ -16,6 +16,7 @@ Do not create a task until these are known:
 - clear task goal
 - delivery shape: one PR, multiple PRs, direct push, or report-only
 - acceptance criteria
+- Telegram `chat_id` when the group expects updates and tasklane config does not provide `default_chat_id`
 
 Ask a short follow-up if any required input is missing.
 
@@ -88,6 +89,9 @@ request_type: task-small
 delivery_group: optional-group-name
 depends_on: optional-task-id
 project: Project Name
+platform: telegram
+chat_id: optional-chat-id
+thread_id: optional-topic-id
 allowed_paths: path/one, path/two
 allow_unlisted_paths: false
 review_loops: 3
@@ -106,8 +110,9 @@ Acceptance criteria:
 2. Keep IDs lowercase, stable, and readable.
 3. Use one `delivery_group` per desired final PR.
 4. Use `depends_on` only for real order dependencies.
-5. Write the files into the inbox.
-6. Run:
+5. When the request came from Telegram and chat metadata is available, include `platform: telegram`, `chat_id`, and `thread_id` in each task file so Hermes can send start/completion/failure updates.
+6. Write the files into the inbox.
+7. Run:
 
 ```bash
 hermes-tasklane sync
@@ -115,4 +120,4 @@ hermes-tasklane status
 hermes jobs list --json
 ```
 
-7. Report the created job IDs and any deferred/invalid tasks.
+8. Report the created job IDs and any deferred/invalid tasks.

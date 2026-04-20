@@ -60,3 +60,5 @@ Clean up the auth flow, add regression tests, run verification, and prepare a co
 - Use different `delivery_group` values when two big features need separate PRs.
 - Use `depends_on` for serial work; omit it for work that can be scheduled independently.
 - For a many-task single-PR batch, use `direct-push` for implementation tasks and one final `pull-request` task that depends on all implementation tasks.
+- Add `platform: telegram` and `chat_id` when the group should receive start/completion/failure updates.
+- `default_platform`, `default_chat_id`, and `default_thread_id` in config are used when a task file omits these fields.

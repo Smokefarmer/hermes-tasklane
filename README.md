@@ -82,6 +82,28 @@ hermes-tasklane status
 hermes jobs list --json
 ```
 
+### Telegram updates
+
+Task files can include Telegram metadata so Hermes can send start/completion/failure updates:
+
+```yaml
+platform: telegram
+chat_id: -1001234567890
+thread_id: 42
+```
+
+You can also set defaults in `~/.config/hermes-tasklane/config.json`:
+
+```json
+{
+  "default_platform": "telegram",
+  "default_chat_id": "-1001234567890",
+  "default_thread_id": null
+}
+```
+
+Use per-task `chat_id` values when one machine serves multiple project groups.
+
 ## Group Master Prompt
 
 Paste this into the Hermes group chat where the agent should create tasklane jobs from voice or text requests:
@@ -96,6 +118,10 @@ Always use the hermes-tasklane-intake skill when I ask for features, bugs, fixes
 Default workflow:
 1. Create tasklane Markdown files in:
    ~/.local/share/hermes-tasklane/inbox/
+   If this request came from Telegram and the chat ID is available, include:
+   platform: telegram
+   chat_id: <current chat id>
+   thread_id: <current topic/thread id if available>
 2. Run:
    hermes-tasklane sync
    hermes-tasklane status
@@ -108,6 +134,7 @@ Required before creating jobs:
 - goal
 - delivery shape: one PR, multiple PRs, direct push, or report-only
 - acceptance criteria
+- Telegram chat ID if the group expects job updates and no tasklane default_chat_id is configured
 
 If required information is missing, ask one short clarification question.
 

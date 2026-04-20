@@ -49,9 +49,14 @@ Example:
   "task_root": "/home/your-user/.local/share/hermes-tasklane",
   "poll_repo_idle": true,
   "max_pending_per_repo": 1,
-  "github_owner_hint": "your-github-user"
+  "github_owner_hint": "your-github-user",
+  "default_platform": null,
+  "default_chat_id": null,
+  "default_thread_id": null
 }
 ```
+
+Set `default_platform` to `telegram` and `default_chat_id` to a group/chat ID only when all tasklane jobs from this machine should report to that chat. Otherwise put `platform`, `chat_id`, and `thread_id` in individual task files.
 
 ## Systemd user units
 

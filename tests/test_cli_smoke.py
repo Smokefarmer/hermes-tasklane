@@ -98,6 +98,43 @@ def test_sync_supports_scope_and_mode_frontmatter(tmp_path: Path) -> None:
     assert spec["pipeline"]["security_review"] is False
 
 
+def test_sync_applies_default_telegram_source_from_config(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "hermes_home": str(hermes_home),
+                "task_root": str(task_root),
+                "poll_repo_idle": True,
+                "max_pending_per_repo": 1,
+                "default_platform": "telegram",
+                "default_chat_id": "-1001234567890",
+                "default_thread_id": "42",
+            }
+        )
+    )
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_file = task_root / "inbox" / "demo.md"
+    task_file.write_text(
+        f"---\nrepo_path: {repo}\nbranch_base: main\nproject: Demo\n---\nImplement the demo task.\n",
+        encoding="utf-8",
+    )
+
+    command_sync(cfg)
+
+    ready = list((hermes_home / "jobs" / "ready").glob("*.json"))
+    payload = json.loads(ready[0].read_text(encoding="utf-8"))
+    assert payload["spec"]["source"]["type"] == "telegram"
+    assert payload["spec"]["source"]["chat_id"] == "-1001234567890"
+    assert payload["spec"]["source"]["thread_id"] == "42"
+
+
 def test_sync_resolves_dependencies_and_delivery_group_branch(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"
