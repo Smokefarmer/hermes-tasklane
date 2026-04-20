@@ -496,7 +496,7 @@ def job_spec(task: TaskFile, job_id: str) -> dict[str, Any]:
         },
         "branch": {
             "mode": task.branch_mode,
-            "base_branch": task.base_branch if task.branch_mode == "new-branch" else None,
+            "base_branch": task.base_branch or None,
             "work_branch": task.work_branch or None,
             "pr_target": task.base_branch if task.delivery_mode == "pull-request" else None,
         },
