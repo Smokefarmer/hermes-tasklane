@@ -32,8 +32,9 @@ while [[ $# -gt 0 ]]; do
 Usage: ./scripts/install.sh [--editable] [--systemd] [--no-skills] [--config /path/to/config.json]
 
 Installs hermes-tasklane, initializes local folders, and optionally installs
-user-level systemd units for sync/reconcile/watch timers. Bundled Hermes
-skills are installed by default unless --no-skills is passed.
+user-level systemd units for sync/reconcile/watch timers plus a disabled
+dashboard service template. Bundled Hermes skills are installed by default
+unless --no-skills is passed.
 EOF
       exit 0
       ;;
@@ -89,6 +90,7 @@ if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
     cp "$REPO_DIR/systemd/hermes-tasklane-reconcile.timer" "$SYSTEMD_USER_DIR/hermes-tasklane-reconcile.timer"
     sed -e "s|__CONFIG_PATH__|$CONFIG_PATH|g" -e "s|__EXECUTABLE__|$CLI_PATH|g" "$REPO_DIR/systemd/hermes-tasklane-watch.service" > "$SYSTEMD_USER_DIR/hermes-tasklane-watch.service"
     cp "$REPO_DIR/systemd/hermes-tasklane-watch.timer" "$SYSTEMD_USER_DIR/hermes-tasklane-watch.timer"
+    sed -e "s|__CONFIG_PATH__|$CONFIG_PATH|g" -e "s|__EXECUTABLE__|$CLI_PATH|g" "$REPO_DIR/systemd/hermes-tasklane-dashboard.service" > "$SYSTEMD_USER_DIR/hermes-tasklane-dashboard.service"
 
     systemctl --user daemon-reload
     systemctl --user enable --now hermes-tasklane-sync.timer

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from hermes_tasklane import cli
 from hermes_tasklane.cli import command_init, command_reconcile, command_sync, load_config, load_state
+from hermes_tasklane.dashboard import dashboard_state, job_detail
 
 
 def write_job_record(hermes_home: Path, state: str, job_id: str, payload: dict) -> Path:
@@ -500,3 +501,80 @@ def test_safe_retry_classifier_accepts_provider_500_and_rejects_dirty_worktree()
     )
     assert ok is False
     assert reason == "unsafe-error"
+
+
+def test_dashboard_state_groups_jobs_and_exposes_watch_health(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    write_job_record(
+        hermes_home,
+        "running",
+        "tasklane_running",
+        {
+            "claimed_at": "2026-01-01T00:00:00+00:00",
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "running job"},
+                "branch": {"mode": "new-branch", "base_branch": "main"},
+            },
+        },
+    )
+    write_job_record(
+        hermes_home,
+        "completed",
+        "tasklane_completed",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "completed job"},
+                "branch": {"mode": "new-branch", "base_branch": "main"},
+            },
+        },
+    )
+
+    state = dashboard_state(cfg)
+
+    assert state["watch"]["counts"]["running"] == 1
+    assert state["watch"]["counts"]["completed"] == 1
+    assert state["jobs"]["running"][0]["id"] == "tasklane_running"
+    assert state["jobs"]["completed"][0]["id"] == "tasklane_completed"
+    assert state["tasklane"]["task_root"] == str(task_root)
+
+
+def test_dashboard_job_detail_includes_event_log(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    write_job_record(
+        hermes_home,
+        "completed",
+        "tasklane_detail",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "detail job"},
+                "branch": {"mode": "new-branch", "base_branch": "main"},
+            },
+        },
+    )
+    cli.append_jsonl(
+        cli.job_event_log_path(cfg, "tasklane_detail"),
+        {"timestamp": "2026-01-01T00:00:00+00:00", "event_type": "job_completed", "state": "completed"},
+    )
+
+    detail = job_detail(cfg, "tasklane_detail")
+
+    assert detail["job"]["id"] == "tasklane_detail"
+    assert detail["events"][0]["event_type"] == "job_completed"

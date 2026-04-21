@@ -92,6 +92,20 @@ systemctl --user enable --now hermes-tasklane-watch.timer
 
 The watch timer runs `hermes-tasklane watch --mode observe --quiet-ok` every 15 minutes. It reports failed, blocked, stale, dead-gateway, and branch-policy problems in the systemd journal without mutating the queue.
 
+The installer also copies a disabled dashboard service:
+
+```bash
+systemctl --user enable --now hermes-tasklane-dashboard.service
+```
+
+The packaged service binds to `127.0.0.1:8765`. For a trusted internal network, edit the service and change the dashboard command to:
+
+```text
+hermes-tasklane --config /path/to/config.json dashboard --host 0.0.0.0 --port 8765
+```
+
+Do not expose the dashboard directly to the public internet without an authenticating reverse proxy.
+
 ## Cron example
 
 ```cron
@@ -124,6 +138,26 @@ Guarded mode retries only narrowly classified transient failures, including prov
 
 ```bash
 hermes-tasklane watch --mode guarded
+```
+
+## Dashboard command
+
+Start a read-only local dashboard:
+
+```bash
+hermes-tasklane dashboard --host 127.0.0.1 --port 8765
+```
+
+Start it for a trusted internal network:
+
+```bash
+hermes-tasklane dashboard --host 0.0.0.0 --port 8765
+```
+
+Open:
+
+```text
+http://<server-lan-ip>:8765
 ```
 
 ## GitHub auth

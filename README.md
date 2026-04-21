@@ -349,6 +349,28 @@ For Telegram watchdog messages, set `TELEGRAM_BOT_TOKEN` and configure `watch.te
 hermes-tasklane watch --notify --quiet-ok
 ```
 
+### Pipeline dashboard
+
+```bash
+hermes-tasklane dashboard --host 127.0.0.1 --port 8765
+```
+
+The dashboard is a read-only web view over the same JobStore files used by `watch`. It shows queue health, active work, failed/blocked jobs, completed jobs, and per-job event details. It does not create, retry, cancel, or edit jobs.
+
+For a trusted internal network, bind it to all interfaces:
+
+```bash
+hermes-tasklane dashboard --host 0.0.0.0 --port 8765
+```
+
+Then open:
+
+```text
+http://<server-lan-ip>:8765
+```
+
+Do not expose this dashboard directly to the public internet without an authenticating reverse proxy.
+
 ## Recommended automation
 
 ### systemd user timers (recommended)
@@ -359,6 +381,8 @@ systemctl --user status hermes-tasklane-sync.timer
 systemctl --user status hermes-tasklane-reconcile.timer
 systemctl --user status hermes-tasklane-watch.timer
 ```
+
+The installer also copies `hermes-tasklane-dashboard.service` but does not enable it automatically because binding a dashboard is a deployment choice.
 
 ### cron fallback
 
@@ -441,6 +465,9 @@ Show inbox/submitted/completed counts and current JobStore/governed run states.
 
 ### `hermes-tasklane watch`
 Review queue health for unattended operation. Defaults to observe-only. Use `--expected-base Project=branch` for one-off branch policy checks, `--ignore-blocked JOB_ID` for known obsolete jobs, `--json` for machine-readable output, and `--mode guarded` for narrowly safe transient retries.
+
+### `hermes-tasklane dashboard`
+Run a read-only web dashboard. Defaults to `127.0.0.1:8765`; use `--host 0.0.0.0` only on a trusted internal network.
 
 ## Delivery reconciliation behavior
 

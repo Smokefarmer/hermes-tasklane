@@ -1,0 +1,12 @@
+[Unit]
+Description=hermes-tasklane dashboard
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=__EXECUTABLE__ --config __CONFIG_PATH__ dashboard --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

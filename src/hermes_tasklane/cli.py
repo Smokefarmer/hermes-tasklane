@@ -1411,6 +1411,9 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--quiet-ok", action="store_true", help="Suppress output and notifications when health is ok")
     watch.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     watch.add_argument("--fail-on-problems", action="store_true", help="Exit 2 when warnings or critical findings exist")
+    dashboard = sub.add_parser("dashboard", help="Run the read-only Tasklane Pipeline web dashboard")
+    dashboard.add_argument("--host", default="127.0.0.1", help="Bind address; use 0.0.0.0 for trusted internal networks")
+    dashboard.add_argument("--port", type=int, default=8765, help="Bind port")
     return parser
 
 
@@ -1444,6 +1447,11 @@ def main(argv: list[str] | None = None) -> int:
                 json_output=args.json,
                 fail_on_problems=args.fail_on_problems,
             )
+        if args.command == "dashboard":
+            from .dashboard import serve_dashboard
+
+            serve_dashboard(cfg, host=args.host, port=args.port)
+            return 0
     except Exception as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 1
