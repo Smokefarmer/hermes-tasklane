@@ -478,3 +478,25 @@ def test_guarded_watch_retries_safe_transient_failed_job(tmp_path: Path) -> None
     ready = json.loads((hermes_home / "jobs" / "ready" / "tasklane_retry.json").read_text(encoding="utf-8"))
     assert ready["state"] == "ready"
     assert ready["last_error"] is None
+
+
+def test_safe_retry_classifier_accepts_provider_500_and_rejects_dirty_worktree() -> None:
+    ok, reason = cli.safe_to_retry(
+        {
+            "attempt": 1,
+            "last_error": "HTTP 500: The server had an error processing your request. Please include the request ID abc.",
+        },
+        3,
+    )
+    assert ok is True
+    assert reason == "safe-transient-error"
+
+    ok, reason = cli.safe_to_retry(
+        {
+            "attempt": 1,
+            "last_error": "worktree has uncommitted changes after agent run",
+        },
+        3,
+    )
+    assert ok is False
+    assert reason == "unsafe-error"

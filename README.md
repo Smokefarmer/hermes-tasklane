@@ -337,7 +337,7 @@ Use observe mode for unattended production:
 hermes-tasklane watch --mode observe --quiet-ok
 ```
 
-Use guarded mode only after you trust the queue. It retries narrowly classified transient failures, never blocked jobs, never planning/schema errors, and never dirty-worktree failures:
+Use guarded mode only after you trust the queue. It retries narrowly classified transient failures such as provider HTTP 500/502/503/504, APIError, timeouts, and rate-limit transport failures. It never retries blocked jobs, planning/schema errors, no-code-change results, or dirty-worktree failures:
 
 ```bash
 hermes-tasklane watch --mode guarded

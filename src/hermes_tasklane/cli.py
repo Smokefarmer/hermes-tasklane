@@ -30,10 +30,17 @@ ACTIVE_JOB_STATES = {"ready", "running"}
 JOB_STATES = {"draft", "ready", "running", "blocked", "completed", "failed", "needs-human"}
 TASK_SUFFIXES = {".md", ".txt"}
 SAFE_RETRY_ERROR_PATTERNS = (
+    "apierror",
     "connection reset",
     "gateway stopped",
     "gateway restart",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "internal server error",
     "rate limit",
+    "server had an error processing your request",
     "temporary",
     "timeout",
     "timed out",

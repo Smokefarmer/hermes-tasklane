@@ -120,7 +120,7 @@ Known obsolete blocked jobs can be ignored:
 hermes-tasklane watch --ignore-blocked tasklane_d08a145fbccc
 ```
 
-Guarded mode retries only narrowly classified transient failures and never retries blocked jobs, schema/planning failures, dirty-worktree failures, or no-code-change failures:
+Guarded mode retries only narrowly classified transient failures, including provider HTTP 500/502/503/504, APIError, timeouts, and rate-limit transport failures. It never retries blocked jobs, schema/planning failures, dirty-worktree failures, or no-code-change failures:
 
 ```bash
 hermes-tasklane watch --mode guarded
