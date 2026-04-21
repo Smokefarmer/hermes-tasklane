@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
+import re
+import shutil
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +16,214 @@ from . import cli
 
 
 REFRESH_SECONDS = 10
+
+
+def read_job_events(cfg: cli.Config, job_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    event_path = cli.job_event_log_path(cfg, job_id)
+    if not event_path.exists():
+        return events
+    lines = event_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if limit is not None:
+        lines = lines[-limit:]
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            events.append({"raw": line})
+    return events
+
+
+def summarize_event(event: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not event:
+        return None
+    return {
+        "timestamp": event.get("timestamp"),
+        "event_type": event.get("event_type"),
+        "state": event.get("state"),
+        "reason": event.get("reason"),
+        "metadata": event.get("metadata") or {},
+    }
+
+
+def sanitize_text(value: Any, *, limit: int = 600) -> str:
+    text = str(value or "")
+    text = re.sub(r"(?i)(bearer)\s+['\"]?[^'\"\s,)}]+", r"\1 <redacted>", text)
+    text = re.sub(r"(?i)(password=)[^\s]+", r"\1<redacted>", text)
+    text = re.sub(r"(?i)(token=)[^\s]+", r"\1<redacted>", text)
+    text = re.sub(r"(?i)(TOKEN\s*=\s*)[^\s]+", r"\1<redacted>", text)
+    if len(text) > limit:
+        return text[: limit - 1] + "..."
+    return text
+
+
+def summarize_command(arguments: str) -> str:
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return sanitize_text(arguments, limit=180)
+    command = str(parsed.get("command") or "").strip()
+    if not command:
+        return sanitize_text(parsed, limit=180)
+    for line in command.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(secret in stripped for secret in ("credential fill", "TOKEN", "Authorization", "password=")):
+            continue
+        return sanitize_text(stripped, limit=180)
+    return "credential-aware command"
+
+
+def summarize_tool_output(content: str) -> tuple[int | None, str]:
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return None, sanitize_text(content, limit=500)
+    exit_code = parsed.get("exit_code")
+    output = str(parsed.get("output") or parsed.get("error") or "").strip()
+    if not output:
+        return exit_code, "no output"
+    lines = [line for line in output.splitlines() if line.strip()]
+    tail = "\n".join(lines[-6:])
+    return exit_code, sanitize_text(tail, limit=500)
+
+
+def session_activity(cfg: cli.Config, job_id: str) -> dict[str, Any] | None:
+    path = cfg.hermes_home / "sessions" / f"session_job_{job_id}.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return {"path": str(path), "error": "session-json-invalid", "recent": [], "latest": None}
+    activities: list[dict[str, Any]] = []
+    for message in (payload.get("messages") or [])[-40:]:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "assistant" and message.get("tool_calls"):
+            for call in message.get("tool_calls") or []:
+                function = (call or {}).get("function") or {}
+                activities.append(
+                    {
+                        "kind": "tool_call",
+                        "label": function.get("name") or "tool",
+                        "summary": summarize_command(str(function.get("arguments") or "")),
+                    }
+                )
+        elif role == "tool":
+            exit_code, summary = summarize_tool_output(str(message.get("content") or ""))
+            activities.append(
+                {
+                    "kind": "tool_result",
+                    "label": "tool result",
+                    "status": "failed" if exit_code not in (None, 0) else "ok",
+                    "exit_code": exit_code,
+                    "summary": summary,
+                }
+            )
+        elif role == "assistant":
+            content = str(message.get("content") or "").strip()
+            if content:
+                activities.append({"kind": "assistant", "label": "agent", "summary": sanitize_text(content, limit=500)})
+    return {
+        "path": str(path),
+        "last_updated": payload.get("last_updated"),
+        "message_count": payload.get("message_count") or len(payload.get("messages") or []),
+        "latest": activities[-1] if activities else None,
+        "recent": activities[-6:],
+    }
+
+
+def current_run_summary(cfg: cli.Config, job: dict[str, Any]) -> dict[str, Any]:
+    job_id = str(job.get("id") or "")
+    spec = job.get("spec") or {}
+    branch = spec.get("branch") or {}
+    events = read_job_events(cfg, job_id, limit=8)
+    workspace_event = next((event for event in reversed(events) if event.get("event_type") == "job_workspace_prepared"), None)
+    workspace_meta = workspace_event.get("metadata") if isinstance(workspace_event, dict) else {}
+    compact = cli.compact_job(job)
+    compact.update(
+        {
+            "claimed_at": job.get("claimed_at"),
+            "updated_at": job.get("updated_at"),
+            "request_type": (spec.get("request") or {}).get("type"),
+            "pr_target": branch.get("pr_target"),
+            "workspace": {
+                "path": (workspace_meta or {}).get("worktree_path"),
+                "base_ref": (workspace_meta or {}).get("base_ref"),
+                "reused": (workspace_meta or {}).get("reused"),
+            },
+            "latest_event": summarize_event(events[-1] if events else None),
+            "recent_events": [summarize_event(event) for event in events[-5:]],
+            "session": session_activity(cfg, job_id),
+        }
+    )
+    return compact
+
+
+def read_meminfo() -> dict[str, int | None]:
+    values: dict[str, int] = {}
+    path = Path("/proc/meminfo")
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].endswith(":"):
+                try:
+                    values[parts[0].removesuffix(":")] = int(parts[1]) * 1024
+                except ValueError:
+                    continue
+    total = values.get("MemTotal")
+    available = values.get("MemAvailable")
+    used = total - available if total is not None and available is not None else None
+    return {"total_bytes": total, "available_bytes": available, "used_bytes": used}
+
+
+def disk_snapshot(path: Path) -> dict[str, Any]:
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return {"path": str(path), "total_bytes": None, "free_bytes": None, "used_bytes": None, "used_percent": None}
+    used_percent = round((usage.used / usage.total) * 100, 1) if usage.total else None
+    return {
+        "path": str(path),
+        "total_bytes": usage.total,
+        "free_bytes": usage.free,
+        "used_bytes": usage.used,
+        "used_percent": used_percent,
+    }
+
+
+def server_resources(cfg: cli.Config) -> dict[str, Any]:
+    cores = os.cpu_count() or 1
+    try:
+        load_1m, load_5m, load_15m = os.getloadavg()
+    except OSError:
+        load_1m = load_5m = load_15m = None
+    mem = read_meminfo()
+    total = mem.get("total_bytes")
+    used = mem.get("used_bytes")
+    mem["used_percent"] = round((used / total) * 100, 1) if isinstance(total, int) and total and isinstance(used, int) else None
+    load_percent = round((load_1m / cores) * 100, 1) if isinstance(load_1m, float) else None
+    return {
+        "cpu": {
+            "cores": cores,
+            "load_1m": round(load_1m, 2) if isinstance(load_1m, float) else None,
+            "load_5m": round(load_5m, 2) if isinstance(load_5m, float) else None,
+            "load_15m": round(load_15m, 2) if isinstance(load_15m, float) else None,
+            "load_percent": load_percent,
+        },
+        "memory": mem,
+        "disk": {
+            "root": disk_snapshot(Path("/")),
+            "task_root": disk_snapshot(cfg.task_root),
+            "hermes_home": disk_snapshot(cfg.hermes_home),
+        },
+        "process": {
+            "dashboard_pid": os.getpid(),
+        },
+    }
 
 
 def dashboard_state(cfg: cli.Config) -> dict[str, Any]:
@@ -32,6 +243,8 @@ def dashboard_state(cfg: cli.Config) -> dict[str, Any]:
         "refresh_seconds": REFRESH_SECONDS,
         "watch": watch,
         "jobs": jobs_by_state,
+        "current_runs": [current_run_summary(cfg, job) for job in jobs if job.get("state") == "running"],
+        "resources": server_resources(cfg),
         "totals": watch.get("counts") or {},
         "tasklane": {
             "inbox": watch.get("inbox", 0),
@@ -45,14 +258,7 @@ def job_detail(cfg: cli.Config, job_id: str) -> dict[str, Any]:
     payload = cli.find_job_record(cfg, job_id)
     if not isinstance(payload, dict):
         raise KeyError(job_id)
-    events: list[dict[str, Any]] = []
-    event_path = cli.job_event_log_path(cfg, job_id)
-    if event_path.exists():
-        for line in event_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                events.append({"raw": line})
+    events = read_job_events(cfg, job_id)
     return {"job": payload, "events": events}
 
 
@@ -101,6 +307,24 @@ INDEX_HTML = """<!doctype html>
       <div class="metric"><span>Blocked</span><strong id="count-blocked">0</strong></div>
       <div class="metric"><span>Completed</span><strong id="count-completed">0</strong></div>
       <div class="metric"><span>Needs Human</span><strong id="count-needs-human">0</strong></div>
+    </section>
+
+    <section class="content-grid ops-grid">
+      <section class="panel primary-panel" aria-labelledby="current-run-heading">
+        <div class="panel-heading">
+          <h2 id="current-run-heading">Current Run</h2>
+          <span id="current-run-state" class="subtle">Live state</span>
+        </div>
+        <div id="current-run-list" class="run-list"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="resources-heading">
+        <div class="panel-heading">
+          <h2 id="resources-heading">Server Resources</h2>
+          <span id="resource-state" class="subtle">Load</span>
+        </div>
+        <div id="resource-list" class="resource-list"></div>
+      </section>
     </section>
 
     <section class="content-grid">
@@ -339,21 +563,24 @@ h2 { font-size: 18px; line-height: 1.2; letter-spacing: 0; }
   overflow-wrap: anywhere;
 }
 
-.job-list, .queue-list, .problem-list {
+.job-list, .queue-list, .problem-list, .run-list, .resource-list {
   display: grid;
   gap: 10px;
 }
 
-.job-item {
+.job-item, .run-card, .resource-card {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
   gap: 12px;
-  align-items: center;
   min-height: 72px;
   padding: 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--popover);
+}
+
+.job-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
 }
 
 .job-item button {
@@ -372,6 +599,84 @@ h2 { font-size: 18px; line-height: 1.2; letter-spacing: 0; }
   color: var(--muted-foreground);
   font-size: 13px;
   overflow-wrap: anywhere;
+}
+
+.run-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.fact-grid, .resource-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.fact, .event-row {
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--muted);
+}
+
+.fact span, .resource-card span {
+  display: block;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.fact strong, .resource-card strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--foreground);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.event-list {
+  display: grid;
+  gap: 6px;
+}
+
+.event-row {
+  color: var(--muted-foreground);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.event-row strong {
+  color: var(--foreground);
+}
+
+.resource-card {
+  min-height: 88px;
+}
+
+.resource-value {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.resource-bar {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 8px;
+  background: #050706;
+  border: 1px solid var(--border);
+}
+
+.resource-bar i {
+  display: block;
+  width: 0%;
+  height: 100%;
+  background: var(--ring);
 }
 
 .state-badge {
@@ -465,6 +770,8 @@ h2 { font-size: 18px; line-height: 1.2; letter-spacing: 0; }
   }
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .job-item { grid-template-columns: 1fr; }
+  .fact-grid, .resource-grid { grid-template-columns: 1fr; }
+  .run-header { flex-direction: column; }
   h1 { font-size: 25px; }
 }
 """
@@ -496,6 +803,33 @@ function stateClass(state) {
 
 function jobLabel(job) {
   return `${text(job.project)} · ${text(job.id)}`;
+}
+
+function formatBytes(bytes) {
+  if (bytes === null || bytes === undefined) return '-';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = Number(bytes);
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value = value / 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function formatPercent(value) {
+  if (value === null || value === undefined) return '-';
+  return `${Number(value).toFixed(1)}%`;
+}
+
+function formatTimestamp(value) {
+  if (!value) return '-';
+  return new Date(value).toLocaleString();
+}
+
+function clampPercent(value) {
+  const numeric = Number(value || 0);
+  return Math.max(0, Math.min(100, numeric));
 }
 
 function renderJob(job) {
@@ -530,6 +864,104 @@ function renderJobs(container, jobs, emptyText) {
   for (const job of jobs) {
     container.appendChild(renderJob(job));
   }
+}
+
+function renderCurrentRuns(data) {
+  const list = el('current-run-list');
+  const runs = data.current_runs || [];
+  el('current-run-state').textContent = runs.length ? `${runs.length} running` : 'Idle';
+  list.innerHTML = '';
+  if (!runs.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No run is active right now.';
+    list.appendChild(empty);
+    return;
+  }
+  for (const run of runs) {
+    const latest = run.latest_event || {};
+    const session = run.session || {};
+    const latestActivity = session.latest || {};
+    const workspace = run.workspace || {};
+    const activities = (session.recent || []).filter(Boolean).slice(-5).reverse();
+    const events = (run.recent_events || []).filter(Boolean).slice(-4).reverse();
+    const item = document.createElement('div');
+    item.className = 'run-card';
+    item.innerHTML = `
+      <div class="run-header">
+        <div>
+          <div class="job-title">${escapeHtml(run.title || run.id)}</div>
+          <div class="job-meta">${escapeHtml(jobLabel(run))} · ${escapeHtml(run.work_branch || run.base_branch || 'no branch')}</div>
+        </div>
+        <div class="top-actions">
+          <span class="state-badge ${stateClass(run.state)}">${escapeHtml(run.state || 'unknown')}</span>
+          <button type="button" data-job-id="${escapeHtml(run.id || '')}">Inspect</button>
+        </div>
+      </div>
+      <div class="fact-grid">
+        <div class="fact"><span>Runtime</span><strong>${escapeHtml(text(run.runtime_minutes !== null && run.runtime_minutes !== undefined ? `${run.runtime_minutes} min` : '-'))}</strong></div>
+        <div class="fact"><span>Latest Activity</span><strong>${escapeHtml(text(latestActivity.summary || latest.event_type || latest.reason))}</strong></div>
+        <div class="fact"><span>Session Updated</span><strong>${escapeHtml(formatTimestamp(session.last_updated || latest.timestamp || run.updated_at))}</strong></div>
+        <div class="fact"><span>Worktree</span><strong>${escapeHtml(text(workspace.path))}</strong></div>
+      </div>
+      <div class="event-list"></div>
+    `;
+    item.querySelector('button').addEventListener('click', () => loadJob(run.id));
+    const eventList = item.querySelector('.event-list');
+    if (activities.length) {
+      for (const activity of activities) {
+        const row = document.createElement('div');
+        row.className = 'event-row';
+        const status = activity.exit_code !== null && activity.exit_code !== undefined ? ` exit ${activity.exit_code}` : '';
+        row.innerHTML = `<strong>${escapeHtml(activity.kind || 'activity')}${escapeHtml(status)}</strong> · ${escapeHtml(activity.summary || activity.label || '')}`;
+        eventList.appendChild(row);
+      }
+    } else if (!events.length) {
+      const empty = document.createElement('div');
+      empty.className = 'event-row';
+      empty.textContent = 'No events recorded yet.';
+      eventList.appendChild(empty);
+    } else {
+      for (const event of events) {
+        const row = document.createElement('div');
+        row.className = 'event-row';
+        row.innerHTML = `<strong>${escapeHtml(event.event_type || 'event')}</strong> · ${escapeHtml(event.reason || event.state || '')} · ${escapeHtml(formatTimestamp(event.timestamp))}`;
+        eventList.appendChild(row);
+      }
+    }
+    list.appendChild(item);
+  }
+}
+
+function resourceCard(label, value, detail, percent) {
+  const card = document.createElement('div');
+  card.className = 'resource-card';
+  const width = percent === null || percent === undefined ? 0 : clampPercent(percent);
+  card.innerHTML = `
+    <div class="resource-value">
+      <div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>
+      <span>${escapeHtml(detail || '')}</span>
+    </div>
+    <div class="resource-bar" aria-hidden="true"><i style="width: ${width}%"></i></div>
+  `;
+  return card;
+}
+
+function renderResources(data) {
+  const resources = data.resources || {};
+  const cpu = resources.cpu || {};
+  const memory = resources.memory || {};
+  const disk = resources.disk || {};
+  const list = el('resource-list');
+  list.innerHTML = '';
+  el('resource-state').textContent = `${text(cpu.load_1m)} load · ${text(cpu.cores)} cores`;
+  const grid = document.createElement('div');
+  grid.className = 'resource-grid';
+  grid.appendChild(resourceCard('CPU Load', `${text(cpu.load_1m)} / ${text(cpu.cores)}`, `5m ${text(cpu.load_5m)}`, cpu.load_percent));
+  grid.appendChild(resourceCard('Memory', formatPercent(memory.used_percent), `${formatBytes(memory.used_bytes)} used`, memory.used_percent));
+  grid.appendChild(resourceCard('Task Disk', formatPercent(disk.task_root?.used_percent), `${formatBytes(disk.task_root?.free_bytes)} free`, disk.task_root?.used_percent));
+  grid.appendChild(resourceCard('Hermes Disk', formatPercent(disk.hermes_home?.used_percent), `${formatBytes(disk.hermes_home?.free_bytes)} free`, disk.hermes_home?.used_percent));
+  list.appendChild(grid);
 }
 
 function escapeHtml(value) {
@@ -582,6 +1014,8 @@ function render(data) {
   el('updated-at').textContent = new Date(data.timestamp).toLocaleString();
   el('subtitle').textContent = `${data.tasklane.task_root} · refreshes every ${data.refresh_seconds}s`;
 
+  renderCurrentRuns(data);
+  renderResources(data);
   renderJobs(el('active-list'), data.jobs.running || [], 'No active job.');
   renderProblems(data);
 

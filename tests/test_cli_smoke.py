@@ -529,6 +529,44 @@ def test_dashboard_state_groups_jobs_and_exposes_watch_health(tmp_path: Path) ->
             },
         },
     )
+    cli.append_jsonl(
+        cli.job_event_log_path(cfg, "tasklane_running"),
+        {
+            "timestamp": "2026-01-01T00:00:01+00:00",
+            "event_type": "job_workspace_prepared",
+            "state": "running",
+            "reason": "isolated-worktree-ready",
+            "metadata": {"worktree_path": "/tmp/tasklane_running"},
+        },
+    )
+    session_dir = hermes_home / "sessions"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session_job_tasklane_running.json").write_text(
+        json.dumps(
+            {
+                "last_updated": "2026-01-01T00:00:02+00:00",
+                "message_count": 2,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "terminal",
+                                    "arguments": json.dumps({"command": "npm test"}),
+                                }
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "content": json.dumps({"output": "1 failed\npassword=secret", "exit_code": 1, "error": None}),
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     write_job_record(
         hermes_home,
         "completed",
@@ -549,6 +587,14 @@ def test_dashboard_state_groups_jobs_and_exposes_watch_health(tmp_path: Path) ->
     assert state["watch"]["counts"]["completed"] == 1
     assert state["jobs"]["running"][0]["id"] == "tasklane_running"
     assert state["jobs"]["completed"][0]["id"] == "tasklane_completed"
+    assert state["current_runs"][0]["id"] == "tasklane_running"
+    assert state["current_runs"][0]["workspace"]["path"] == "/tmp/tasklane_running"
+    assert state["current_runs"][0]["latest_event"]["event_type"] == "job_workspace_prepared"
+    assert state["current_runs"][0]["session"]["latest"]["exit_code"] == 1
+    assert "password=<redacted>" in state["current_runs"][0]["session"]["latest"]["summary"]
+    assert state["resources"]["cpu"]["cores"] >= 1
+    assert "memory" in state["resources"]
+    assert "task_root" in state["resources"]["disk"]
     assert state["tasklane"]["task_root"] == str(task_root)
 
 
