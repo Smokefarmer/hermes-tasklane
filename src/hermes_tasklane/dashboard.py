@@ -17,10 +17,13 @@ REFRESH_SECONDS = 10
 
 def dashboard_state(cfg: cli.Config) -> dict[str, Any]:
     watch = cli.build_watch_report(cfg)
+    ignored_blocked = cli.watch_ignored_blocked_jobs(cfg)
     jobs = cli.iter_job_records(cfg)
     jobs_by_state: dict[str, list[dict[str, Any]]] = {state: [] for state in sorted(cli.JOB_STATES)}
     for job in jobs:
         state = str(job.get("state") or "unknown")
+        if state == "blocked" and str(job.get("id") or "") in ignored_blocked:
+            continue
         jobs_by_state.setdefault(state, []).append(cli.compact_job(job))
     for records in jobs_by_state.values():
         records.sort(key=lambda item: str(item.get("id") or ""))

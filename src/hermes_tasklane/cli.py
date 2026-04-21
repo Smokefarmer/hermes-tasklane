@@ -1112,6 +1112,7 @@ def build_watch_report(
     for job in jobs:
         state = str(job.get("state") or "unknown")
         by_state[state] = by_state.get(state, 0) + 1
+    counts_all = dict(by_state)
     problems: list[dict[str, Any]] = []
     notices: list[dict[str, Any]] = []
     gateway = systemd_gateway_status() if check_gateway else {"available": False, "state": "unchecked", "ok": None}
@@ -1133,12 +1134,17 @@ def build_watch_report(
         pid = claimant_pid(job)
         if pid is not None and not process_is_alive(pid):
             add_watch_problem(problems, "critical", "running-dead-claimant", f"claimed gateway process {pid} is not alive", job)
+    active_blocked: list[dict[str, Any]] = []
+    ignored_blocked_jobs: list[dict[str, Any]] = []
     for job in blocked:
         job_id = str(job.get("id") or "")
         if job_id in ignored:
+            ignored_blocked_jobs.append(job)
             notices.append({"code": "blocked-ignored", "job": compact_job(job)})
             continue
+        active_blocked.append(job)
         add_watch_problem(problems, "warning", "job-blocked", "job is blocked and needs review", job)
+    by_state["blocked"] = len(active_blocked)
     for job in needs_human:
         add_watch_problem(problems, "warning", "job-needs-human", "job is waiting for human input", job)
     for job in failed:
@@ -1163,10 +1169,12 @@ def build_watch_report(
         "health": health,
         "gateway": gateway,
         "counts": by_state,
+        "counts_all": counts_all,
         "inbox": len([p for p in cfg.inbox_dir.iterdir() if p.is_file()]) if cfg.inbox_dir.exists() else 0,
         "running": [compact_job(job) for job in running],
         "ready": [compact_job(job) for job in ready],
-        "blocked": [compact_job(job) for job in blocked],
+        "blocked": [compact_job(job) for job in active_blocked],
+        "ignored_blocked": [compact_job(job) for job in ignored_blocked_jobs],
         "needs_human": [compact_job(job) for job in needs_human],
         "failed": [compact_job(job) for job in failed],
         "problems": problems,

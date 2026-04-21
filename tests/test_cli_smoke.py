@@ -411,6 +411,10 @@ def test_watch_ignores_known_blocked_job(tmp_path: Path) -> None:
     report = cli.build_watch_report(cfg, ignored_blocked={"tasklane_obsolete"}, check_gateway=False)
 
     assert report["health"] == "ok"
+    assert report["counts"]["blocked"] == 0
+    assert report["counts_all"]["blocked"] == 1
+    assert report["blocked"] == []
+    assert report["ignored_blocked"][0]["id"] == "tasklane_obsolete"
     assert report["problems"] == []
     assert report["notices"][0]["code"] == "blocked-ignored"
 
@@ -546,6 +550,38 @@ def test_dashboard_state_groups_jobs_and_exposes_watch_health(tmp_path: Path) ->
     assert state["jobs"]["running"][0]["id"] == "tasklane_running"
     assert state["jobs"]["completed"][0]["id"] == "tasklane_completed"
     assert state["tasklane"]["task_root"] == str(task_root)
+
+
+def test_dashboard_hides_ignored_blocked_jobs_from_active_counts(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.watch["ignored_blocked_jobs"] = ["tasklane_obsolete"]
+    command_init(cfg, str(config_path))
+
+    write_job_record(
+        hermes_home,
+        "blocked",
+        "tasklane_obsolete",
+        {
+            "last_error": "superseded",
+            "spec": {
+                "project": "Treasure Hunter",
+                "repo": {"key": "repo:///repo/th"},
+                "request": {"title": "obsolete"},
+                "branch": {"mode": "new-branch", "base_branch": "development"},
+            },
+        },
+    )
+
+    state = dashboard_state(cfg)
+
+    assert state["totals"]["blocked"] == 0
+    assert state["watch"]["counts_all"]["blocked"] == 1
+    assert state["watch"]["ignored_blocked"][0]["id"] == "tasklane_obsolete"
+    assert state["jobs"]["blocked"] == []
 
 
 def test_dashboard_job_detail_includes_event_log(tmp_path: Path) -> None:
