@@ -62,3 +62,22 @@ Clean up the auth flow, add regression tests, run verification, and prepare a co
 - For a many-task single-PR batch, use `direct-push` for implementation tasks and one final `pull-request` task that depends on all implementation tasks.
 - Add `platform: telegram` and `chat_id` when the group should receive start/completion/failure updates.
 - `default_platform`, `default_chat_id`, and `default_thread_id` in config are used when a task file omits these fields.
+
+## Preflight Blockers
+
+`hermes-tasklane sync` validates task files before it writes Hermes JobStore
+records. A blocked task stays in `inbox/` and receives a sibling
+`*.preflight.json` report with concrete findings.
+
+Current blockers:
+
+- `repo_path` does not exist.
+- `feature-large` or `refactor-large` uses `direct-push`.
+- `detached-review` uses a mutating delivery mode.
+- A large task has no `allowed_paths` while `allow_unlisted_paths` is true.
+- `allow_unlisted_paths: false` is set without `allowed_paths`.
+- `review_loops` is outside `1..3`.
+- `depends_on` references an unknown task ID.
+- Dependencies contain a cycle.
+- One `delivery_group` mixes multiple base branches.
+- Multiple tasks mutate the same `work_branch` without an ordering dependency.

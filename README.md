@@ -276,6 +276,13 @@ If the repo is idle, the task is converted into a JobStore record under:
 ~/.hermes/jobs/ready/
 ```
 
+Before submission, `sync` runs a production preflight. Risky tasks stay in
+`inbox/` and get a sibling report such as `fix-login-flow.md.preflight.json`
+instead of entering Hermes. Current blockers include unbounded large tasks,
+unsafe direct-push large tasks, missing dependencies, dependency cycles, mixed
+base branches inside one delivery group, and multiple independent roots trying
+to mutate the same integration branch.
+
 If the repo is busy, the task stays deferred in the inbox and will be eligible on the next sync.
 
 ### Reconcile finished work back into tasklane state

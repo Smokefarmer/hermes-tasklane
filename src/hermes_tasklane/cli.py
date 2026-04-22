@@ -570,6 +570,135 @@ def event_log_path(cfg: Config, run_id: str) -> Path:
     return cfg.events_dir / f"{run_id}.jsonl"
 
 
+def preflight_report_path(task_path: Path) -> Path:
+    return task_path.with_name(f"{task_path.name}.preflight.json")
+
+
+def clear_preflight_report(task_path: Path) -> None:
+    try:
+        preflight_report_path(task_path).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def write_preflight_report(task: TaskFile, findings: list[dict[str, Any]]) -> None:
+    payload = {
+        "task": task.path.name,
+        "uid": task.uid,
+        "status": "blocked",
+        "generated_at": now_iso(),
+        "findings": findings,
+    }
+    atomic_write_json(preflight_report_path(task.path), payload)
+
+
+def preflight_blocker(code: str, message: str) -> dict[str, Any]:
+    return {"severity": "blocker", "code": code, "message": message}
+
+
+def task_is_large(task: TaskFile) -> bool:
+    return task.request_type in {"feature-large", "refactor-large"}
+
+
+def task_mutates_repo(task: TaskFile) -> bool:
+    return task.delivery_mode in {"pull-request", "direct-push"} and task.branch_mode != "detached-review"
+
+
+def dependency_cycle_uids(tasks_by_uid: dict[str, TaskFile]) -> set[str]:
+    graph = {
+        uid: [dep for dep in task.dependencies if dep in tasks_by_uid]
+        for uid, task in tasks_by_uid.items()
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    cyclic: set[str] = set()
+
+    def visit(uid: str, stack: list[str]) -> None:
+        if uid in visited:
+            return
+        if uid in visiting:
+            try:
+                start = stack.index(uid)
+                cyclic.update(stack[start:])
+            except ValueError:
+                cyclic.add(uid)
+            return
+        visiting.add(uid)
+        for dep in graph.get(uid, []):
+            visit(dep, [*stack, dep])
+        visiting.remove(uid)
+        visited.add(uid)
+
+    for uid in graph:
+        visit(uid, [uid])
+    return cyclic
+
+
+def preflight_task_batch(loaded_tasks: dict[Path, TaskFile], submitted: dict[str, Any]) -> dict[Path, list[dict[str, Any]]]:
+    findings: dict[Path, list[dict[str, Any]]] = {path: [] for path in loaded_tasks}
+    tasks_by_uid = {task.uid: task for task in loaded_tasks.values()}
+    submitted_uid_to_job_id = submitted_dependency_ids(submitted)
+
+    for path, task in loaded_tasks.items():
+        if not task.repo_path.exists():
+            findings[path].append(preflight_blocker("repo-path-missing", f"repo_path does not exist: {task.repo_path}"))
+        if task.delivery_mode == "direct-push" and task_is_large(task):
+            findings[path].append(preflight_blocker("direct-push-large-task", "feature-large/refactor-large tasks must use pull-request delivery"))
+        if task.branch_mode == "detached-review" and task.delivery_mode != "report-only":
+            findings[path].append(preflight_blocker("detached-review-mutating-delivery", "detached-review tasks must use report-only delivery"))
+        if task_is_large(task) and task.allow_unlisted_paths and not task.allowed_paths:
+            findings[path].append(preflight_blocker("large-task-unbounded-scope", "large tasks must declare allowed_paths or set allow_unlisted_paths: false"))
+        if not task.allow_unlisted_paths and not task.allowed_paths:
+            findings[path].append(preflight_blocker("empty-restricted-scope", "allow_unlisted_paths: false requires at least one allowed_paths entry"))
+        if task.review_loops < 1 or task.review_loops > 3:
+            findings[path].append(preflight_blocker("review-loops-out-of-range", "review_loops must be between 1 and 3"))
+        for dependency in task.dependencies:
+            if dependency in tasks_by_uid or dependency in submitted_uid_to_job_id or dependency.startswith("tasklane_"):
+                continue
+            findings[path].append(preflight_blocker("dependency-not-found", f"dependency {dependency!r} is not in this batch or submitted state"))
+
+    for uid in dependency_cycle_uids(tasks_by_uid):
+        task = tasks_by_uid[uid]
+        findings[task.path].append(preflight_blocker("dependency-cycle", "task dependencies contain a cycle"))
+
+    delivery_groups: dict[tuple[str, str], list[TaskFile]] = {}
+    branch_groups: dict[tuple[str, str], list[TaskFile]] = {}
+    for task in loaded_tasks.values():
+        repo = repo_key(task.repo_path)
+        if task.delivery_group:
+            delivery_groups.setdefault((repo, task.delivery_group), []).append(task)
+        if task_mutates_repo(task) and task.work_branch:
+            branch_groups.setdefault((repo, task.work_branch), []).append(task)
+
+    for (_repo, group), tasks in delivery_groups.items():
+        bases = {task.base_branch for task in tasks if task.base_branch}
+        if len(bases) > 1:
+            for task in tasks:
+                findings[task.path].append(
+                    preflight_blocker(
+                        "delivery-group-mixed-base-branches",
+                        f"delivery_group {group!r} mixes base branches: {', '.join(sorted(bases))}",
+                    )
+                )
+
+    for (_repo, branch), tasks in branch_groups.items():
+        if len(tasks) < 2:
+            continue
+        task_uids = {task.uid for task in tasks}
+        roots = [task for task in tasks if not any(dep in task_uids for dep in task.dependencies)]
+        if len(roots) > 1:
+            root_names = ", ".join(sorted(task.uid for task in roots))
+            for task in roots:
+                findings[task.path].append(
+                    preflight_blocker(
+                        "same-branch-multiple-roots",
+                        f"multiple tasks mutate {branch!r} without an ordering dependency: {root_names}",
+                    )
+                )
+
+    return findings
+
+
 def move_task_file(src: Path, dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     destination = dest_dir / src.name
@@ -610,6 +739,7 @@ def command_sync(cfg: Config) -> int:
             actions.append({"task": path.name, "status": "invalid", "error": str(exc)})
             continue
         loaded_tasks[path] = task
+    preflight_findings = preflight_task_batch(loaded_tasks, submitted)
     batch_uid_to_job_id = {task.uid: task_job_id(task) for task in loaded_tasks.values()}
     uid_to_job_id = submitted_dependency_ids(submitted)
     uid_to_job_id.update(batch_uid_to_job_id)
@@ -618,6 +748,12 @@ def command_sync(cfg: Config) -> int:
         if task.uid in submitted:
             actions.append({"task": path.name, "status": "already-submitted", "run_id": submitted[task.uid].get("run_id")})
             continue
+        blockers = preflight_findings.get(path) or []
+        if blockers:
+            write_preflight_report(task, blockers)
+            actions.append({"task": path.name, "status": "preflight-blocked", "findings": blockers})
+            continue
+        clear_preflight_report(path)
         expected_repo_key = repo_key(task.repo_path)
         job_id = batch_uid_to_job_id[task.uid]
         task.dependencies = dependency_job_ids(task, uid_to_job_id)

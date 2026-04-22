@@ -107,6 +107,62 @@ def test_sync_supports_scope_and_mode_frontmatter(tmp_path: Path) -> None:
     assert spec["pipeline"]["security_review"] is False
 
 
+def test_sync_preflight_blocks_unbounded_large_task(tmp_path: Path, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_file = task_root / "inbox" / "big.md"
+    task_file.write_text(
+        f"---\nrepo_path: {repo}\nbase_branch: development\nrequest_type: feature\n---\nImplement the whole season.\n",
+        encoding="utf-8",
+    )
+
+    command_sync(cfg)
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["actions"][0]["status"] == "preflight-blocked"
+    assert output["actions"][0]["findings"][0]["code"] == "large-task-unbounded-scope"
+    assert task_file.exists()
+    assert (task_root / "inbox" / "big.md.preflight.json").exists()
+    assert not list((hermes_home / "jobs" / "ready").glob("*.json"))
+
+
+def test_sync_preflight_blocks_same_branch_multiple_roots(tmp_path: Path, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (task_root / "inbox" / "one.md").write_text(
+        f"---\nid: one\nrepo_path: {repo}\nbase_branch: development\ndelivery_group: s3-wave\nallowed_paths: apps/client\nrequest_type: feature\n---\nBuild one.\n",
+        encoding="utf-8",
+    )
+    (task_root / "inbox" / "two.md").write_text(
+        f"---\nid: two\nrepo_path: {repo}\nbase_branch: development\ndelivery_group: s3-wave\nallowed_paths: apps/server\nrequest_type: feature\n---\nBuild two.\n",
+        encoding="utf-8",
+    )
+
+    command_sync(cfg)
+
+    output = json.loads(capsys.readouterr().out)
+    blocked = [action for action in output["actions"] if action["status"] == "preflight-blocked"]
+    assert len(blocked) == 2
+    assert {finding["code"] for action in blocked for finding in action["findings"]} == {"same-branch-multiple-roots"}
+    assert not list((hermes_home / "jobs" / "ready").glob("*.json"))
+
+
 def test_sync_applies_default_telegram_source_from_config(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"
