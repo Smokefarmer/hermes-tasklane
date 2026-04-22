@@ -36,6 +36,7 @@ It is designed for teams that already run Hermes and want a simple, shareable â€
 - detects failed, blocked, stale, and dead-gateway jobs
 - checks expected base-branch policy per project or repo
 - defaults to observe-only and can optionally run guarded safe retries
+- can auto-salvage failed pull-request jobs that already produced scoped, verified code changes
 
 ## What it does not replace
 
@@ -325,8 +326,20 @@ Configure branch policy and known expected blocked jobs in `~/.config/hermes-tas
 {
   "watch": {
     "mode": "observe",
+    "auto_salvage": false,
+    "verification_timeout_seconds": 1800,
     "stale_running_minutes": 180,
     "max_retry_attempts": 3,
+    "verification_commands": [
+      "git diff --check"
+    ],
+    "verification_profiles": {
+      "Treasure Hunter": [
+        "git diff --check",
+        "npm run client:typecheck",
+        "npm run server:typecheck"
+      ]
+    },
     "expected_base_branches": {
       "Alvin": "develop",
       "Treasure Hunter": "development"
@@ -338,16 +351,39 @@ Configure branch policy and known expected blocked jobs in `~/.config/hermes-tas
 }
 ```
 
-Use observe mode for unattended production:
+Use observe mode for dry runs and first installs:
 
 ```bash
 hermes-tasklane watch --mode observe --quiet-ok
 ```
 
-Use guarded mode only after you trust the queue. It retries narrowly classified transient failures such as provider HTTP 500/502/503/504, APIError, timeouts, and rate-limit transport failures. It never retries blocked jobs, planning/schema errors, no-code-change results, or dirty-worktree failures:
+Use guarded mode for unattended production after the repo policies and verification commands are configured:
 
 ```bash
 hermes-tasklane watch --mode guarded
+```
+
+Guarded mode retries narrowly classified transient failures such as provider HTTP 500/502/503/504, APIError, timeouts, and rate-limit transport failures only when the failed job worktree is clean. It never retries blocked jobs, planning/schema errors, or no-code-change results.
+
+If `auto_salvage` is enabled, guarded mode treats dirty failed pull-request jobs differently:
+
+- inspect the job worktree and current branch
+- require the job failure to match a safe provider/job failure pattern
+- require all changed files to stay inside the task scope
+- run configured verification commands
+- commit remaining dirty changes
+- push the task branch
+- find or create the pull request
+- mark the job and tasklane file completed
+
+If any guard fails, the job stays failed or needs-human and is not pushed.
+
+Manual salvage commands:
+
+```bash
+hermes-tasklane salvage <job-id>
+hermes-tasklane salvage <job-id> --verify
+hermes-tasklane salvage <job-id> --auto
 ```
 
 For Telegram watchdog messages, set `TELEGRAM_BOT_TOKEN` and configure `watch.telegram_chat_id` or `default_chat_id`, then run:
@@ -471,7 +507,10 @@ Reconcile submitted tasks from JobStore/governed run state and attempt PR/CI nor
 Show inbox/submitted/completed counts and current JobStore/governed run states.
 
 ### `hermes-tasklane watch`
-Review queue health for unattended operation. Defaults to observe-only. Use `--expected-base Project=branch` for one-off branch policy checks, `--ignore-blocked JOB_ID` for known obsolete jobs, `--json` for machine-readable output, and `--mode guarded` for narrowly safe transient retries.
+Review queue health for unattended operation. Defaults to observe-only. Use `--expected-base Project=branch` for one-off branch policy checks, `--ignore-blocked JOB_ID` for known obsolete jobs, `--json` for machine-readable output, and `--mode guarded` for narrowly safe transient retries and configured auto-salvage.
+
+### `hermes-tasklane salvage`
+Inspect or deliver a failed pull-request job that produced code changes. `--verify` runs the configured checks without committing or pushing. `--auto` runs the full guarded salvage path.
 
 ### `hermes-tasklane dashboard`
 Run a read-only web dashboard. Defaults to `127.0.0.1:8765`; use `--host 0.0.0.0` only on a trusted internal network.

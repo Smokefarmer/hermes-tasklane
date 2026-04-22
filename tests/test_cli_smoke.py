@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 from hermes_tasklane import cli
@@ -27,6 +28,41 @@ def write_config(path: Path, *, hermes_home: Path, task_root: Path) -> None:
             }
         )
     )
+
+
+def init_git_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tasklane@example.test"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Tasklane Test"], cwd=path, check=True)
+    (path / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "tasklane/demo"], cwd=path, check=True, capture_output=True)
+
+
+def failed_provider_job(repo: Path, *, allowed_paths: list[str] | None = None) -> dict:
+    return {
+        "attempt": 2,
+        "last_error": "An error occurred while processing your request. Please include the request ID abc.",
+        "spec": {
+            "project": "Demo",
+            "repo": {"key": f"repo://{repo}", "path": str(repo)},
+            "request": {"title": "salvage me", "body": "Implement the demo task."},
+            "branch": {
+                "mode": "new-branch",
+                "base_branch": "main",
+                "work_branch": "tasklane/demo",
+                "pr_target": "main",
+            },
+            "delivery_mode": "pull-request",
+            "scope": {
+                "allowed_paths": allowed_paths or ["README.md"],
+                "denied_paths": [],
+                "allow_unlisted_paths": False,
+            },
+        },
+    }
 
 
 def test_init_writes_example_outside_inbox(tmp_path: Path) -> None:
@@ -621,6 +657,134 @@ def test_safe_retry_classifier_accepts_provider_500_and_rejects_dirty_worktree()
     )
     assert ok is False
     assert reason == "unsafe-error"
+
+
+def test_failed_provider_dirty_worktree_is_salvage_needed_not_retried(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    init_git_repo(repo)
+    (repo / "README.md").write_text("base\nchanged\n", encoding="utf-8")
+    write_job_record(hermes_home, "failed", "tasklane_salvage", failed_provider_job(repo))
+    cli.append_jsonl(
+        cli.job_event_log_path(cfg, "tasklane_salvage"),
+        {
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "job_id": "tasklane_salvage",
+            "event_type": "job_workspace_prepared",
+            "state": "running",
+            "metadata": {"worktree_path": str(repo)},
+        },
+    )
+
+    report = cli.build_watch_report(cfg, mode="guarded", ignored_blocked=set(), check_gateway=False)
+    actions = cli.apply_guarded_watch_actions(cfg, report)
+
+    assert [problem["code"] for problem in report["problems"]] == ["salvage-needed"]
+    assert actions[0]["status"] == "salvage-needed"
+    assert actions[0]["inspection"]["dirty_files"] == ["README.md"]
+    assert (hermes_home / "jobs" / "failed" / "tasklane_salvage.json").exists()
+    assert not (hermes_home / "jobs" / "ready" / "tasklane_salvage.json").exists()
+
+
+def test_guarded_watch_auto_salvage_commits_pushes_and_marks_completed(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.watch["auto_salvage"] = True
+    cfg.watch["verification_commands"] = ["git diff --check"]
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    init_git_repo(repo)
+    subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/demo.git"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\nchanged\n", encoding="utf-8")
+    failed_task = task_root / "failed" / "demo.md"
+    failed_task.write_text("---\nid: demo-task\n---\nImplement the demo task.\n", encoding="utf-8")
+    (task_root / "failed" / "demo.md.result.json").write_text(
+        json.dumps({"job_id": "tasklane_salvage", "state": "failed"}),
+        encoding="utf-8",
+    )
+    write_job_record(hermes_home, "failed", "tasklane_salvage", failed_provider_job(repo))
+    cli.append_jsonl(
+        cli.job_event_log_path(cfg, "tasklane_salvage"),
+        {
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "job_id": "tasklane_salvage",
+            "event_type": "job_workspace_prepared",
+            "state": "running",
+            "metadata": {"worktree_path": str(repo)},
+        },
+    )
+    monkeypatch.setattr(cli, "push_branch", lambda worktree, branch: {"ok": True, "branch": branch})
+    monkeypatch.setattr(cli, "find_pr", lambda owner, repo_name, branch: None)
+    monkeypatch.setattr(
+        cli,
+        "create_pr",
+        lambda owner, repo_name, **kwargs: {
+            "number": 123,
+            "url": "https://github.com/example/demo/pull/123",
+            "title": kwargs["title"],
+            "state": "open",
+            "merged_at": None,
+            "head_sha": "abc123",
+            "branch": kwargs["branch"],
+            "base_branch": kwargs["base_branch"],
+        },
+    )
+
+    report = cli.build_watch_report(cfg, mode="guarded", ignored_blocked=set(), check_gateway=False)
+    actions = cli.apply_guarded_watch_actions(cfg, report)
+
+    assert actions[0]["status"] == "salvaged"
+    assert actions[0]["pr"]["url"] == "https://github.com/example/demo/pull/123"
+    assert not (hermes_home / "jobs" / "failed" / "tasklane_salvage.json").exists()
+    completed_job = json.loads((hermes_home / "jobs" / "completed" / "tasklane_salvage.json").read_text(encoding="utf-8"))
+    assert completed_job["state"] == "completed"
+    assert completed_job["result"]["delivery_validation"]["pr"]["number"] == 123
+    assert (task_root / "completed" / "demo.md").exists()
+    completed_note = json.loads((task_root / "completed" / "demo.md.result.json").read_text(encoding="utf-8"))
+    assert completed_note["state"] == "completed"
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=repo, check=True, capture_output=True, text=True)
+    assert status.stdout == ""
+
+
+def test_auto_salvage_blocks_scope_violations(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.watch["auto_salvage"] = True
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    init_git_repo(repo)
+    (repo / "README.md").write_text("base\nchanged\n", encoding="utf-8")
+    write_job_record(
+        hermes_home,
+        "failed",
+        "tasklane_salvage",
+        failed_provider_job(repo, allowed_paths=["docs"]),
+    )
+
+    report = cli.build_watch_report(cfg, mode="guarded", ignored_blocked=set(), check_gateway=False)
+    actions = cli.apply_guarded_watch_actions(cfg, report)
+
+    assert actions[0]["status"] == "needs-human"
+    assert actions[0]["reason"] == "scope-violations"
+    assert actions[0]["inspection"]["scope_violations"] == [{"code": "unlisted-path-changed", "path": "README.md"}]
+    assert not (hermes_home / "jobs" / "failed" / "tasklane_salvage.json").exists()
+    needs_human = json.loads((hermes_home / "jobs" / "needs-human" / "tasklane_salvage.json").read_text(encoding="utf-8"))
+    assert needs_human["state"] == "needs-human"
+    assert needs_human["needs_human_reason"] == "scope-violations"
 
 
 def test_dashboard_state_groups_jobs_and_exposes_watch_health(tmp_path: Path) -> None:

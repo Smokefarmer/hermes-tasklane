@@ -29,6 +29,7 @@ ACTIVE_RUN_STATES = {"queued", "running"}
 ACTIVE_JOB_STATES = {"ready", "running"}
 JOB_STATES = {"draft", "ready", "running", "blocked", "completed", "failed", "needs-human"}
 TASK_SUFFIXES = {".md", ".txt"}
+SALVAGEABLE_DELIVERY_MODES = {"pull-request"}
 SAFE_RETRY_ERROR_PATTERNS = (
     "apierror",
     "an error occurred while processing your request",
@@ -55,6 +56,12 @@ UNSAFE_RETRY_ERROR_PATTERNS = (
     "planning-invalid-packet",
     "worktree has uncommitted",
 )
+SALVAGE_ERROR_PATTERNS = (
+    *SAFE_RETRY_ERROR_PATTERNS,
+    "worktree has uncommitted",
+    "dirty worktree",
+    "uncommitted changes after agent run",
+)
 
 
 def now_iso() -> str:
@@ -72,6 +79,34 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload) + "\n")
+
+
+def run_process(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def run_shell_command(command: str, *, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=False,
+        shell=True,
+        timeout=timeout,
+    )
 
 
 @dataclass
@@ -470,6 +505,29 @@ def find_job_record(cfg: Config, job_id: str) -> dict[str, Any] | None:
     return None
 
 
+def find_job_record_path(cfg: Config, job_id: str) -> Path | None:
+    for state in JOB_STATES:
+        path = job_path(cfg, job_id, state)
+        if path.exists():
+            return path
+    return None
+
+
+def read_job_events(cfg: Config, job_id: str) -> list[dict[str, Any]]:
+    path = job_event_log_path(cfg, job_id)
+    if not path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    return events
+
+
 def task_job_id(task: TaskFile) -> str:
     return f"tasklane_{sha_id(task.uid)}"
 
@@ -854,6 +912,21 @@ def github_get(url: str) -> Any:
     return json.loads(body) if body.strip() else None
 
 
+def github_post(url: str, payload: dict[str, Any]) -> Any:
+    auth = github_auth_header()
+    if not auth:
+        raise RuntimeError("GitHub credentials unavailable")
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Authorization", auth)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "hermes-tasklane")
+    with urllib.request.urlopen(req, timeout=30) as response:
+        response_body = response.read().decode("utf-8")
+    return json.loads(response_body) if response_body.strip() else None
+
+
 def ci_status(owner: str, repo: str, sha: str) -> dict[str, Any]:
     combined = github_get(f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/status") or {}
     suites = github_get(f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-suites") or {}
@@ -900,6 +973,29 @@ def find_pr(owner: str, repo: str, branch: str) -> dict[str, Any] | None:
             "base_branch": ((pr.get("base") or {}).get("ref")),
         }
     return None
+
+
+def create_pr(owner: str, repo: str, *, branch: str, base_branch: str, title: str, body: str) -> dict[str, Any]:
+    pr = github_post(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls",
+        {
+            "title": title,
+            "head": branch,
+            "base": base_branch,
+            "body": body,
+            "draft": False,
+        },
+    )
+    return {
+        "number": pr.get("number"),
+        "url": pr.get("html_url"),
+        "title": pr.get("title"),
+        "state": pr.get("state"),
+        "merged_at": pr.get("merged_at"),
+        "head_sha": ((pr.get("head") or {}).get("sha")),
+        "branch": ((pr.get("head") or {}).get("ref")),
+        "base_branch": ((pr.get("base") or {}).get("ref")),
+    }
 
 
 def update_workflow_stage(run_payload: dict[str, Any], stage: str, message: str) -> None:
@@ -1019,6 +1115,14 @@ def command_reconcile(cfg: Config) -> int:
                 actions.append({"task_uid": task_uid, "status": "completed", "job_id": job_id})
                 continue
             if job_state == "failed":
+                classification = classify_failed_job(cfg, job_payload, int(cfg.watch.get("max_retry_attempts") or 3))
+                if classification.get("classification") == "salvage-needed":
+                    salvage = auto_salvage_failed_job(cfg, job_payload, auto=bool(cfg.watch.get("auto_salvage", False)))
+                    actions.append({"task_uid": task_uid, "status": "auto-salvage", **salvage})
+                    if salvage.get("status") == "salvaged":
+                        continue
+                    remaining[task_uid] = entry
+                    continue
                 finalize_submitted_task(cfg, task_uid, entry, cfg.failed_dir, {"job_id": job_id, "state": job_state, "error": job_payload.get("last_error")})
                 actions.append({"task_uid": task_uid, "status": "failed", "job_id": job_id, "error": job_payload.get("last_error")})
                 continue
@@ -1099,6 +1203,9 @@ def compact_job(payload: dict[str, Any]) -> dict[str, Any]:
     spec = payload.get("spec") or {}
     branch = spec.get("branch") or {}
     request = spec.get("request") or {}
+    metadata = payload.get("metadata") or {}
+    delivery = metadata.get("delivery") if isinstance(metadata, dict) else {}
+    salvage = metadata.get("tasklane_salvage") if isinstance(metadata, dict) else {}
     return {
         "id": payload.get("id"),
         "state": payload.get("state"),
@@ -1113,6 +1220,8 @@ def compact_job(payload: dict[str, Any]) -> dict[str, Any]:
         "claimed_by": payload.get("claimed_by"),
         "runtime_minutes": minutes_since(payload.get("claimed_at")) if payload.get("state") == "running" else None,
         "error": payload.get("last_error"),
+        "salvage": salvage if isinstance(salvage, dict) else None,
+        "pr": (delivery or {}).get("pr") if isinstance(delivery, dict) else None,
     }
 
 
@@ -1185,6 +1294,486 @@ def add_watch_problem(problems: list[dict[str, Any]], severity: str, code: str, 
     if job:
         entry["job"] = compact_job(job)
     problems.append(entry)
+
+
+def job_repo_path_from_spec(job: dict[str, Any]) -> Path | None:
+    spec = job.get("spec") or {}
+    repo = spec.get("repo") or {}
+    raw = str(repo.get("path") or repo.get("key") or "").strip()
+    if raw.startswith("repo://"):
+        raw = raw.removeprefix("repo://")
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def job_worktree_path(cfg: Config, job: dict[str, Any]) -> Path | None:
+    job_id = str(job.get("id") or "").strip()
+    metadata = job.get("metadata") or {}
+    for candidate in (
+        ((metadata.get("workspace") or {}).get("worktree_path") if isinstance(metadata.get("workspace"), dict) else None),
+        metadata.get("worktree_path"),
+    ):
+        if candidate:
+            return Path(str(candidate)).expanduser()
+    for event in reversed(read_job_events(cfg, job_id)):
+        event_meta = event.get("metadata") or {}
+        if isinstance(event_meta, dict) and event_meta.get("worktree_path"):
+            return Path(str(event_meta["worktree_path"])).expanduser()
+    return job_repo_path_from_spec(job)
+
+
+def git_stdout(repo_path: Path, args: list[str], *, timeout: int = 30) -> tuple[bool, str]:
+    proc = run_process(["git", "-C", str(repo_path), *args], timeout=timeout)
+    output = (proc.stdout or proc.stderr or "").strip()
+    return proc.returncode == 0, output
+
+
+def git_ref_exists(repo_path: Path, ref: str) -> bool:
+    proc = run_process(["git", "-C", str(repo_path), "rev-parse", "--verify", "--quiet", ref], timeout=20)
+    return proc.returncode == 0
+
+
+def git_base_ref(repo_path: Path, base_branch: str | None) -> str | None:
+    if not base_branch:
+        return None
+    candidates = [f"origin/{base_branch}", base_branch]
+    for candidate in candidates:
+        if git_ref_exists(repo_path, candidate):
+            return candidate
+    ok, upstream = git_stdout(repo_path, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
+    return upstream if ok and upstream else None
+
+
+def parse_porcelain_changed_files(output: str) -> list[str]:
+    changed: list[str] = []
+    for raw_line in output.splitlines():
+        if not raw_line:
+            continue
+        if len(raw_line) > 3 and raw_line[2] == " ":
+            path = raw_line[3:]
+        else:
+            parts = raw_line.split(maxsplit=1)
+            path = parts[1] if len(parts) == 2 else raw_line
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        path = path.strip()
+        if path:
+            changed.append(path)
+    return sorted(set(changed))
+
+
+def path_matches(path: str, patterns: list[str]) -> bool:
+    clean = path.strip().lstrip("./")
+    for pattern in patterns:
+        prefix = pattern.strip().lstrip("./").rstrip("/")
+        if not prefix:
+            continue
+        if clean == prefix or clean.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def scope_violations(job: dict[str, Any], changed_files: list[str]) -> list[dict[str, Any]]:
+    spec = job.get("spec") or {}
+    scope = spec.get("scope") or {}
+    allowed = [str(item) for item in scope.get("allowed_paths") or []]
+    denied = [str(item) for item in scope.get("denied_paths") or []]
+    allow_unlisted = bool(scope.get("allow_unlisted_paths", True))
+    findings: list[dict[str, Any]] = []
+    for path in changed_files:
+        if path_matches(path, denied):
+            findings.append({"code": "denied-path-changed", "path": path})
+        if not allow_unlisted and allowed and not path_matches(path, allowed):
+            findings.append({"code": "unlisted-path-changed", "path": path})
+        if not allow_unlisted and not allowed:
+            findings.append({"code": "restricted-scope-without-allowed-paths", "path": path})
+    return findings
+
+
+def inspect_job_worktree(cfg: Config, job: dict[str, Any]) -> dict[str, Any]:
+    spec = job.get("spec") or {}
+    branch = spec.get("branch") or {}
+    expected_work_branch = str(branch.get("work_branch") or "").strip()
+    expected_base_branch = str(branch.get("base_branch") or branch.get("pr_target") or "").strip()
+    worktree = job_worktree_path(cfg, job)
+    if not worktree:
+        return {"ok": False, "reason": "worktree-path-missing", "has_changes": False}
+    if not worktree.exists():
+        return {"ok": False, "reason": "worktree-missing", "worktree_path": str(worktree), "has_changes": False}
+    if not (worktree / ".git").exists():
+        ok, root = git_stdout(worktree, ["rev-parse", "--show-toplevel"])
+        if not ok:
+            return {"ok": False, "reason": "not-a-git-worktree", "worktree_path": str(worktree), "has_changes": False}
+        worktree = Path(root)
+    ok, current_branch = git_stdout(worktree, ["branch", "--show-current"])
+    if not ok:
+        current_branch = ""
+    ok, status = git_stdout(worktree, ["status", "--porcelain"])
+    if not ok:
+        return {"ok": False, "reason": "git-status-failed", "worktree_path": str(worktree), "has_changes": False}
+    dirty_files = parse_porcelain_changed_files(status)
+    base_ref = git_base_ref(worktree, expected_base_branch)
+    committed_files: list[str] = []
+    ahead_count = 0
+    if base_ref:
+        ok, ahead = git_stdout(worktree, ["rev-list", "--count", f"{base_ref}..HEAD"])
+        if ok and ahead.isdigit():
+            ahead_count = int(ahead)
+        ok, diff_files = git_stdout(worktree, ["diff", "--name-only", f"{base_ref}...HEAD"])
+        if ok and diff_files:
+            committed_files = sorted({line.strip() for line in diff_files.splitlines() if line.strip()})
+    changed_files = sorted(set(dirty_files + committed_files))
+    violations = scope_violations(job, changed_files)
+    branch_ok = not expected_work_branch or current_branch == expected_work_branch
+    return {
+        "ok": True,
+        "worktree_path": str(worktree),
+        "current_branch": current_branch,
+        "expected_work_branch": expected_work_branch,
+        "base_branch": expected_base_branch,
+        "base_ref": base_ref,
+        "dirty": bool(dirty_files),
+        "dirty_files": dirty_files,
+        "ahead_count": ahead_count,
+        "committed_files": committed_files,
+        "changed_files": changed_files,
+        "has_changes": bool(dirty_files or ahead_count > 0),
+        "branch_ok": branch_ok,
+        "scope_violations": violations,
+    }
+
+
+def salvageable_error(job: dict[str, Any]) -> bool:
+    error = str(job.get("last_error") or "").lower()
+    return any(pattern in error for pattern in SALVAGE_ERROR_PATTERNS)
+
+
+def classify_failed_job(cfg: Config, job: dict[str, Any], max_attempts: int) -> dict[str, Any]:
+    if str(job.get("state") or "").lower() != "failed":
+        return {"classification": "not-failed"}
+    inspection = inspect_job_worktree(cfg, job)
+    if inspection.get("has_changes"):
+        if salvageable_error(job):
+            return {"classification": "salvage-needed", "inspection": inspection}
+        return {"classification": "needs-human", "reason": "dirty-worktree-unclassified-error", "inspection": inspection}
+    ok, reason = safe_to_retry(job, max_attempts)
+    if ok:
+        return {"classification": "retryable-clean", "reason": reason, "inspection": inspection}
+    return {"classification": "terminal-failed", "reason": reason, "inspection": inspection}
+
+
+def verification_commands_for_job(cfg: Config, job: dict[str, Any]) -> list[str]:
+    spec = job.get("spec") or {}
+    metadata = spec.get("metadata") or {}
+    configured = cfg.watch.get("verification_commands")
+    project = str(spec.get("project") or "").strip()
+    repo_path = job_repo_path_from_spec(job)
+    repo_name = repo_path.name if repo_path else ""
+    profiles = cfg.watch.get("verification_profiles") or {}
+
+    raw: Any = metadata.get("verification_commands") or configured
+    profile_name = metadata.get("verification_profile") or cfg.watch.get("verification_profile")
+    for key in (project, repo_name, profile_name):
+        if key and isinstance(profiles, dict) and key in profiles:
+            raw = profiles[key]
+            break
+
+    commands: list[str] = []
+    if isinstance(raw, str):
+        commands.extend(parse_csv(raw))
+    elif isinstance(raw, list):
+        commands.extend(str(item).strip() for item in raw if str(item).strip())
+    if "git diff --check" not in commands:
+        commands.insert(0, "git diff --check")
+    return commands
+
+
+def command_output_tail(output: str, *, limit: int = 3000) -> str:
+    lines = [line for line in output.splitlines() if line.strip()]
+    text = "\n".join(lines[-40:])
+    return text[-limit:] if len(text) > limit else text
+
+
+def run_verification_commands(worktree: Path, commands: list[str], *, timeout: int) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for command in commands:
+        started = now_iso()
+        try:
+            proc = run_shell_command(command, cwd=worktree, timeout=timeout)
+            output = "\n".join(part for part in [proc.stdout, proc.stderr] if part)
+            results.append(
+                {
+                    "command": command,
+                    "started_at": started,
+                    "completed_at": now_iso(),
+                    "exit_code": proc.returncode,
+                    "ok": proc.returncode == 0,
+                    "output_tail": command_output_tail(output),
+                }
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = "\n".join(part.decode() if isinstance(part, bytes) else str(part or "") for part in [exc.stdout, exc.stderr] if part)
+            results.append(
+                {
+                    "command": command,
+                    "started_at": started,
+                    "completed_at": now_iso(),
+                    "exit_code": None,
+                    "ok": False,
+                    "timed_out": True,
+                    "output_tail": command_output_tail(output),
+                }
+            )
+            break
+    return results
+
+
+def git_commit_if_needed(worktree: Path, message: str) -> dict[str, Any]:
+    ok, status = git_stdout(worktree, ["status", "--porcelain"])
+    if not ok:
+        return {"ok": False, "reason": "git-status-failed"}
+    if not status:
+        ok, sha = git_stdout(worktree, ["rev-parse", "HEAD"])
+        return {"ok": True, "committed": False, "sha": sha}
+    add = run_process(["git", "-C", str(worktree), "add", "-A"], timeout=120)
+    if add.returncode != 0:
+        return {"ok": False, "reason": "git-add-failed", "output": command_output_tail((add.stdout or "") + (add.stderr or ""))}
+    commit = run_process(["git", "-C", str(worktree), "commit", "-m", message], timeout=120)
+    if commit.returncode != 0:
+        return {"ok": False, "reason": "git-commit-failed", "output": command_output_tail((commit.stdout or "") + (commit.stderr or ""))}
+    ok, sha = git_stdout(worktree, ["rev-parse", "HEAD"])
+    return {"ok": ok, "committed": True, "sha": sha, "output": command_output_tail((commit.stdout or "") + (commit.stderr or ""))}
+
+
+def push_branch(worktree: Path, branch: str) -> dict[str, Any]:
+    proc = run_process(["git", "-C", str(worktree), "push", "-u", "origin", f"HEAD:{branch}"], timeout=180)
+    output = command_output_tail((proc.stdout or "") + (proc.stderr or ""))
+    return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "output": output}
+
+
+def salvage_pr_body(job: dict[str, Any], verification: list[dict[str, Any]], inspection: dict[str, Any]) -> str:
+    spec = job.get("spec") or {}
+    request = spec.get("request") or {}
+    command_lines = "\n".join(f"- `{result['command']}`: {'passed' if result.get('ok') else 'failed'}" for result in verification)
+    changed = "\n".join(f"- `{path}`" for path in inspection.get("changed_files") or [])
+    return "\n".join(
+        [
+            "## Summary",
+            "",
+            str(request.get("body") or request.get("title") or "Tasklane salvaged delivery."),
+            "",
+            "## Tasklane Auto-Salvage",
+            "",
+            f"- Job: `{job.get('id')}`",
+            f"- Original failure: {job.get('last_error') or 'unknown'}",
+            "- Reason: provider/job failure happened after code changes were produced.",
+            "",
+            "## Changed Files",
+            "",
+            changed or "- No changed files reported.",
+            "",
+            "## Verification",
+            "",
+            command_lines or "- No verification commands configured.",
+        ]
+    )
+
+
+def complete_tasklane_record_for_job(cfg: Config, job_id: str, note: dict[str, Any]) -> dict[str, Any] | None:
+    state = load_state(cfg)
+    submitted = dict(state.get("submitted") or {})
+    for task_uid, entry in list(submitted.items()):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("job_id") or entry.get("run_id") or "") != job_id:
+            continue
+        finalize_submitted_task(cfg, task_uid, entry, cfg.completed_dir, note)
+        submitted.pop(task_uid, None)
+        state["submitted"] = submitted
+        save_state(cfg, state)
+        return {"task_uid": task_uid, "source": "submitted"}
+
+    for result_path in sorted(cfg.failed_dir.glob("*.result.json")):
+        result = load_json(result_path)
+        if not isinstance(result, dict) or str(result.get("job_id") or result.get("run_id") or "") != job_id:
+            continue
+        task_name = result_path.name[: -len(".result.json")]
+        task_path = result_path.with_name(task_name)
+        moved_task: Path | None = None
+        if task_path.exists():
+            moved_task = move_task_file(task_path, cfg.completed_dir)
+        result_path.unlink(missing_ok=True)
+        note_path = (moved_task or (cfg.completed_dir / task_name)).with_suffix(Path(task_name).suffix + ".result.json")
+        atomic_write_json(note_path, note)
+        return {"task_uid": task_name, "source": "failed"}
+    return None
+
+
+def mark_job_completed_after_salvage(cfg: Config, job: dict[str, Any], result: dict[str, Any]) -> None:
+    job_id = str(job.get("id") or "")
+    source_path = find_job_record_path(cfg, job_id)
+    payload = dict(job)
+    payload["state"] = "completed"
+    payload["updated_at"] = now_iso()
+    payload["completed_at"] = payload.get("completed_at") or now_iso()
+    payload["last_error"] = None
+    payload["result"] = result
+    metadata = dict(payload.get("metadata") or {})
+    metadata["tasklane_salvage"] = {
+        "status": "completed",
+        "at": now_iso(),
+        "reason": "dirty-worktree-auto-salvage",
+    }
+    payload["metadata"] = metadata
+    atomic_write_json(job_path(cfg, job_id, "completed"), payload)
+    if source_path and source_path != job_path(cfg, job_id, "completed"):
+        source_path.unlink(missing_ok=True)
+    append_jsonl(
+        job_event_log_path(cfg, job_id),
+        {
+            "timestamp": now_iso(),
+            "job_id": job_id,
+            "event_type": "job_salvaged",
+            "state": "completed",
+            "reason": "tasklane-auto-salvage",
+            "metadata": result,
+        },
+    )
+
+
+def mark_job_needs_human_after_salvage(cfg: Config, job: dict[str, Any], result: dict[str, Any]) -> None:
+    job_id = str(job.get("id") or "")
+    source_path = find_job_record_path(cfg, job_id)
+    payload = dict(job)
+    payload["state"] = "needs-human"
+    payload["updated_at"] = now_iso()
+    payload["needs_human_at"] = payload.get("needs_human_at") or now_iso()
+    payload["needs_human_reason"] = result.get("reason") or "auto-salvage-needs-human"
+    payload["result"] = {"auto_salvage": result}
+    metadata = dict(payload.get("metadata") or {})
+    metadata["tasklane_salvage"] = {
+        "status": "needs-human",
+        "at": now_iso(),
+        "reason": result.get("reason") or "auto-salvage-needs-human",
+    }
+    payload["metadata"] = metadata
+    atomic_write_json(job_path(cfg, job_id, "needs-human"), payload)
+    if source_path and source_path != job_path(cfg, job_id, "needs-human"):
+        source_path.unlink(missing_ok=True)
+    append_jsonl(
+        job_event_log_path(cfg, job_id),
+        {
+            "timestamp": now_iso(),
+            "job_id": job_id,
+            "event_type": "job_needs_human",
+            "state": "needs-human",
+            "reason": "tasklane-auto-salvage",
+            "metadata": result,
+        },
+    )
+
+
+def auto_salvage_failed_job(cfg: Config, job: dict[str, Any], *, auto: bool) -> dict[str, Any]:
+    job_id = str(job.get("id") or "")
+    spec = job.get("spec") or {}
+    branch = spec.get("branch") or {}
+    delivery_mode = str(spec.get("delivery_mode") or "")
+
+    def needs_human(reason: str, **extra: Any) -> dict[str, Any]:
+        result = {"job_id": job_id, "status": "needs-human", "reason": reason, **extra}
+        if auto:
+            mark_job_needs_human_after_salvage(cfg, job, result)
+        return result
+
+    if delivery_mode not in SALVAGEABLE_DELIVERY_MODES:
+        return {"job_id": job_id, "status": "skipped", "reason": "delivery-mode-not-salvageable"}
+    if not salvageable_error(job):
+        return {"job_id": job_id, "status": "skipped", "reason": "failure-not-salvageable"}
+    inspection = inspect_job_worktree(cfg, job)
+    if not inspection.get("ok"):
+        return needs_human(str(inspection.get("reason") or "worktree-inspection-failed"), inspection=inspection)
+    if not inspection.get("has_changes"):
+        return {"job_id": job_id, "status": "skipped", "reason": "clean-worktree", "inspection": inspection}
+    if not inspection.get("branch_ok"):
+        return needs_human("work-branch-mismatch", inspection=inspection)
+    if inspection.get("scope_violations"):
+        return needs_human("scope-violations", inspection=inspection)
+    if not auto:
+        return {"job_id": job_id, "status": "salvage-needed", "inspection": inspection}
+
+    worktree = Path(str(inspection["worktree_path"]))
+    timeout = int(cfg.watch.get("verification_timeout_seconds") or 1800)
+    commands = verification_commands_for_job(cfg, job)
+    verification = run_verification_commands(worktree, commands, timeout=timeout)
+    if not verification or not all(result.get("ok") for result in verification):
+        return needs_human(
+            "verification-failed",
+            inspection=inspection,
+            verification=verification,
+        )
+
+    inspection_after = inspect_job_worktree(cfg, job)
+    if inspection_after.get("scope_violations"):
+        return needs_human("scope-violations-after-verification", inspection=inspection_after, verification=verification)
+
+    title = str((spec.get("request") or {}).get("title") or f"Tasklane salvage {job_id}")
+    commit = git_commit_if_needed(worktree, f"{title}\n\nTasklane-auto-salvage: {job_id}")
+    if not commit.get("ok"):
+        return needs_human(str(commit.get("reason") or "git-commit-failed"), inspection=inspection_after, verification=verification, commit=commit)
+
+    work_branch = str(branch.get("work_branch") or inspection_after.get("current_branch") or "").strip()
+    base_branch = str(branch.get("pr_target") or branch.get("base_branch") or "").strip()
+    if not work_branch or not base_branch:
+        return needs_human("missing-branch-metadata", inspection=inspection_after, verification=verification, commit=commit)
+    push = push_branch(worktree, work_branch)
+    if not push.get("ok"):
+        return needs_human("push-failed", inspection=inspection_after, verification=verification, commit=commit, push=push)
+
+    remote = git_remote_for_repo(worktree)
+    if not remote:
+        return needs_human("no-github-remote", inspection=inspection_after, verification=verification, commit=commit, push=push)
+    owner, repo = remote
+    pr = find_pr(owner, repo, work_branch)
+    if not pr:
+        pr = create_pr(
+            owner,
+            repo,
+            branch=work_branch,
+            base_branch=base_branch,
+            title=title,
+            body=salvage_pr_body(job, verification, inspection_after),
+        )
+    if pr.get("base_branch") and pr.get("base_branch") != base_branch:
+        return needs_human("pr-base-mismatch", pr=pr, inspection=inspection_after, verification=verification, commit=commit, push=push)
+
+    final_inspection = inspect_job_worktree(cfg, job)
+    result = {
+        "delivery_validation": {
+            "delivery_mode": delivery_mode,
+            "ok": True,
+            "pr": pr,
+            "pr_target": base_branch,
+            "work_branch": work_branch,
+            "workspace": {
+                "cleanup": "kept",
+                "isolated": True,
+                "original_repo_path": str(job_repo_path_from_spec(job) or ""),
+                "worktree_path": str(worktree),
+            },
+            "worktree_clean": not final_inspection.get("dirty"),
+        },
+        "auto_salvage": {
+            "reason": "provider/job failure happened after code changes were produced",
+            "commit": commit.get("sha"),
+            "verification": verification,
+            "changed_files": final_inspection.get("changed_files") or inspection_after.get("changed_files") or [],
+        },
+        "final_response": f"Tasklane auto-salvaged failed job {job_id} into PR {pr.get('url')}.",
+    }
+    mark_job_completed_after_salvage(cfg, job, result)
+    completed_task = complete_tasklane_record_for_job(cfg, job_id, {"job_id": job_id, "state": "completed", "result": result})
+    return {"job_id": job_id, "status": "salvaged", "pr": pr, "commit": commit, "push": push, "submitted_completed": completed_task}
 
 
 def restore_submitted_task_for_retry(cfg: Config, job: dict[str, Any], ready_path: Path) -> dict[str, Any] | None:
@@ -1315,6 +1904,7 @@ def build_watch_report(
     blocked = [job for job in jobs if job.get("state") == "blocked"]
     needs_human = [job for job in jobs if job.get("state") == "needs-human"]
     failed = [job for job in jobs if job.get("state") == "failed"]
+    max_attempts = int(cfg.watch.get("max_retry_attempts") or 3)
     if ready and check_gateway and gateway.get("ok") is False:
         add_watch_problem(problems, "critical", "ready-jobs-without-gateway", f"{len(ready)} ready job(s) cannot run while the gateway is inactive")
     for job in running:
@@ -1340,7 +1930,17 @@ def build_watch_report(
     for job in needs_human:
         add_watch_problem(problems, "warning", "job-needs-human", "job is waiting for human input", job)
     for job in failed:
-        add_watch_problem(problems, "warning", "job-failed", "job failed and was not automatically retried", job)
+        classification = classify_failed_job(cfg, job, max_attempts)
+        kind = classification.get("classification")
+        if kind == "salvage-needed":
+            add_watch_problem(problems, "warning", "salvage-needed", "job failed after producing worktree changes; salvage instead of retry", job)
+            notices.append({"code": "salvage-needed", "job": compact_job(job), "inspection": classification.get("inspection")})
+        elif kind == "retryable-clean":
+            add_watch_problem(problems, "warning", "job-retryable", "job failed with a clean transient error and can be retried", job)
+        elif kind == "needs-human":
+            add_watch_problem(problems, "warning", "salvage-needs-human", str(classification.get("reason") or "dirty failed job needs review"), job)
+        else:
+            add_watch_problem(problems, "warning", "job-failed", "job failed and was not automatically retried", job)
     for job in ready + running:
         spec = job.get("spec") or {}
         branch = spec.get("branch") or {}
@@ -1377,11 +1977,16 @@ def build_watch_report(
 
 def apply_guarded_watch_actions(cfg: Config, report: dict[str, Any]) -> list[dict[str, Any]]:
     max_attempts = int(cfg.watch.get("max_retry_attempts") or 3)
+    auto_salvage = bool(cfg.watch.get("auto_salvage", False))
     actions: list[dict[str, Any]] = []
     for job in iter_job_records(cfg, {"failed"}):
-        ok, reason = safe_to_retry(job, max_attempts)
-        if not ok:
-            actions.append({"job_id": job.get("id"), "status": "skipped", "reason": reason})
+        classification = classify_failed_job(cfg, job, max_attempts)
+        kind = classification.get("classification")
+        if kind == "salvage-needed":
+            actions.append(auto_salvage_failed_job(cfg, job, auto=auto_salvage))
+            continue
+        if kind != "retryable-clean":
+            actions.append({"job_id": job.get("id"), "status": "skipped", "reason": classification.get("reason") or kind})
             continue
         actions.append(retry_failed_job(cfg, job))
     report["actions"] = actions
@@ -1504,6 +2109,36 @@ def command_watch(
     return 0
 
 
+def command_salvage(cfg: Config, job_id: str, *, auto: bool, verify: bool) -> int:
+    ensure_layout(cfg)
+    job = find_job_record(cfg, job_id)
+    if not isinstance(job, dict):
+        print(json.dumps({"job_id": job_id, "status": "missing-job"}, indent=2))
+        return 2
+    classification = classify_failed_job(cfg, job, int(cfg.watch.get("max_retry_attempts") or 3))
+    result: dict[str, Any] = {"job_id": job_id, **classification}
+    if classification.get("classification") == "salvage-needed":
+        if auto:
+            result = auto_salvage_failed_job(cfg, job, auto=True)
+        elif verify:
+            inspection = classification.get("inspection") or {}
+            if inspection.get("ok") and inspection.get("worktree_path"):
+                commands = verification_commands_for_job(cfg, job)
+                verification = run_verification_commands(
+                    Path(str(inspection["worktree_path"])),
+                    commands,
+                    timeout=int(cfg.watch.get("verification_timeout_seconds") or 1800),
+                )
+                result["verification"] = verification
+                result["status"] = "verification-passed" if verification and all(item.get("ok") for item in verification) else "verification-failed"
+        else:
+            result["status"] = "salvage-needed"
+    print(json.dumps(result, indent=2))
+    if result.get("status") in {"salvaged", "verification-passed", "salvage-needed"}:
+        return 0
+    return 2
+
+
 def command_status(cfg: Config) -> int:
     ensure_layout(cfg)
     state = load_state(cfg)
@@ -1574,8 +2209,12 @@ def command_init(cfg: Config, config_path_override: str | None = None) -> int:
                 "default_thread_id": cfg.default_thread_id,
                 "watch": {
                     "mode": "observe",
+                    "auto_salvage": False,
+                    "verification_timeout_seconds": 1800,
                     "stale_running_minutes": 180,
                     "max_retry_attempts": 3,
+                    "verification_commands": ["git diff --check"],
+                    "verification_profiles": {},
                     "expected_base_branches": {},
                     "ignored_blocked_jobs": [],
                 },
@@ -1602,6 +2241,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("sync", help="Convert inbox files into Hermes queue items")
     sub.add_parser("reconcile", help="Reconcile submitted tasks from governed run state")
     sub.add_parser("status", help="Show tasklane and run status")
+    salvage = sub.add_parser("salvage", help="Inspect or auto-deliver a failed job with worktree changes")
+    salvage.add_argument("job_id", help="Failed Hermes job ID to inspect or salvage")
+    salvage.add_argument("--verify", action="store_true", help="Run configured verification commands without committing or pushing")
+    salvage.add_argument("--auto", action="store_true", help="Run verification, commit, push, open PR, and mark the task completed when safe")
     watch = sub.add_parser("watch", help="Review queue health and optionally apply guarded recovery")
     watch.add_argument("--mode", choices=["observe", "guarded"], default=None, help="observe reports only; guarded retries narrowly safe transient failures")
     watch.add_argument("--stale-minutes", type=int, help="Warn when a running job exceeds this age")
@@ -1632,6 +2275,8 @@ def main(argv: list[str] | None = None) -> int:
             return command_reconcile(cfg)
         if args.command == "status":
             return command_status(cfg)
+        if args.command == "salvage":
+            return command_salvage(cfg, args.job_id, auto=args.auto, verify=args.verify)
         if args.command == "watch":
             mode = args.mode or str(cfg.watch.get("mode") or "observe")
             if mode not in {"observe", "guarded"}:

@@ -21,6 +21,8 @@ Each task is a `.md` or `.txt` file inside the inbox directory.
 - `allow_unlisted_paths`: `true` or `false`
 - `review_loops`: max self-review loops, default `3`
 - `security_review`: `true` or `false`
+- `verification_commands`: comma-separated commands for this task's salvage verification
+- `verification_profile`: named profile from `watch.verification_profiles`
 - `platform`
 - `chat_id`
 - `thread_id`
@@ -62,6 +64,7 @@ Clean up the auth flow, add regression tests, run verification, and prepare a co
 - For a many-task single-PR batch, use `direct-push` for implementation tasks and one final `pull-request` task that depends on all implementation tasks.
 - Add `platform: telegram` and `chat_id` when the group should receive start/completion/failure updates.
 - `default_platform`, `default_chat_id`, and `default_thread_id` in config are used when a task file omits these fields.
+- Use `verification_commands` only for simple per-task overrides. Prefer named `verification_profile` values for larger repos.
 
 ## Preflight Blockers
 
@@ -81,3 +84,22 @@ Current blockers:
 - Dependencies contain a cycle.
 - One `delivery_group` mixes multiple base branches.
 - Multiple tasks mutate the same `work_branch` without an ordering dependency.
+
+## Auto-Salvage
+
+When `watch.auto_salvage` is enabled, failed pull-request jobs can still be
+delivered if they produced safe code changes. This is meant for provider/API
+failures or dirty-worktree failures that happen after useful work exists.
+
+Auto-salvage only proceeds when all of these are true:
+
+- delivery mode is `pull-request`
+- the job failure matches a safe transient/provider pattern
+- the worktree exists and is on the expected task branch
+- changed files stay inside `allowed_paths` and outside `denied_paths`
+- configured verification commands pass
+- the branch can be pushed and a PR can be found or created
+
+If a task sets `allow_unlisted_paths: false`, keep `allowed_paths` precise.
+That scope is the hard guard that prevents an overnight run from pushing broad
+or unrelated changes.

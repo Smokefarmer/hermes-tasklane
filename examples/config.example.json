@@ -6,5 +6,18 @@
   "github_owner_hint": "your-github-user",
   "default_platform": null,
   "default_chat_id": null,
-  "default_thread_id": null
+  "default_thread_id": null,
+  "watch": {
+    "mode": "observe",
+    "auto_salvage": false,
+    "verification_timeout_seconds": 1800,
+    "stale_running_minutes": 180,
+    "max_retry_attempts": 3,
+    "verification_commands": [
+      "git diff --check"
+    ],
+    "verification_profiles": {},
+    "expected_base_branches": {},
+    "ignored_blocked_jobs": []
+  }
 }
