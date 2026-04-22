@@ -541,11 +541,71 @@ def test_guarded_watch_retries_safe_transient_failed_job(tmp_path: Path) -> None
     assert ready["last_error"] is None
 
 
+def test_guarded_watch_restores_reconciled_failed_task_to_submitted(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    failed_task = task_root / "failed" / "demo.md"
+    failed_task.write_text(
+        f"---\nid: demo-task\nrepo_path: {repo}\nbase_branch: main\n---\nDo the retryable task.\n",
+        encoding="utf-8",
+    )
+    (task_root / "failed" / "demo.md.result.json").write_text(
+        json.dumps({"job_id": "tasklane_retry", "state": "failed"}),
+        encoding="utf-8",
+    )
+    write_job_record(
+        hermes_home,
+        "failed",
+        "tasklane_retry",
+        {
+            "attempt": 1,
+            "last_error": "An error occurred while processing your request. Please include the request ID abc.",
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": f"repo://{repo}"},
+                "request": {"title": "retry me"},
+                "branch": {"mode": "new-branch", "base_branch": "main"},
+                "metadata": {"uid": "demo-task"},
+            },
+        },
+    )
+
+    report = cli.build_watch_report(cfg, mode="guarded", ignored_blocked=set(), check_gateway=False)
+    actions = cli.apply_guarded_watch_actions(cfg, report)
+
+    assert actions[0]["status"] == "retried"
+    assert actions[0]["submitted_restored"]["task_uid"] == "demo-task"
+    assert not failed_task.exists()
+    assert not (task_root / "failed" / "demo.md.result.json").exists()
+    restored_path = task_root / "submitted" / "demo.md"
+    assert restored_path.exists()
+    state = load_state(cfg)
+    assert state["submitted"]["demo-task"]["source_path"] == str(restored_path)
+    assert state["submitted"]["demo-task"]["job_id"] == "tasklane_retry"
+
+
 def test_safe_retry_classifier_accepts_provider_500_and_rejects_dirty_worktree() -> None:
     ok, reason = cli.safe_to_retry(
         {
             "attempt": 1,
             "last_error": "HTTP 500: The server had an error processing your request. Please include the request ID abc.",
+        },
+        3,
+    )
+    assert ok is True
+    assert reason == "safe-transient-error"
+
+    ok, reason = cli.safe_to_retry(
+        {
+            "attempt": 1,
+            "last_error": "An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID abc.",
         },
         3,
     )

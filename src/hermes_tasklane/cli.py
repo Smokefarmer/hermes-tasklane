@@ -31,6 +31,7 @@ JOB_STATES = {"draft", "ready", "running", "blocked", "completed", "failed", "ne
 TASK_SUFFIXES = {".md", ".txt"}
 SAFE_RETRY_ERROR_PATTERNS = (
     "apierror",
+    "an error occurred while processing your request",
     "connection reset",
     "gateway stopped",
     "gateway restart",
@@ -1186,6 +1187,57 @@ def add_watch_problem(problems: list[dict[str, Any]], severity: str, code: str, 
     problems.append(entry)
 
 
+def restore_submitted_task_for_retry(cfg: Config, job: dict[str, Any], ready_path: Path) -> dict[str, Any] | None:
+    job_id = str(job.get("id") or "").strip()
+    if not job_id:
+        return None
+    state = load_state(cfg)
+    submitted = dict(state.get("submitted") or {})
+    if any(str(entry.get("job_id") or entry.get("run_id") or "") == job_id for entry in submitted.values() if isinstance(entry, dict)):
+        return None
+
+    result_path: Path | None = None
+    task_path: Path | None = None
+    for candidate in sorted(cfg.failed_dir.glob("*.result.json")):
+        result = load_json(candidate)
+        if not isinstance(result, dict) or str(result.get("job_id") or result.get("run_id") or "") != job_id:
+            continue
+        source_name = candidate.name[: -len(".result.json")]
+        source_path = candidate.with_name(source_name)
+        if source_path.exists():
+            result_path = candidate
+            task_path = source_path
+            break
+    if task_path is None:
+        return None
+
+    restored_path = move_task_file(task_path, cfg.submitted_dir)
+    if result_path is not None:
+        result_path.unlink(missing_ok=True)
+
+    spec = dict(job.get("spec") or {})
+    metadata = dict(spec.get("metadata") or {})
+    task_uid = str(metadata.get("uid") or "").strip()
+    if not task_uid:
+        try:
+            task_uid = load_task_file(restored_path, cfg).uid
+        except Exception:
+            task_uid = restored_path.stem
+    submitted[task_uid] = {
+        "source_path": str(restored_path),
+        "original_name": restored_path.name,
+        "job_id": job_id,
+        "run_id": job_id,
+        "job_file": str(ready_path),
+        "repo_key": ((spec.get("repo") or {}).get("key") or ""),
+        "submitted_at": now_iso(),
+        "retried_at": now_iso(),
+    }
+    state["submitted"] = submitted
+    save_state(cfg, state)
+    return {"task_uid": task_uid, "source_path": str(restored_path)}
+
+
 def retry_failed_job(cfg: Config, job: dict[str, Any]) -> dict[str, Any]:
     job_id = str(job.get("id") or "")
     if not job_id:
@@ -1215,7 +1267,11 @@ def retry_failed_job(cfg: Config, job: dict[str, Any]) -> dict[str, Any]:
             "reason": "tasklane-watchdog-safe-retry",
         },
     )
-    return {"job_id": job_id, "status": "retried", "from": str(failed_path), "to": str(ready_path)}
+    restored = restore_submitted_task_for_retry(cfg, payload, ready_path)
+    action = {"job_id": job_id, "status": "retried", "from": str(failed_path), "to": str(ready_path)}
+    if restored:
+        action["submitted_restored"] = restored
+    return action
 
 
 def safe_to_retry(job: dict[str, Any], max_attempts: int) -> tuple[bool, str]:
