@@ -353,6 +353,7 @@ INDEX_HTML = """<!doctype html>
           <button class="filter" data-filter="ready" type="button">Ready</button>
           <button class="filter" data-filter="running" type="button">Running</button>
           <button class="filter" data-filter="failed" type="button">Failed</button>
+          <button class="filter" data-filter="needs-human" type="button">Needs Human</button>
           <button class="filter" data-filter="blocked" type="button">Blocked</button>
           <button class="filter" data-filter="completed" type="button">Completed</button>
         </div>
@@ -601,6 +602,17 @@ h2 { font-size: 18px; line-height: 1.2; letter-spacing: 0; }
   overflow-wrap: anywhere;
 }
 
+.verification-line {
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 209, 102, 0.32);
+  color: var(--warning);
+  background: rgba(112, 81, 20, 0.16);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
 .run-header {
   display: flex;
   justify-content: space-between;
@@ -805,6 +817,24 @@ function jobLabel(job) {
   return `${text(job.project)} · ${text(job.id)}`;
 }
 
+function verificationLine(job) {
+  const verification = job.verification || {};
+  const failedBootstrap = verification.failed_bootstrap || [];
+  const failedVerification = verification.failed_verification || [];
+  const first = failedBootstrap[0] || failedVerification[0];
+  if (first) {
+    return `Needs human: ${verification.reason || 'verification failed'} · ${first.command || 'command'} exited ${text(first.exit_code)}`;
+  }
+  const accepted = verification.accepted_baseline_failures || [];
+  if (accepted.length) {
+    return `Baseline failure accepted: ${accepted.map((item) => item.command).join(', ')}`;
+  }
+  if (job.needs_human_reason) {
+    return `Needs human: ${job.needs_human_reason}`;
+  }
+  return '';
+}
+
 function formatBytes(bytes) {
   if (bytes === null || bytes === undefined) return '-';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -837,10 +867,12 @@ function renderJob(job) {
   item.className = 'job-item';
   item.dataset.state = job.state || 'unknown';
   const runtime = job.runtime_minutes !== null && job.runtime_minutes !== undefined ? ` · ${job.runtime_minutes} min` : '';
+  const verify = verificationLine(job);
   item.innerHTML = `
     <div>
       <div class="job-title">${escapeHtml(job.title || job.id)}</div>
       <div class="job-meta">${escapeHtml(jobLabel(job))} · ${escapeHtml(job.base_branch || 'no base')} · ${escapeHtml(job.delivery_mode || '')}${runtime}</div>
+      ${verify ? `<div class="verification-line">${escapeHtml(verify)}</div>` : ''}
     </div>
     <div class="top-actions">
       <span class="state-badge ${stateClass(job.state)}">${escapeHtml(job.state || 'unknown')}</span>

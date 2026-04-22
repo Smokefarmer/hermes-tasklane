@@ -21,8 +21,12 @@ Each task is a `.md` or `.txt` file inside the inbox directory.
 - `allow_unlisted_paths`: `true` or `false`
 - `review_loops`: max self-review loops, default `3`
 - `security_review`: `true` or `false`
+- `bootstrap_commands`: comma-separated commands to run before salvage verification
+- `bootstrap_profile`: named profile from `watch.bootstrap_profiles`
 - `verification_commands`: comma-separated commands for this task's salvage verification
 - `verification_profile`: named profile from `watch.verification_profiles`
+- `baseline_verification`: `true` or `false`
+- `allow_matching_baseline_failures`: `true` or `false`
 - `platform`
 - `chat_id`
 - `thread_id`
@@ -64,6 +68,7 @@ Clean up the auth flow, add regression tests, run verification, and prepare a co
 - For a many-task single-PR batch, use `direct-push` for implementation tasks and one final `pull-request` task that depends on all implementation tasks.
 - Add `platform: telegram` and `chat_id` when the group should receive start/completion/failure updates.
 - `default_platform`, `default_chat_id`, and `default_thread_id` in config are used when a task file omits these fields.
+- Use `bootstrap_profile` for dependency install or generated-client setup before verification.
 - Use `verification_commands` only for simple per-task overrides. Prefer named `verification_profile` values for larger repos.
 
 ## Preflight Blockers
@@ -98,6 +103,7 @@ Auto-salvage only proceeds when all of these are true:
 - the worktree exists and is on the expected task branch
 - changed files stay inside `allowed_paths` and outside `denied_paths`
 - configured verification commands pass
+- if baseline comparison is enabled, any accepted failed command also fails the base branch with matching output
 - the branch can be pushed and a PR can be found or created
 
 If a task sets `allow_unlisted_paths: false`, keep `allowed_paths` precise.

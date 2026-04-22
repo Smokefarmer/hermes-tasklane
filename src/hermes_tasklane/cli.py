@@ -273,6 +273,14 @@ def parse_bool(value: str | None, *, default: bool) -> bool:
     raise ValueError(f"invalid boolean value {value!r}")
 
 
+def bool_from_any(value: Any, *, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return parse_bool(str(value), default=default)
+
+
 REQUEST_TYPE_ALIASES = {
     "bug": "bug-small",
     "bugfix": "bug-small",
@@ -1199,6 +1207,64 @@ def minutes_since(value: Any) -> int | None:
     return max(0, int((datetime.now(timezone.utc) - parsed).total_seconds() // 60))
 
 
+def auto_salvage_result(payload: dict[str, Any]) -> dict[str, Any]:
+    result = payload.get("result") or {}
+    if isinstance(result, dict):
+        auto_salvage = result.get("auto_salvage")
+        if isinstance(auto_salvage, dict):
+            return auto_salvage
+    return {}
+
+
+def failed_command_summaries(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for item in results:
+        if item.get("ok"):
+            continue
+        failures.append(
+            {
+                "command": item.get("command"),
+                "exit_code": item.get("exit_code"),
+                "phase": item.get("phase"),
+                "output_tail": item.get("output_tail"),
+                "baseline": {
+                    "ok": (item.get("baseline") or {}).get("ok"),
+                    "exit_code": (item.get("baseline") or {}).get("exit_code"),
+                    "matches_branch_output": (item.get("baseline") or {}).get("matches_branch_output"),
+                }
+                if isinstance(item.get("baseline"), dict)
+                else None,
+            }
+        )
+    return failures
+
+
+def verification_summary_for_job(payload: dict[str, Any]) -> dict[str, Any] | None:
+    auto_salvage = auto_salvage_result(payload)
+    if not auto_salvage:
+        return None
+    verification = [item for item in auto_salvage.get("verification") or [] if isinstance(item, dict)]
+    bootstrap = [item for item in auto_salvage.get("bootstrap") or [] if isinstance(item, dict)]
+    failed_verification = failed_command_summaries(verification)
+    failed_bootstrap = failed_command_summaries(bootstrap)
+    accepted = [
+        {
+            "command": item.get("command"),
+            "status": item.get("status"),
+        }
+        for item in verification
+        if item.get("accepted_baseline_failure")
+    ]
+    return {
+        "status": auto_salvage.get("status") or ("failed" if failed_bootstrap or failed_verification else "passed"),
+        "reason": auto_salvage.get("reason"),
+        "failed_bootstrap": failed_bootstrap,
+        "failed_verification": failed_verification,
+        "accepted_baseline_failures": accepted,
+        "changed_files": auto_salvage.get("changed_files") or ((auto_salvage.get("inspection") or {}).get("changed_files") if isinstance(auto_salvage.get("inspection"), dict) else []),
+    }
+
+
 def compact_job(payload: dict[str, Any]) -> dict[str, Any]:
     spec = payload.get("spec") or {}
     branch = spec.get("branch") or {}
@@ -1220,7 +1286,9 @@ def compact_job(payload: dict[str, Any]) -> dict[str, Any]:
         "claimed_by": payload.get("claimed_by"),
         "runtime_minutes": minutes_since(payload.get("claimed_at")) if payload.get("state") == "running" else None,
         "error": payload.get("last_error"),
+        "needs_human_reason": payload.get("needs_human_reason"),
         "salvage": salvage if isinstance(salvage, dict) else None,
+        "verification": verification_summary_for_job(payload),
         "pr": (delivery or {}).get("pr") if isinstance(delivery, dict) else None,
     }
 
@@ -1464,16 +1532,27 @@ def classify_failed_job(cfg: Config, job: dict[str, Any], max_attempts: int) -> 
 
 
 def verification_commands_for_job(cfg: Config, job: dict[str, Any]) -> list[str]:
+    commands = configured_commands_for_job(cfg, job, "verification")
+    if "git diff --check" not in commands:
+        commands.insert(0, "git diff --check")
+    return commands
+
+
+def bootstrap_commands_for_job(cfg: Config, job: dict[str, Any]) -> list[str]:
+    return configured_commands_for_job(cfg, job, "bootstrap")
+
+
+def configured_commands_for_job(cfg: Config, job: dict[str, Any], kind: str) -> list[str]:
     spec = job.get("spec") or {}
     metadata = spec.get("metadata") or {}
-    configured = cfg.watch.get("verification_commands")
+    configured = cfg.watch.get(f"{kind}_commands")
     project = str(spec.get("project") or "").strip()
     repo_path = job_repo_path_from_spec(job)
     repo_name = repo_path.name if repo_path else ""
-    profiles = cfg.watch.get("verification_profiles") or {}
+    profiles = cfg.watch.get(f"{kind}_profiles") or {}
 
-    raw: Any = metadata.get("verification_commands") or configured
-    profile_name = metadata.get("verification_profile") or cfg.watch.get("verification_profile")
+    raw: Any = metadata.get(f"{kind}_commands") or configured
+    profile_name = metadata.get(f"{kind}_profile") or cfg.watch.get(f"{kind}_profile")
     for key in (project, repo_name, profile_name):
         if key and isinstance(profiles, dict) and key in profiles:
             raw = profiles[key]
@@ -1484,8 +1563,6 @@ def verification_commands_for_job(cfg: Config, job: dict[str, Any]) -> list[str]
         commands.extend(parse_csv(raw))
     elif isinstance(raw, list):
         commands.extend(str(item).strip() for item in raw if str(item).strip())
-    if "git diff --check" not in commands:
-        commands.insert(0, "git diff --check")
     return commands
 
 
@@ -1493,6 +1570,16 @@ def command_output_tail(output: str, *, limit: int = 3000) -> str:
     lines = [line for line in output.splitlines() if line.strip()]
     text = "\n".join(lines[-40:])
     return text[-limit:] if len(text) > limit else text
+
+
+def command_output_compare_text(output: str, roots: list[Path]) -> str:
+    text = command_output_tail(output, limit=6000)
+    for root in roots:
+        if root:
+            text = text.replace(str(root), "<repo>")
+    text = re.sub(r"pytest-\d+", "pytest-N", text)
+    text = re.sub(r"/tmp/[^\s'\"]+", "<tmp>", text)
+    return text.strip()
 
 
 def run_verification_commands(worktree: Path, commands: list[str], *, timeout: int) -> list[dict[str, Any]]:
@@ -1527,6 +1614,134 @@ def run_verification_commands(worktree: Path, commands: list[str], *, timeout: i
             )
             break
     return results
+
+
+def run_labeled_commands(worktree: Path, commands: list[str], *, timeout: int, phase: str) -> list[dict[str, Any]]:
+    results = run_verification_commands(worktree, commands, timeout=timeout)
+    for result in results:
+        result["phase"] = phase
+    return results
+
+
+def baseline_verification_enabled(cfg: Config, job: dict[str, Any]) -> bool:
+    metadata = (job.get("spec") or {}).get("metadata") or {}
+    if "baseline_verification" in metadata:
+        return bool_from_any(metadata.get("baseline_verification"), default=False)
+    return bool_from_any(cfg.watch.get("baseline_verification"), default=False)
+
+
+def allow_matching_baseline_failures(cfg: Config, job: dict[str, Any]) -> bool:
+    metadata = (job.get("spec") or {}).get("metadata") or {}
+    if "allow_matching_baseline_failures" in metadata:
+        return bool_from_any(metadata.get("allow_matching_baseline_failures"), default=False)
+    return bool_from_any(cfg.watch.get("allow_matching_baseline_failures"), default=False)
+
+
+def baseline_worktree_path(cfg: Config, job_id: str) -> Path:
+    safe_job_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", job_id)
+    return cfg.task_root / "baseline-worktrees" / safe_job_id
+
+
+def prepare_baseline_worktree(source_worktree: Path, target_path: Path, base_ref: str) -> dict[str, Any]:
+    if target_path.exists():
+        cleanup_baseline_worktree(source_worktree, target_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = run_process(["git", "-C", str(source_worktree), "worktree", "add", "--detach", "--force", str(target_path), base_ref], timeout=180)
+    output = command_output_tail((proc.stdout or "") + (proc.stderr or ""))
+    return {"ok": proc.returncode == 0, "path": str(target_path), "base_ref": base_ref, "exit_code": proc.returncode, "output_tail": output}
+
+
+def cleanup_baseline_worktree(source_worktree: Path, target_path: Path) -> None:
+    if target_path.exists():
+        run_process(["git", "-C", str(source_worktree), "worktree", "remove", "--force", str(target_path)], timeout=120)
+    if target_path.exists():
+        shutil.rmtree(target_path, ignore_errors=True)
+
+
+def annotate_verification_with_baseline(
+    cfg: Config,
+    job: dict[str, Any],
+    *,
+    worktree: Path,
+    base_ref: str | None,
+    bootstrap_commands: list[str],
+    verification: list[dict[str, Any]],
+    timeout: int,
+) -> list[dict[str, Any]]:
+    if not baseline_verification_enabled(cfg, job) or not base_ref:
+        return verification
+    failed = [result for result in verification if not result.get("ok")]
+    if not failed:
+        return verification
+
+    baseline_path = baseline_worktree_path(cfg, str(job.get("id") or "job"))
+    prepared = prepare_baseline_worktree(worktree, baseline_path, base_ref)
+    if not prepared.get("ok"):
+        for result in failed:
+            result["baseline"] = prepared
+        return verification
+    try:
+        baseline_bootstrap = run_labeled_commands(
+            baseline_path,
+            bootstrap_commands,
+            timeout=int(cfg.watch.get("bootstrap_timeout_seconds") or timeout),
+            phase="baseline-bootstrap",
+        )
+        bootstrap_ok = all(result.get("ok") for result in baseline_bootstrap)
+        for result in failed:
+            baseline_result = {
+                "command": result.get("command"),
+                "phase": "baseline-verification",
+                "skipped": not bootstrap_ok,
+                "bootstrap": baseline_bootstrap,
+            }
+            if bootstrap_ok:
+                baseline_run = run_verification_commands(baseline_path, [str(result.get("command") or "")], timeout=timeout)
+                baseline_result = baseline_run[0] if baseline_run else baseline_result
+                baseline_result["phase"] = "baseline-verification"
+                branch_text = command_output_compare_text(str(result.get("output_tail") or ""), [worktree, baseline_path])
+                baseline_text = command_output_compare_text(str(baseline_result.get("output_tail") or ""), [worktree, baseline_path])
+                matches = bool(branch_text and baseline_text and branch_text == baseline_text)
+                baseline_result["matches_branch_output"] = matches
+                if not baseline_result.get("ok") and matches and allow_matching_baseline_failures(cfg, job):
+                    result["ok"] = True
+                    result["accepted_baseline_failure"] = True
+                    result["status"] = "accepted-baseline-failure"
+            result["baseline"] = baseline_result
+    finally:
+        cleanup_baseline_worktree(worktree, baseline_path)
+    return verification
+
+
+def run_delivery_checks(cfg: Config, job: dict[str, Any], worktree: Path, inspection: dict[str, Any]) -> dict[str, Any]:
+    timeout = int(cfg.watch.get("verification_timeout_seconds") or 1800)
+    bootstrap_timeout = int(cfg.watch.get("bootstrap_timeout_seconds") or timeout)
+    bootstrap_commands = bootstrap_commands_for_job(cfg, job)
+    verification_commands = verification_commands_for_job(cfg, job)
+    bootstrap = run_labeled_commands(worktree, bootstrap_commands, timeout=bootstrap_timeout, phase="bootstrap")
+    if bootstrap and not all(result.get("ok") for result in bootstrap):
+        return {
+            "ok": False,
+            "reason": "bootstrap-failed",
+            "bootstrap": bootstrap,
+            "verification": [],
+        }
+    verification = run_labeled_commands(worktree, verification_commands, timeout=timeout, phase="verification")
+    verification = annotate_verification_with_baseline(
+        cfg,
+        job,
+        worktree=worktree,
+        base_ref=inspection.get("base_ref"),
+        bootstrap_commands=bootstrap_commands,
+        verification=verification,
+        timeout=timeout,
+    )
+    return {
+        "ok": bool(verification) and all(result.get("ok") for result in verification),
+        "reason": None if verification and all(result.get("ok") for result in verification) else "verification-failed",
+        "bootstrap": bootstrap,
+        "verification": verification,
+    }
 
 
 def git_commit_if_needed(worktree: Path, message: str) -> dict[str, Any]:
@@ -1703,36 +1918,35 @@ def auto_salvage_failed_job(cfg: Config, job: dict[str, Any], *, auto: bool) -> 
         return {"job_id": job_id, "status": "salvage-needed", "inspection": inspection}
 
     worktree = Path(str(inspection["worktree_path"]))
-    timeout = int(cfg.watch.get("verification_timeout_seconds") or 1800)
-    commands = verification_commands_for_job(cfg, job)
-    verification = run_verification_commands(worktree, commands, timeout=timeout)
-    if not verification or not all(result.get("ok") for result in verification):
+    checks = run_delivery_checks(cfg, job, worktree, inspection)
+    if not checks.get("ok"):
         return needs_human(
-            "verification-failed",
+            str(checks.get("reason") or "verification-failed"),
             inspection=inspection,
-            verification=verification,
+            bootstrap=checks.get("bootstrap") or [],
+            verification=checks.get("verification") or [],
         )
 
     inspection_after = inspect_job_worktree(cfg, job)
     if inspection_after.get("scope_violations"):
-        return needs_human("scope-violations-after-verification", inspection=inspection_after, verification=verification)
+        return needs_human("scope-violations-after-verification", inspection=inspection_after, bootstrap=checks.get("bootstrap") or [], verification=checks.get("verification") or [])
 
     title = str((spec.get("request") or {}).get("title") or f"Tasklane salvage {job_id}")
     commit = git_commit_if_needed(worktree, f"{title}\n\nTasklane-auto-salvage: {job_id}")
     if not commit.get("ok"):
-        return needs_human(str(commit.get("reason") or "git-commit-failed"), inspection=inspection_after, verification=verification, commit=commit)
+        return needs_human(str(commit.get("reason") or "git-commit-failed"), inspection=inspection_after, bootstrap=checks.get("bootstrap") or [], verification=checks.get("verification") or [], commit=commit)
 
     work_branch = str(branch.get("work_branch") or inspection_after.get("current_branch") or "").strip()
     base_branch = str(branch.get("pr_target") or branch.get("base_branch") or "").strip()
     if not work_branch or not base_branch:
-        return needs_human("missing-branch-metadata", inspection=inspection_after, verification=verification, commit=commit)
+        return needs_human("missing-branch-metadata", inspection=inspection_after, bootstrap=checks.get("bootstrap") or [], verification=checks.get("verification") or [], commit=commit)
     push = push_branch(worktree, work_branch)
     if not push.get("ok"):
-        return needs_human("push-failed", inspection=inspection_after, verification=verification, commit=commit, push=push)
+        return needs_human("push-failed", inspection=inspection_after, bootstrap=checks.get("bootstrap") or [], verification=checks.get("verification") or [], commit=commit, push=push)
 
     remote = git_remote_for_repo(worktree)
     if not remote:
-        return needs_human("no-github-remote", inspection=inspection_after, verification=verification, commit=commit, push=push)
+        return needs_human("no-github-remote", inspection=inspection_after, bootstrap=checks.get("bootstrap") or [], verification=checks.get("verification") or [], commit=commit, push=push)
     owner, repo = remote
     pr = find_pr(owner, repo, work_branch)
     if not pr:
@@ -1742,10 +1956,10 @@ def auto_salvage_failed_job(cfg: Config, job: dict[str, Any], *, auto: bool) -> 
             branch=work_branch,
             base_branch=base_branch,
             title=title,
-            body=salvage_pr_body(job, verification, inspection_after),
+            body=salvage_pr_body(job, checks.get("verification") or [], inspection_after),
         )
     if pr.get("base_branch") and pr.get("base_branch") != base_branch:
-        return needs_human("pr-base-mismatch", pr=pr, inspection=inspection_after, verification=verification, commit=commit, push=push)
+        return needs_human("pr-base-mismatch", pr=pr, inspection=inspection_after, bootstrap=checks.get("bootstrap") or [], verification=checks.get("verification") or [], commit=commit, push=push)
 
     final_inspection = inspect_job_worktree(cfg, job)
     result = {
@@ -1766,7 +1980,8 @@ def auto_salvage_failed_job(cfg: Config, job: dict[str, Any], *, auto: bool) -> 
         "auto_salvage": {
             "reason": "provider/job failure happened after code changes were produced",
             "commit": commit.get("sha"),
-            "verification": verification,
+            "bootstrap": checks.get("bootstrap") or [],
+            "verification": checks.get("verification") or [],
             "changed_files": final_inspection.get("changed_files") or inspection_after.get("changed_files") or [],
         },
         "final_response": f"Tasklane auto-salvaged failed job {job_id} into PR {pr.get('url')}.",
@@ -2123,14 +2338,10 @@ def command_salvage(cfg: Config, job_id: str, *, auto: bool, verify: bool) -> in
         elif verify:
             inspection = classification.get("inspection") or {}
             if inspection.get("ok") and inspection.get("worktree_path"):
-                commands = verification_commands_for_job(cfg, job)
-                verification = run_verification_commands(
-                    Path(str(inspection["worktree_path"])),
-                    commands,
-                    timeout=int(cfg.watch.get("verification_timeout_seconds") or 1800),
-                )
-                result["verification"] = verification
-                result["status"] = "verification-passed" if verification and all(item.get("ok") for item in verification) else "verification-failed"
+                checks = run_delivery_checks(cfg, job, Path(str(inspection["worktree_path"])), inspection)
+                result["bootstrap"] = checks.get("bootstrap") or []
+                result["verification"] = checks.get("verification") or []
+                result["status"] = "verification-passed" if checks.get("ok") else str(checks.get("reason") or "verification-failed")
         else:
             result["status"] = "salvage-needed"
     print(json.dumps(result, indent=2))
@@ -2210,9 +2421,14 @@ def command_init(cfg: Config, config_path_override: str | None = None) -> int:
                 "watch": {
                     "mode": "observe",
                     "auto_salvage": False,
+                    "baseline_verification": False,
+                    "allow_matching_baseline_failures": False,
+                    "bootstrap_timeout_seconds": 1800,
                     "verification_timeout_seconds": 1800,
                     "stale_running_minutes": 180,
                     "max_retry_attempts": 3,
+                    "bootstrap_commands": [],
+                    "bootstrap_profiles": {},
                     "verification_commands": ["git diff --check"],
                     "verification_profiles": {},
                     "expected_base_branches": {},

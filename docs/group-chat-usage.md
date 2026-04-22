@@ -61,9 +61,9 @@ hermes jobs list --json
 For pull-request jobs, review the PR before merging. Treat the autonomous output as a draft from a junior developer until the pipeline has more production burn-in.
 
 For unattended overnight runs, use scoped pull-request tasks with `allowed_paths`
-and project verification profiles. Guarded watch can auto-retry clean transient
-failures and auto-salvage dirty failed pull-request jobs only after scope and
-verification pass.
+and project bootstrap/verification profiles. Guarded watch can auto-retry clean
+transient failures and auto-salvage dirty failed pull-request jobs only after
+scope, bootstrap, verification, and optional baseline comparison pass.
 
 ## Good Task Template
 

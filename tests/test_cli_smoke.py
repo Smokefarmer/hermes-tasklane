@@ -756,6 +756,92 @@ def test_guarded_watch_auto_salvage_commits_pushes_and_marks_completed(tmp_path:
     assert status.stdout == ""
 
 
+def test_auto_salvage_runs_bootstrap_before_verification(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.watch["auto_salvage"] = True
+    cfg.watch["bootstrap_commands"] = ["git config tasklane.bootstrapped true"]
+    cfg.watch["verification_commands"] = ["test \"$(git config --get tasklane.bootstrapped)\" = true"]
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    init_git_repo(repo)
+    subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/demo.git"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\nchanged\n", encoding="utf-8")
+    write_job_record(hermes_home, "failed", "tasklane_salvage", failed_provider_job(repo))
+    monkeypatch.setattr(cli, "push_branch", lambda worktree, branch: {"ok": True, "branch": branch})
+    monkeypatch.setattr(cli, "find_pr", lambda owner, repo_name, branch: None)
+    monkeypatch.setattr(
+        cli,
+        "create_pr",
+        lambda owner, repo_name, **kwargs: {
+            "number": 124,
+            "url": "https://github.com/example/demo/pull/124",
+            "title": kwargs["title"],
+            "state": "open",
+            "merged_at": None,
+            "head_sha": "def456",
+            "branch": kwargs["branch"],
+            "base_branch": kwargs["base_branch"],
+        },
+    )
+
+    report = cli.build_watch_report(cfg, mode="guarded", ignored_blocked=set(), check_gateway=False)
+    actions = cli.apply_guarded_watch_actions(cfg, report)
+
+    assert actions[0]["status"] == "salvaged"
+    completed_job = json.loads((hermes_home / "jobs" / "completed" / "tasklane_salvage.json").read_text(encoding="utf-8"))
+    assert completed_job["result"]["auto_salvage"]["bootstrap"][0]["ok"] is True
+    assert completed_job["result"]["auto_salvage"]["verification"][1]["ok"] is True
+
+
+def test_auto_salvage_accepts_matching_baseline_failure(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.watch["auto_salvage"] = True
+    cfg.watch["baseline_verification"] = True
+    cfg.watch["allow_matching_baseline_failures"] = True
+    cfg.watch["verification_commands"] = ["printf 'shared failure\\n' >&2; exit 2"]
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    init_git_repo(repo)
+    subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/demo.git"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\nchanged\n", encoding="utf-8")
+    write_job_record(hermes_home, "failed", "tasklane_salvage", failed_provider_job(repo))
+    monkeypatch.setattr(cli, "push_branch", lambda worktree, branch: {"ok": True, "branch": branch})
+    monkeypatch.setattr(cli, "find_pr", lambda owner, repo_name, branch: None)
+    monkeypatch.setattr(
+        cli,
+        "create_pr",
+        lambda owner, repo_name, **kwargs: {
+            "number": 125,
+            "url": "https://github.com/example/demo/pull/125",
+            "title": kwargs["title"],
+            "state": "open",
+            "merged_at": None,
+            "head_sha": "fed789",
+            "branch": kwargs["branch"],
+            "base_branch": kwargs["base_branch"],
+        },
+    )
+
+    report = cli.build_watch_report(cfg, mode="guarded", ignored_blocked=set(), check_gateway=False)
+    actions = cli.apply_guarded_watch_actions(cfg, report)
+
+    assert actions[0]["status"] == "salvaged"
+    completed_job = json.loads((hermes_home / "jobs" / "completed" / "tasklane_salvage.json").read_text(encoding="utf-8"))
+    accepted = [item for item in completed_job["result"]["auto_salvage"]["verification"] if item.get("accepted_baseline_failure")]
+    assert accepted[0]["status"] == "accepted-baseline-failure"
+    assert accepted[0]["baseline"]["matches_branch_output"] is True
+
+
 def test_auto_salvage_blocks_scope_violations(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"
@@ -908,6 +994,54 @@ def test_dashboard_hides_ignored_blocked_jobs_from_active_counts(tmp_path: Path)
     assert state["watch"]["counts_all"]["blocked"] == 1
     assert state["watch"]["ignored_blocked"][0]["id"] == "tasklane_obsolete"
     assert state["jobs"]["blocked"] == []
+
+
+def test_dashboard_exposes_needs_human_verification_summary(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    write_job_record(
+        hermes_home,
+        "needs-human",
+        "tasklane_review",
+        {
+            "needs_human_reason": "verification-failed",
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "review job"},
+                "branch": {"mode": "new-branch", "base_branch": "main"},
+            },
+            "metadata": {"tasklane_salvage": {"status": "needs-human", "reason": "verification-failed"}},
+            "result": {
+                "auto_salvage": {
+                    "status": "needs-human",
+                    "reason": "verification-failed",
+                    "verification": [
+                        {
+                            "command": "npm run typecheck",
+                            "phase": "verification",
+                            "exit_code": 2,
+                            "ok": False,
+                            "output_tail": "typecheck failed",
+                        }
+                    ],
+                    "changed_files": ["README.md"],
+                }
+            },
+        },
+    )
+
+    state = dashboard_state(cfg)
+    job = state["jobs"]["needs-human"][0]
+
+    assert job["needs_human_reason"] == "verification-failed"
+    assert job["verification"]["failed_verification"][0]["command"] == "npm run typecheck"
+    assert job["verification"]["changed_files"] == ["README.md"]
 
 
 def test_dashboard_job_detail_includes_event_log(tmp_path: Path) -> None:

@@ -327,9 +327,18 @@ Configure branch policy and known expected blocked jobs in `~/.config/hermes-tas
   "watch": {
     "mode": "observe",
     "auto_salvage": false,
+    "baseline_verification": false,
+    "allow_matching_baseline_failures": false,
+    "bootstrap_timeout_seconds": 1800,
     "verification_timeout_seconds": 1800,
     "stale_running_minutes": 180,
     "max_retry_attempts": 3,
+    "bootstrap_commands": [],
+    "bootstrap_profiles": {
+      "Treasure Hunter": [
+        "npm ci"
+      ]
+    },
     "verification_commands": [
       "git diff --check"
     ],
@@ -370,13 +379,22 @@ If `auto_salvage` is enabled, guarded mode treats dirty failed pull-request jobs
 - inspect the job worktree and current branch
 - require the job failure to match a safe provider/job failure pattern
 - require all changed files to stay inside the task scope
+- run configured bootstrap commands, such as dependency install or code generation
 - run configured verification commands
+- optionally compare failed verification commands against the base branch
 - commit remaining dirty changes
 - push the task branch
 - find or create the pull request
 - mark the job and tasklane file completed
 
 If any guard fails, the job stays failed or needs-human and is not pushed.
+
+Baseline-aware verification is intentionally strict. With
+`baseline_verification: true`, Tasklane re-runs failed verification commands on
+the base ref in a temporary detached worktree. With
+`allow_matching_baseline_failures: true`, a failed command can be accepted only
+when the base branch fails with matching output. If the base passes or the
+output differs, delivery stays `needs-human`.
 
 Manual salvage commands:
 

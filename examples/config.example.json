@@ -10,9 +10,14 @@
   "watch": {
     "mode": "observe",
     "auto_salvage": false,
+    "baseline_verification": false,
+    "allow_matching_baseline_failures": false,
+    "bootstrap_timeout_seconds": 1800,
     "verification_timeout_seconds": 1800,
     "stale_running_minutes": 180,
     "max_retry_attempts": 3,
+    "bootstrap_commands": [],
+    "bootstrap_profiles": {},
     "verification_commands": [
       "git diff --check"
     ],
