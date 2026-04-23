@@ -24,6 +24,7 @@ DELIVERY_BLOCKERS = {
     "pr-already-exists",
     "delivery-failed",
     "ci-pending",
+    "ci-unavailable",
 }
 ACTIVE_RUN_STATES = {"queued", "running"}
 ACTIVE_JOB_STATES = {"ready", "running"}
@@ -61,6 +62,24 @@ SALVAGE_ERROR_PATTERNS = (
     "worktree has uncommitted",
     "dirty worktree",
     "uncommitted changes after agent run",
+)
+CI_FAIL_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
+CI_UNAVAILABLE_CONCLUSIONS = {"action_required", "startup_failure"}
+CI_UNAVAILABLE_PATTERNS = (
+    "actions are disabled",
+    "artifact expired",
+    "billing",
+    "blobnotfound",
+    "disabled by billing",
+    "minute limit",
+    "minutes limit",
+    "no hosted parallelism",
+    "quota",
+    "resource not accessible",
+    "spending limit",
+    "startup failure",
+    "usage limit",
+    "workflow was not run",
 )
 
 
@@ -494,6 +513,43 @@ def iter_job_records(cfg: Config, states: set[str] | None = None) -> list[dict[s
             if isinstance(payload, dict):
                 records.append(payload)
     return records
+
+
+def completed_job_ids(cfg: Config) -> set[str]:
+    return {
+        str(payload.get("id") or "")
+        for payload in iter_job_records(cfg, {"completed"})
+        if payload.get("id")
+    }
+
+
+def job_dependencies(payload: dict[str, Any]) -> list[str]:
+    spec = payload.get("spec") or {}
+    dependencies = spec.get("dependencies") or []
+    if isinstance(dependencies, str):
+        dependencies = parse_csv(dependencies)
+    if not isinstance(dependencies, list):
+        return []
+    return [str(item).strip() for item in dependencies if str(item).strip()]
+
+
+def waiting_dependencies(payload: dict[str, Any], completed: set[str]) -> list[str]:
+    return [dependency for dependency in job_dependencies(payload) if dependency not in completed]
+
+
+def split_ready_jobs(cfg: Config, ready_jobs: list[dict[str, Any]] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, list[str]]]:
+    completed = completed_job_ids(cfg)
+    runnable: list[dict[str, Any]] = []
+    waiting: list[dict[str, Any]] = []
+    waiting_for: dict[str, list[str]] = {}
+    for job in ready_jobs if ready_jobs is not None else iter_job_records(cfg, {"ready"}):
+        missing = waiting_dependencies(job, completed)
+        if missing:
+            waiting.append(job)
+            waiting_for[str(job.get("id") or "")] = missing
+        else:
+            runnable.append(job)
+    return runnable, waiting, waiting_for
 
 
 def active_jobs_for_repo(cfg: Config, expected_repo_key: str) -> list[dict[str, Any]]:
@@ -935,30 +991,108 @@ def github_post(url: str, payload: dict[str, Any]) -> Any:
     return json.loads(response_body) if response_body.strip() else None
 
 
+def ci_text_indicates_unavailable(*values: Any) -> bool:
+    text = "\n".join(str(value or "") for value in values).lower()
+    return any(pattern in text for pattern in CI_UNAVAILABLE_PATTERNS)
+
+
+def check_runs_for_suite(suite: dict[str, Any]) -> list[dict[str, Any]]:
+    url = suite.get("check_runs_url")
+    if not url:
+        return []
+    try:
+        payload = github_get(str(url)) or {}
+    except Exception:
+        return []
+    runs = payload.get("check_runs") if isinstance(payload, dict) else []
+    if not isinstance(runs, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        output = run.get("output") if isinstance(run.get("output"), dict) else {}
+        rows.append(
+            {
+                "name": run.get("name"),
+                "status": run.get("status"),
+                "conclusion": run.get("conclusion"),
+                "title": output.get("title") if isinstance(output, dict) else None,
+                "summary": output.get("summary") if isinstance(output, dict) else None,
+                "text": output.get("text") if isinstance(output, dict) else None,
+            }
+        )
+    return rows
+
+
 def ci_status(owner: str, repo: str, sha: str) -> dict[str, Any]:
     combined = github_get(f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/status") or {}
     suites = github_get(f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-suites") or {}
     lines: list[str] = []
     pending = False
-    failed = False
+    unavailable = False
+    hard_failed = False
     suite_rows: list[dict[str, Any]] = []
     for suite in suites.get("check_suites", []) or []:
         app = ((suite.get("app") or {}).get("slug") or (suite.get("app") or {}).get("name") or "unknown")
         status = suite.get("status")
         conclusion = suite.get("conclusion")
-        suite_rows.append({"app": app, "status": status, "conclusion": conclusion})
+        conclusion_lower = str(conclusion or "").lower()
+        suite_row: dict[str, Any] = {"app": app, "status": status, "conclusion": conclusion}
         lines.append(f"suite {app}: {status}/{conclusion or 'pending'}")
         if status != "completed" or not conclusion:
             pending = True
-        elif str(conclusion).lower() in {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}:
-            failed = True
+        elif conclusion_lower in CI_FAIL_CONCLUSIONS:
+            check_runs = check_runs_for_suite(suite)
+            if check_runs:
+                suite_row["check_runs"] = [
+                    {
+                        "name": run.get("name"),
+                        "status": run.get("status"),
+                        "conclusion": run.get("conclusion"),
+                        "title": run.get("title"),
+                    }
+                    for run in check_runs
+                ]
+            suite_unavailable = conclusion_lower in CI_UNAVAILABLE_CONCLUSIONS or ci_text_indicates_unavailable(
+                app,
+                suite.get("name"),
+                suite.get("conclusion"),
+                suite.get("status"),
+            )
+            if not suite_unavailable:
+                suite_unavailable = any(
+                    str(run.get("conclusion") or "").lower() in CI_UNAVAILABLE_CONCLUSIONS
+                    or ci_text_indicates_unavailable(run.get("name"), run.get("title"), run.get("summary"), run.get("text"))
+                    for run in check_runs
+                )
+            if suite_unavailable:
+                unavailable = True
+                lines.append(f"suite {app}: CI unavailable")
+            else:
+                hard_failed = True
+        suite_rows.append(suite_row)
+    statuses = combined.get("statuses") if isinstance(combined, dict) else []
+    if isinstance(statuses, list):
+        for status_item in statuses:
+            if not isinstance(status_item, dict):
+                continue
+            state = str(status_item.get("state") or "").lower()
+            if state in {"failure", "error"}:
+                if ci_text_indicates_unavailable(status_item.get("context"), status_item.get("description"), status_item.get("target_url")):
+                    unavailable = True
+                else:
+                    hard_failed = True
+            elif state == "pending":
+                pending = True
     overall = str(combined.get("state") or "").lower()
-    if overall in {"failure", "error"}:
-        failed = True
+    if overall in {"failure", "error"} and not unavailable:
+        hard_failed = True
     elif overall == "pending":
         pending = True
+    status = "fail" if hard_failed else "unavailable" if unavailable else "pending" if pending else "pass"
     return {
-        "status": "fail" if failed else "pending" if pending else "pass",
+        "status": status,
         "output": "\n".join(lines) if lines else "No GitHub status checks reported",
         "combined_state": combined.get("state"),
         "check_suites": suite_rows,
@@ -1265,7 +1399,7 @@ def verification_summary_for_job(payload: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
-def compact_job(payload: dict[str, Any]) -> dict[str, Any]:
+def compact_job(payload: dict[str, Any], *, state: str | None = None, waiting_for: list[str] | None = None) -> dict[str, Any]:
     spec = payload.get("spec") or {}
     branch = spec.get("branch") or {}
     request = spec.get("request") or {}
@@ -1274,7 +1408,7 @@ def compact_job(payload: dict[str, Any]) -> dict[str, Any]:
     salvage = metadata.get("tasklane_salvage") if isinstance(metadata, dict) else {}
     return {
         "id": payload.get("id"),
-        "state": payload.get("state"),
+        "state": state or payload.get("state"),
         "attempt": payload.get("attempt"),
         "project": spec.get("project"),
         "repo_key": ((spec.get("repo") or {}).get("key")),
@@ -1283,6 +1417,7 @@ def compact_job(payload: dict[str, Any]) -> dict[str, Any]:
         "base_branch": branch.get("base_branch"),
         "work_branch": branch.get("work_branch"),
         "delivery_mode": spec.get("delivery_mode"),
+        "waiting_for": waiting_for or [],
         "claimed_by": payload.get("claimed_by"),
         "runtime_minutes": minutes_since(payload.get("claimed_at")) if payload.get("state") == "running" else None,
         "error": payload.get("last_error"),
@@ -2109,13 +2244,20 @@ def build_watch_report(
         state = str(job.get("state") or "unknown")
         by_state[state] = by_state.get(state, 0) + 1
     counts_all = dict(by_state)
+    by_state["waiting"] = 0
+    counts_all["waiting"] = 0
     problems: list[dict[str, Any]] = []
     notices: list[dict[str, Any]] = []
     gateway = systemd_gateway_status() if check_gateway else {"available": False, "state": "unchecked", "ok": None}
     if check_gateway and gateway.get("ok") is False:
         add_watch_problem(problems, "critical", "gateway-inactive", f"hermes-gateway.service is {gateway.get('state')}")
     running = [job for job in jobs if job.get("state") == "running"]
-    ready = [job for job in jobs if job.get("state") == "ready"]
+    raw_ready = [job for job in jobs if job.get("state") == "ready"]
+    ready, waiting, waiting_for = split_ready_jobs(cfg, raw_ready)
+    counts_all["ready_physical"] = counts_all.get("ready", 0)
+    by_state["ready"] = len(ready)
+    by_state["waiting"] = len(waiting)
+    counts_all["waiting"] = len(waiting)
     blocked = [job for job in jobs if job.get("state") == "blocked"]
     needs_human = [job for job in jobs if job.get("state") == "needs-human"]
     failed = [job for job in jobs if job.get("state") == "failed"]
@@ -2156,7 +2298,7 @@ def build_watch_report(
             add_watch_problem(problems, "warning", "salvage-needs-human", str(classification.get("reason") or "dirty failed job needs review"), job)
         else:
             add_watch_problem(problems, "warning", "job-failed", "job failed and was not automatically retried", job)
-    for job in ready + running:
+    for job in ready + waiting + running:
         spec = job.get("spec") or {}
         branch = spec.get("branch") or {}
         expected_branch = expected_base_for_job(job, expected)
@@ -2180,6 +2322,7 @@ def build_watch_report(
         "inbox": len([p for p in cfg.inbox_dir.iterdir() if p.is_file()]) if cfg.inbox_dir.exists() else 0,
         "running": [compact_job(job) for job in running],
         "ready": [compact_job(job) for job in ready],
+        "waiting": [compact_job(job, state="waiting", waiting_for=waiting_for.get(str(job.get("id") or ""), [])) for job in waiting],
         "blocked": [compact_job(job) for job in active_blocked],
         "ignored_blocked": [compact_job(job) for job in ignored_blocked_jobs],
         "needs_human": [compact_job(job) for job in needs_human],
@@ -2216,6 +2359,7 @@ def format_watch_report(report: dict[str, Any]) -> str:
         f"Gateway: {(report.get('gateway') or {}).get('state')}",
         f"Running: {counts.get('running', 0)}",
         f"Ready: {counts.get('ready', 0)}",
+        f"Waiting: {counts.get('waiting', 0)}",
         f"Failed: {counts.get('failed', 0)}",
         f"Blocked: {counts.get('blocked', 0)}",
         f"Needs human: {counts.get('needs-human', 0)}",
@@ -2357,7 +2501,9 @@ def command_status(cfg: Config) -> int:
     active_runs: list[dict[str, Any]] = []
     blocked_runs: list[dict[str, Any]] = []
     active_jobs: list[dict[str, Any]] = []
+    waiting_jobs: list[dict[str, Any]] = []
     blocked_jobs: list[dict[str, Any]] = []
+    completed = completed_job_ids(cfg)
     for path in cfg.runs_dir.glob("*.json"):
         payload = load_json(path)
         if not isinstance(payload, dict) or payload.get("kind") != "coding_task":
@@ -2383,7 +2529,15 @@ def command_status(cfg: Config) -> int:
             "title": ((spec.get("request") or {}).get("title")),
             "error": payload.get("last_error"),
         }
-        if item["state"] in {"ready", "running"}:
+        if item["state"] == "ready":
+            missing = waiting_dependencies(payload, completed)
+            if missing:
+                item["state"] = "waiting"
+                item["waiting_for"] = missing
+                waiting_jobs.append(item)
+                continue
+            active_jobs.append(item)
+        if item["state"] == "running":
             active_jobs.append(item)
         if item["state"] in {"blocked", "needs-human"}:
             blocked_jobs.append(item)
@@ -2394,6 +2548,7 @@ def command_status(cfg: Config) -> int:
         "failed": len([p for p in cfg.failed_dir.iterdir() if p.is_file() and p.suffix in TASK_SUFFIXES]) if cfg.failed_dir.exists() else 0,
         "cancelled": len([p for p in cfg.cancelled_dir.iterdir() if p.is_file() and p.suffix in TASK_SUFFIXES]) if cfg.cancelled_dir.exists() else 0,
         "active_jobs": active_jobs,
+        "waiting_jobs": waiting_jobs,
         "blocked_jobs": blocked_jobs,
         "active_runs": active_runs,
         "blocked_runs": blocked_runs,

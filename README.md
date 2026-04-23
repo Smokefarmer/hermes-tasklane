@@ -173,6 +173,12 @@ For a batch that should become one PR:
   - same delivery_group
   - depends_on all implementation task IDs
 - the final task reviews the grouped branch, runs verification, and opens one PR
+- require the final PR body to include:
+  - full changed-file list from `git diff --name-only <base_branch>...HEAD`
+  - diffstat from `git diff --stat <base_branch>...HEAD`
+  - high-risk file summary for auth, money, contracts, migrations, schemas, and public APIs
+  - verification command results
+  - residual risks or skipped issues
 
 For two big features:
 - use two different delivery_group values

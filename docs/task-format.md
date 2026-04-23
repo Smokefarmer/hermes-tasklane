@@ -109,3 +109,16 @@ Auto-salvage only proceeds when all of these are true:
 If a task sets `allow_unlisted_paths: false`, keep `allowed_paths` precise.
 That scope is the hard guard that prevents an overnight run from pushing broad
 or unrelated changes.
+
+## Final PR Review Artifact
+
+For a many-task batch, the final integration task should require the PR body to
+include:
+
+- full changed-file list from `git diff --name-only <base_branch>...HEAD`
+- diffstat from `git diff --stat <base_branch>...HEAD`
+- high-risk file summary for auth, money, contracts, migrations, schemas, and public APIs
+- verification command results
+- residual risks or skipped issues
+
+This keeps review focused even when a batch spans dozens of files.

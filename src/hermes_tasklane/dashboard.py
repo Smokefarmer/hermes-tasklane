@@ -231,10 +231,17 @@ def dashboard_state(cfg: cli.Config) -> dict[str, Any]:
     ignored_blocked = cli.watch_ignored_blocked_jobs(cfg)
     jobs = cli.iter_job_records(cfg)
     jobs_by_state: dict[str, list[dict[str, Any]]] = {state: [] for state in sorted(cli.JOB_STATES)}
+    jobs_by_state["waiting"] = []
+    completed = cli.completed_job_ids(cfg)
     for job in jobs:
         state = str(job.get("state") or "unknown")
         if state == "blocked" and str(job.get("id") or "") in ignored_blocked:
             continue
+        if state == "ready":
+            missing = cli.waiting_dependencies(job, completed)
+            if missing:
+                jobs_by_state["waiting"].append(cli.compact_job(job, state="waiting", waiting_for=missing))
+                continue
         jobs_by_state.setdefault(state, []).append(cli.compact_job(job))
     for records in jobs_by_state.values():
         records.sort(key=lambda item: str(item.get("id") or ""))
@@ -303,6 +310,7 @@ INDEX_HTML = """<!doctype html>
     <section class="summary-grid" aria-label="Queue summary">
       <div class="metric"><span>Running</span><strong id="count-running">0</strong></div>
       <div class="metric"><span>Ready</span><strong id="count-ready">0</strong></div>
+      <div class="metric"><span>Waiting</span><strong id="count-waiting">0</strong></div>
       <div class="metric"><span>Failed</span><strong id="count-failed">0</strong></div>
       <div class="metric"><span>Blocked</span><strong id="count-blocked">0</strong></div>
       <div class="metric"><span>Completed</span><strong id="count-completed">0</strong></div>
@@ -351,6 +359,7 @@ INDEX_HTML = """<!doctype html>
         <div class="filters" role="group" aria-label="State filters">
           <button class="filter active" data-filter="all" type="button">All</button>
           <button class="filter" data-filter="ready" type="button">Ready</button>
+          <button class="filter" data-filter="waiting" type="button">Waiting</button>
           <button class="filter" data-filter="running" type="button">Running</button>
           <button class="filter" data-filter="failed" type="button">Failed</button>
           <button class="filter" data-filter="needs-human" type="button">Needs Human</button>
@@ -504,7 +513,7 @@ h2 { font-size: 18px; line-height: 1.2; letter-spacing: 0; }
 
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
@@ -707,6 +716,7 @@ h2 { font-size: 18px; line-height: 1.2; letter-spacing: 0; }
 
 .state-running { background: rgba(125, 215, 200, 0.16); color: var(--info); border-color: rgba(125, 215, 200, 0.42); }
 .state-ready { background: rgba(116, 224, 163, 0.15); color: var(--success); border-color: rgba(116, 224, 163, 0.42); }
+.state-waiting { background: rgba(152, 166, 157, 0.12); color: #bac7bf; border-color: rgba(152, 166, 157, 0.28); }
 .state-failed { background: rgba(255, 107, 122, 0.15); color: var(--destructive); border-color: rgba(255, 107, 122, 0.42); }
 .state-blocked, .state-needs-human { background: rgba(255, 209, 102, 0.16); color: var(--warning); border-color: rgba(255, 209, 102, 0.42); }
 .state-completed { background: rgba(152, 166, 157, 0.12); color: #bac7bf; border-color: rgba(152, 166, 157, 0.24); }
@@ -795,6 +805,7 @@ let currentFilter = 'all';
 const stateIds = {
   running: 'count-running',
   ready: 'count-ready',
+  waiting: 'count-waiting',
   failed: 'count-failed',
   blocked: 'count-blocked',
   completed: 'count-completed',
@@ -818,6 +829,10 @@ function jobLabel(job) {
 }
 
 function verificationLine(job) {
+  const waitingFor = job.waiting_for || [];
+  if (waitingFor.length) {
+    return `Waiting for: ${waitingFor.join(', ')}`;
+  }
   const verification = job.verification || {};
   const failedBootstrap = verification.failed_bootstrap || [];
   const failedVerification = verification.failed_verification || [];
@@ -1007,7 +1022,7 @@ function escapeHtml(value) {
 
 function allQueueJobs(data) {
   const jobs = data.jobs || {};
-  const order = ['running', 'ready', 'failed', 'needs-human', 'blocked', 'completed'];
+  const order = ['running', 'ready', 'waiting', 'failed', 'needs-human', 'blocked', 'completed'];
   return order.flatMap((state) => jobs[state] || []);
 }
 

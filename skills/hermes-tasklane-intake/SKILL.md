@@ -50,6 +50,14 @@ For a many-task single-PR batch, prefer:
 
 This avoids multiple jobs fighting to create or update the same PR.
 
+Every final integration/review PR task must require a review artifact in the PR body:
+
+- full changed-file list from `git diff --name-only <base_branch>...HEAD`
+- diffstat from `git diff --stat <base_branch>...HEAD`
+- high-risk file summary, especially auth, money, contracts, migrations, schemas, and public API surfaces
+- verification commands and results
+- residual risks or skipped issues
+
 ## Dependencies
 
 Use stable task IDs and `depends_on`:
@@ -102,6 +110,13 @@ Task body.
 Acceptance criteria:
 - concrete criterion
 - concrete criterion
+
+Final PR artifact requirements, when this is the final integration task:
+- include `git diff --name-only <base_branch>...HEAD`
+- include `git diff --stat <base_branch>...HEAD`
+- include a high-risk file summary
+- include verification command results
+- list residual risks or skipped items
 ```
 
 ## Workflow

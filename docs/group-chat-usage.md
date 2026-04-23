@@ -95,6 +95,7 @@ For ten tasks that should become one PR:
 - omit `depends_on` for tasks that do not require ordering
 - use `delivery_mode: direct-push` for implementation tasks
 - add one final integration task with `delivery_mode: pull-request` and `depends_on` all implementation task IDs
+- make the final integration task require a PR body with full changed-file list, diffstat, high-risk file summary, verification results, and residual risks
 
 For two big features:
 

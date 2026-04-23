@@ -448,6 +448,94 @@ def test_reconcile_keeps_pending_delivery_run_submitted(tmp_path: Path, monkeypa
     assert not list((task_root / "failed").glob("demo.md"))
 
 
+def test_ci_status_classifies_startup_failure_as_unavailable(monkeypatch) -> None:
+    def fake_github_get(url: str) -> dict:
+        if url.endswith("/status"):
+            return {"state": "failure", "statuses": []}
+        if url.endswith("/check-suites"):
+            return {
+                "check_suites": [
+                    {
+                        "app": {"slug": "github-actions"},
+                        "status": "completed",
+                        "conclusion": "startup_failure",
+                    }
+                ]
+            }
+        raise AssertionError(url)
+
+    monkeypatch.setattr(cli, "github_get", fake_github_get)
+
+    status = cli.ci_status("example", "demo", "abc123")
+
+    assert status["status"] == "unavailable"
+    assert status["check_suites"][0]["conclusion"] == "startup_failure"
+
+
+def test_ci_status_classifies_billing_failure_as_unavailable(monkeypatch) -> None:
+    check_runs_url = "https://api.github.com/repos/example/demo/check-suites/1/check-runs"
+
+    def fake_github_get(url: str) -> dict:
+        if url.endswith("/status"):
+            return {"state": "failure", "statuses": []}
+        if url.endswith("/check-suites"):
+            return {
+                "check_suites": [
+                    {
+                        "app": {"slug": "github-actions"},
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "check_runs_url": check_runs_url,
+                    }
+                ]
+            }
+        if url == check_runs_url:
+            return {
+                "check_runs": [
+                    {
+                        "name": "build",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "output": {
+                            "title": "GitHub Actions unavailable",
+                            "summary": "Workflow was not run because the spending limit has been reached.",
+                        },
+                    }
+                ]
+            }
+        raise AssertionError(url)
+
+    monkeypatch.setattr(cli, "github_get", fake_github_get)
+
+    status = cli.ci_status("example", "demo", "abc123")
+
+    assert status["status"] == "unavailable"
+    assert "CI unavailable" in status["output"]
+
+
+def test_ci_status_keeps_real_failures_as_failed(monkeypatch) -> None:
+    def fake_github_get(url: str) -> dict:
+        if url.endswith("/status"):
+            return {"state": "failure", "statuses": []}
+        if url.endswith("/check-suites"):
+            return {
+                "check_suites": [
+                    {
+                        "app": {"slug": "github-actions"},
+                        "status": "completed",
+                        "conclusion": "failure",
+                    }
+                ]
+            }
+        raise AssertionError(url)
+
+    monkeypatch.setattr(cli, "github_get", fake_github_get)
+
+    status = cli.ci_status("example", "demo", "abc123")
+
+    assert status["status"] == "fail"
+
+
 def test_watch_flags_base_branch_policy_mismatch(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"
@@ -509,6 +597,101 @@ def test_watch_ignores_known_blocked_job(tmp_path: Path) -> None:
     assert report["ignored_blocked"][0]["id"] == "tasklane_obsolete"
     assert report["problems"] == []
     assert report["notices"][0]["code"] == "blocked-ignored"
+
+
+def test_watch_splits_dependency_waiting_jobs(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    write_job_record(
+        hermes_home,
+        "ready",
+        "tasklane_base",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "base work"},
+                "branch": {"mode": "new-branch", "base_branch": "main"},
+            },
+        },
+    )
+    write_job_record(
+        hermes_home,
+        "ready",
+        "tasklane_final",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "final PR"},
+                "branch": {"mode": "existing-branch", "base_branch": "main"},
+                "dependencies": ["tasklane_base"],
+            },
+        },
+    )
+
+    report = cli.build_watch_report(cfg, ignored_blocked=set(), check_gateway=False)
+
+    assert report["health"] == "ok"
+    assert report["counts"]["ready"] == 1
+    assert report["counts"]["waiting"] == 1
+    assert report["counts_all"]["ready"] == 2
+    assert report["counts_all"]["ready_physical"] == 2
+    assert report["ready"][0]["id"] == "tasklane_base"
+    assert report["waiting"][0]["id"] == "tasklane_final"
+    assert report["waiting"][0]["state"] == "waiting"
+    assert report["waiting"][0]["waiting_for"] == ["tasklane_base"]
+
+
+def test_status_reports_dependency_waiting_jobs(tmp_path: Path, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+
+    write_job_record(
+        hermes_home,
+        "ready",
+        "tasklane_base",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "base work"},
+                "branch": {"mode": "new-branch", "base_branch": "main"},
+            },
+        },
+    )
+    write_job_record(
+        hermes_home,
+        "ready",
+        "tasklane_final",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "final PR"},
+                "branch": {"mode": "existing-branch", "base_branch": "main"},
+                "dependencies": ["tasklane_base"],
+            },
+        },
+    )
+
+    assert cli.command_status(cfg) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert [job["id"] for job in payload["active_jobs"]] == ["tasklane_base"]
+    assert payload["waiting_jobs"][0]["id"] == "tasklane_final"
+    assert payload["waiting_jobs"][0]["state"] == "waiting"
+    assert payload["waiting_jobs"][0]["waiting_for"] == ["tasklane_base"]
 
 
 def test_watch_flags_stale_running_dead_claimant(tmp_path: Path, monkeypatch) -> None:
@@ -994,6 +1177,51 @@ def test_dashboard_hides_ignored_blocked_jobs_from_active_counts(tmp_path: Path)
     assert state["watch"]["counts_all"]["blocked"] == 1
     assert state["watch"]["ignored_blocked"][0]["id"] == "tasklane_obsolete"
     assert state["jobs"]["blocked"] == []
+
+
+def test_dashboard_exposes_dependency_waiting_jobs(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    write_job_record(
+        hermes_home,
+        "ready",
+        "tasklane_base",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "base work"},
+                "branch": {"mode": "new-branch", "base_branch": "main"},
+            },
+        },
+    )
+    write_job_record(
+        hermes_home,
+        "ready",
+        "tasklane_final",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "final PR"},
+                "branch": {"mode": "existing-branch", "base_branch": "main"},
+                "dependencies": ["tasklane_base"],
+            },
+        },
+    )
+
+    state = dashboard_state(cfg)
+
+    assert state["totals"]["ready"] == 1
+    assert state["totals"]["waiting"] == 1
+    assert state["jobs"]["ready"][0]["id"] == "tasklane_base"
+    assert state["jobs"]["waiting"][0]["id"] == "tasklane_final"
+    assert state["jobs"]["waiting"][0]["waiting_for"] == ["tasklane_base"]
 
 
 def test_dashboard_exposes_needs_human_verification_summary(tmp_path: Path) -> None:
