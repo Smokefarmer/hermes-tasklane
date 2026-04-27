@@ -69,6 +69,20 @@ Bundled Hermes skills, including `hermes-tasklane-intake`, are installed to:
 
 Use `--no-skills` if you only want the CLI.
 
+For a trusted internal network dashboard, install with:
+
+```bash
+./scripts/install.sh --systemd --enable-dashboard --dashboard-host 0.0.0.0 --dashboard-port 8765
+```
+
+Then open:
+
+```text
+http://<server-lan-ip>:8765
+```
+
+Do not expose the dashboard directly to the public internet without an authenticating reverse proxy.
+
 ### Quick use
 
 1. Put a task file in:

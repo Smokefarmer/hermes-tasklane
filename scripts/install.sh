@@ -8,6 +8,9 @@ INSTALL_SYSTEMD="false"
 PIP_EDITABLE="false"
 CLI_PATH=""
 INSTALL_SKILLS="true"
+ENABLE_DASHBOARD="false"
+DASHBOARD_HOST="127.0.0.1"
+DASHBOARD_PORT="8765"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -19,6 +22,26 @@ while [[ $# -gt 0 ]]; do
       INSTALL_SYSTEMD="true"
       shift
       ;;
+    --enable-dashboard)
+      ENABLE_DASHBOARD="true"
+      shift
+      ;;
+    --dashboard-host)
+      if [[ $# -lt 2 ]]; then
+        echo "--dashboard-host requires a host value." >&2
+        exit 1
+      fi
+      DASHBOARD_HOST="$2"
+      shift 2
+      ;;
+    --dashboard-port)
+      if [[ $# -lt 2 ]]; then
+        echo "--dashboard-port requires a port value." >&2
+        exit 1
+      fi
+      DASHBOARD_PORT="$2"
+      shift 2
+      ;;
     --no-skills)
       INSTALL_SKILLS="false"
       shift
@@ -29,12 +52,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --help|-h)
       cat <<'EOF'
-Usage: ./scripts/install.sh [--editable] [--systemd] [--no-skills] [--config /path/to/config.json]
+Usage: ./scripts/install.sh [--editable] [--systemd] [--enable-dashboard] [--dashboard-host HOST] [--dashboard-port PORT] [--no-skills] [--config /path/to/config.json]
 
 Installs hermes-tasklane, initializes local folders, and optionally installs
-user-level systemd units for sync/reconcile/watch timers plus a disabled
-dashboard service template. Bundled Hermes skills are installed by default
-unless --no-skills is passed.
+user-level systemd units for sync/reconcile/watch timers plus the dashboard
+service template. Bundled Hermes skills are installed by default unless
+--no-skills is passed.
 EOF
       exit 0
       ;;
@@ -44,6 +67,11 @@ EOF
       ;;
   esac
 done
+
+if ! [[ "$DASHBOARD_PORT" =~ ^[0-9]+$ ]] || (( DASHBOARD_PORT < 1 || DASHBOARD_PORT > 65535 )); then
+  echo "--dashboard-port must be an integer from 1 to 65535." >&2
+  exit 1
+fi
 
 cd "$REPO_DIR"
 
@@ -90,12 +118,15 @@ if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
     cp "$REPO_DIR/systemd/hermes-tasklane-reconcile.timer" "$SYSTEMD_USER_DIR/hermes-tasklane-reconcile.timer"
     sed -e "s|__CONFIG_PATH__|$CONFIG_PATH|g" -e "s|__EXECUTABLE__|$CLI_PATH|g" "$REPO_DIR/systemd/hermes-tasklane-watch.service" > "$SYSTEMD_USER_DIR/hermes-tasklane-watch.service"
     cp "$REPO_DIR/systemd/hermes-tasklane-watch.timer" "$SYSTEMD_USER_DIR/hermes-tasklane-watch.timer"
-    sed -e "s|__CONFIG_PATH__|$CONFIG_PATH|g" -e "s|__EXECUTABLE__|$CLI_PATH|g" "$REPO_DIR/systemd/hermes-tasklane-dashboard.service" > "$SYSTEMD_USER_DIR/hermes-tasklane-dashboard.service"
+    sed -e "s|__CONFIG_PATH__|$CONFIG_PATH|g" -e "s|__EXECUTABLE__|$CLI_PATH|g" -e "s|__DASHBOARD_HOST__|$DASHBOARD_HOST|g" -e "s|__DASHBOARD_PORT__|$DASHBOARD_PORT|g" "$REPO_DIR/systemd/hermes-tasklane-dashboard.service" > "$SYSTEMD_USER_DIR/hermes-tasklane-dashboard.service"
 
     systemctl --user daemon-reload
     systemctl --user enable --now hermes-tasklane-sync.timer
     systemctl --user enable --now hermes-tasklane-reconcile.timer
     systemctl --user enable --now hermes-tasklane-watch.timer
+    if [[ "$ENABLE_DASHBOARD" == "true" ]]; then
+      systemctl --user enable --now hermes-tasklane-dashboard.service
+    fi
   fi
 fi
 

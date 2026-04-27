@@ -4,7 +4,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=__EXECUTABLE__ --config __CONFIG_PATH__ dashboard --host 127.0.0.1 --port 8765
+ExecStart=__EXECUTABLE__ --config __CONFIG_PATH__ dashboard --host __DASHBOARD_HOST__ --port __DASHBOARD_PORT__
 Restart=on-failure
 RestartSec=5
 

@@ -23,6 +23,18 @@ The installer also copies bundled Hermes skills to:
 
 Pass `--no-skills` to skip that step.
 
+To also enable the read-only dashboard for a trusted internal network:
+
+```bash
+./scripts/install.sh --systemd --enable-dashboard --dashboard-host 0.0.0.0 --dashboard-port 8765
+```
+
+Then open:
+
+```text
+http://<server-lan-ip>:8765
+```
+
 ## Manual install
 
 ```bash
@@ -92,13 +104,19 @@ systemctl --user enable --now hermes-tasklane-watch.timer
 
 The watch timer runs `hermes-tasklane watch --mode observe --quiet-ok` every 15 minutes. It reports failed, blocked, stale, dead-gateway, and branch-policy problems in the systemd journal without mutating the queue.
 
-The installer also copies a disabled dashboard service:
+The installer also copies a dashboard service. Enable it during install with:
+
+```bash
+./scripts/install.sh --systemd --enable-dashboard
+```
+
+Or enable it later with:
 
 ```bash
 systemctl --user enable --now hermes-tasklane-dashboard.service
 ```
 
-The packaged service binds to `127.0.0.1:8765`. For a trusted internal network, edit the service and change the dashboard command to:
+The packaged service binds to `127.0.0.1:8765` by default. For a trusted internal network, pass `--dashboard-host 0.0.0.0` during install. Manual service files may also use:
 
 ```text
 hermes-tasklane --config /path/to/config.json dashboard --host 0.0.0.0 --port 8765
