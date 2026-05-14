@@ -29,9 +29,11 @@ Use these unless the user explicitly chooses otherwise:
 - `delivery_mode: pull-request`
 - `review_loops: 3`
 - `security_review: true`
+- `codex_review: true` for pull-request tasks that should pass the independent Codex review gate
 - `allow_unlisted_paths: false` when a practical allowlist is known
 
 Never choose `direct-push` unless the user explicitly says direct push is acceptable for that repo/branch.
+Never put raw shell commands such as `bootstrap_commands` or `verification_commands` in task files. Use configured `bootstrap_profile` and `verification_profile` names when the repo needs project-specific setup or verification.
 
 ## PR Grouping
 
@@ -47,6 +49,7 @@ For a many-task single-PR batch, prefer:
 
 1. Implementation tasks use the same `delivery_group` and `delivery_mode: direct-push`.
 2. The final integration/review task uses the same `delivery_group`, `branch_mode: existing-branch`, `delivery_mode: pull-request`, and `depends_on` all implementation task IDs.
+3. Set `codex_review: true` on the final pull-request task unless the user explicitly wants to skip the automated review gate.
 
 This avoids multiple jobs fighting to create or update the same PR.
 
@@ -126,6 +129,8 @@ chat_id: optional-chat-id
 thread_id: optional-topic-id
 allowed_paths: path/one, path/two
 allow_unlisted_paths: false
+bootstrap_profile: optional-configured-profile
+verification_profile: optional-configured-profile
 review_loops: 3
 security_review: true
 ---

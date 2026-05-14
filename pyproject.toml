@@ -20,6 +20,9 @@ classifiers = [
 [project.scripts]
 hermes-tasklane = "hermes_tasklane.cli:main"
 
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

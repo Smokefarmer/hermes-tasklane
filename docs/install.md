@@ -45,6 +45,24 @@ hermes-tasklane init
 hermes-tasklane doctor
 ```
 
+## First Operator Run
+
+After install, verify the local wiring and inspect the queue:
+
+```bash
+hermes-tasklane doctor
+hermes-tasklane status
+hermes-tasklane watch --mode observe --json
+```
+
+Before starting autonomous work on an existing install, always reconcile first:
+
+```bash
+hermes-tasklane reconcile
+```
+
+For a complete operator walkthrough, read `docs/onboarding.md`.
+
 ## Config file
 
 Default path:
@@ -65,10 +83,41 @@ Example:
   "default_platform": null,
   "default_chat_id": null,
   "default_thread_id": null,
+  "review_gate": {
+    "enabled": false
+  },
+  "wave_planner": {
+    "max_active_prs": 3,
+    "branch_prefix": "tasklane/",
+    "max_issues_per_wave": 10,
+    "issue_scan_limit": 50,
+    "issue_include_terms": [],
+    "issue_exclude_terms": [],
+    "issue_labels_any": [],
+    "issue_labels_all": [],
+    "issue_milestone": "",
+    "max_pr_lanes": 3,
+    "review_loops": 2,
+    "merge_gate": false,
+    "auto_merge": false,
+    "projects": {
+      "Project Name": {
+        "max_active_prs": 3,
+        "max_pr_lanes": 3,
+        "issue_include_terms": [],
+        "disable_contract_lane": false,
+        "review_docs": ["admin.md", "docs/"],
+        "merge_gate": true,
+        "auto_merge": false,
+        "extra_review_fix_loops": 1
+      }
+    }
+  },
   "watch": {
     "mode": "observe",
     "stale_running_minutes": 180,
     "max_retry_attempts": 3,
+    "allow_task_command_overrides": false,
     "expected_base_branches": {
       "Project Name": "develop"
     },

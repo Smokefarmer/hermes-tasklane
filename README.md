@@ -12,6 +12,46 @@ A polished, file-based task inbox for Hermes v10 JobStore runs.
 
 It is designed for teams that already run Hermes and want a simple, shareable “task lane” on top.
 
+## Operating Model
+
+Tasklane is an orchestration layer for Hermes coding work. It is built around a few durable files and commands:
+
+- `inbox/`: task files waiting to become Hermes jobs
+- `submitted/`: task files already handed to Hermes
+- `completed/`, `failed/`, `cancelled/`: reconciled task history
+- `~/.hermes/jobs/ready/`: JobStore records Hermes can claim
+- `hermes-tasklane reconcile`: moves completed job reality back into Tasklane state
+- `hermes-tasklane watch --mode guarded`: safe unattended health and recovery loop
+- `hermes-tasklane wave-runner`: issue-to-wave planner and queue manager
+
+The normal production loop is:
+
+```bash
+hermes-tasklane status
+hermes-tasklane watch --mode guarded --json
+hermes-tasklane reconcile
+hermes-tasklane wave-runner --repo /path/to/repo --project "Project Name" --base development --enqueue --notify --json
+```
+
+Use `status` to see queue state, `watch` to detect and safely recover queue problems, `reconcile` to clean up completed work, and `wave-runner` to queue the next issue wave only when project PR caps allow it.
+
+## Features At A Glance
+
+- Manual task files for one-off work.
+- Delivery groups for many implementation jobs that land in one final PR.
+- Codex review gates on final PR jobs.
+- Review-fix jobs that push to the existing PR branch.
+- Merge gates for projects that allow automated merge.
+- Issue wave planning from GitHub issues.
+- Active PR caps per project.
+- Contract/large-feature/docs lane risk caps.
+- Duplicate issue protection using active PRs and merged PR references.
+- Guarded watchdog recovery for stale worktrees and narrow transient failures.
+- Telegram/Hermes notifications for real blockers.
+- Read-only dashboard for queue inspection.
+
+For a teammate-facing walkthrough, start with [docs/onboarding.md](docs/onboarding.md).
+
 ## What this package includes
 
 1. File-based task source
@@ -166,6 +206,7 @@ Safe defaults:
 - delivery_mode: pull-request
 - review_loops: 3
 - security_review: true
+- codex_review: true for pull-request tasks that should pass the independent Codex review gate
 - allow_unlisted_paths: false when allowed_paths can be identified
 
 Never use direct-push unless I explicitly allow it, or unless you are creating implementation subtasks inside one delivery_group where one final task will open the PR.
@@ -193,6 +234,7 @@ For a batch that should become one PR:
   - high-risk file summary for auth, money, contracts, migrations, schemas, and public APIs
   - verification command results
   - residual risks or skipped issues
+- set `codex_review: true` on the final pull-request task so Tasklane creates a separate report-only review job. The reviewer must return `TASKLANE_REVIEW_DECISION: pass` or `TASKLANE_REVIEW_DECISION: needs-fix`; needs-fix queues one same-branch fix job and another review until `review_loops` is exhausted.
 
 For two big features:
 - use two different delivery_group values
@@ -201,6 +243,10 @@ For two big features:
 
 For audits:
 - use delivery_mode: report-only unless I explicitly ask for code changes
+
+Command safety:
+- do not put raw shell commands such as `verification_commands` or `bootstrap_commands` in task files
+- use configured `verification_profile` and `bootstrap_profile` names only
 
 After sync, answer in this format:
 
@@ -369,6 +415,7 @@ Configure branch policy and known expected blocked jobs in `~/.config/hermes-tas
         "npm run server:typecheck"
       ]
     },
+    "allow_task_command_overrides": false,
     "expected_base_branches": {
       "Alvin": "develop",
       "Treasure Hunter": "development"
@@ -451,6 +498,61 @@ http://<server-lan-ip>:8765
 ```
 
 Do not expose this dashboard directly to the public internet without an authenticating reverse proxy.
+
+
+## Wave Runner
+
+`wave-runner` is the high-level autonomous coding entrypoint. It inspects GitHub issues, active Tasklane PRs, current JobStore state, and project policy, then proposes or queues a small set of PR lanes.
+
+Dry-run a wave plan:
+
+```bash
+hermes-tasklane plan-wave --repo /mnt/data/workspace/Example --project "Example" --base development --json
+```
+
+Queue the next safe wave:
+
+```bash
+hermes-tasklane wave-runner --repo /mnt/data/workspace/Example --project "Example" --base development --enqueue --notify --json
+```
+
+The planner favors merge shape over raw issue count:
+
+- same domain/files -> same PR lane
+- likely conflicts -> serial `depends_on` chain
+- contract or IDL work -> isolated lane
+- frontend/docs/ops work -> group only when low conflict
+- active project PR cap reached -> review/fix/merge mode instead of new work
+- already-covered issue -> skipped when an active or merged PR references it
+
+Use project config under `wave_planner.projects.<Project Name>` to set:
+
+- `max_active_prs`
+- `max_pr_lanes`
+- `max_issues_per_wave`
+- `issue_include_terms`, `issue_exclude_terms`
+- `issue_labels_any`, `issue_labels_all`, `issue_milestone`
+- `max_active_contract_prs`
+- `max_active_large_feature_prs`
+- `max_active_docs_prs`
+- `disable_contract_lane`
+- `review_docs`
+- `verification_profile` and `bootstrap_profile`
+- `merge_gate` and `auto_merge`
+- `extra_review_fix_loops`
+
+## Review And Merge Gates
+
+Set `review_gate.enabled: true` globally or `codex_review: true` on final PR task files to create an independent review job after the PR job completes. A review gate returns one of:
+
+```text
+TASKLANE_REVIEW_DECISION: pass
+TASKLANE_REVIEW_DECISION: needs-fix
+```
+
+When review says `needs-fix`, Tasklane queues a fix job on the same PR branch and then another review, up to the configured loop budget. `extra_review_fix_loops` lets a project continue autonomously for actionable findings after the normal review-loop cap. Human attention should be reserved for product/design decisions, secrets, deploy approval, contract upgrade approval, or ambiguous acceptance criteria.
+
+Set `merge_gate: true` for a final merge check. Set `auto_merge: true` only for projects where passing gates should merge without human approval. The merge gate should close linked GitHub issues after merge; PR bodies should include `Closes #123` for every issue the PR completes.
 
 ## Recommended automation
 
@@ -543,6 +645,27 @@ Reconcile submitted tasks from JobStore/governed run state and attempt PR/CI nor
 
 ### `hermes-tasklane status`
 Show inbox/submitted/completed counts and current JobStore/governed run states.
+
+### `hermes-tasklane plan-wave`
+Dry-run the next GitHub Issues wave without creating task files or queueing jobs. It reports open `tasklane/` PRs, the active PR cap, issue scope, issue candidates, proposed PR lanes, serial dependencies for likely conflicts, and blocker notification payloads.
+
+Use issue scope filters to avoid planning against the wrong backlog slice:
+
+```bash
+hermes-tasklane plan-wave --repo /path/to/repo --project "Treasure Hunter" --base development \
+  --issue-include "[S3-" --issue-include "Season 3" --issue-scan-limit 50
+```
+
+When the dry-run output is acceptable, `--enqueue` creates guarded task files for the proposed lanes and immediately syncs them into Hermes JobStore. Enqueue mode refuses to run when the inbox already contains task files and caps new lanes to the remaining active PR slots.
+
+### `hermes-tasklane wave-runner`
+Run one guarded rolling wave cycle for a project. It reconciles finished jobs, applies guarded watchdog recovery, plans the next wave using project-specific settings, and optionally enqueues enough lanes to fill the remaining PR slots.
+
+```bash
+hermes-tasklane wave-runner --repo /path/to/repo --project "PeerPay" --base development --enqueue --notify
+```
+
+Use a timer/cron to make it rolling. Merge-gate jobs are only queued after the Codex review gate passes, and Telegram notifications are intended for blockers or human decisions.
 
 ### `hermes-tasklane watch`
 Review queue health for unattended operation. Defaults to observe-only. Use `--expected-base Project=branch` for one-off branch policy checks, `--ignore-blocked JOB_ID` for known obsolete jobs, `--json` for machine-readable output, and `--mode guarded` for narrowly safe transient retries and configured auto-salvage.

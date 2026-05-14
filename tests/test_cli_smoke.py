@@ -17,6 +17,19 @@ def write_job_record(hermes_home: Path, state: str, job_id: str, payload: dict) 
     return path
 
 
+def complete_ready_job(hermes_home: Path, job_id: str, result: dict) -> None:
+    ready_path = hermes_home / "jobs" / "ready" / f"{job_id}.json"
+    payload = json.loads(ready_path.read_text(encoding="utf-8"))
+    ready_path.unlink()
+    payload["state"] = "completed"
+    payload["updated_at"] = "2026-05-08T00:00:00+00:00"
+    payload["completed_at"] = "2026-05-08T00:00:00+00:00"
+    payload["result"] = result
+    completed_path = hermes_home / "jobs" / "completed" / f"{job_id}.json"
+    completed_path.parent.mkdir(parents=True, exist_ok=True)
+    completed_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def write_config(path: Path, *, hermes_home: Path, task_root: Path) -> None:
     path.write_text(
         json.dumps(
@@ -63,6 +76,36 @@ def failed_provider_job(repo: Path, *, allowed_paths: list[str] | None = None) -
             },
         },
     }
+
+
+def wave_issue(number: int, title: str, body: str = "", labels: list[str] | None = None, milestone: str | None = None) -> dict:
+    return {
+        "number": number,
+        "url": f"https://github.com/example/demo/issues/{number}",
+        "title": title,
+        "body": body,
+        "labels": labels or [],
+        "milestone": milestone,
+    }
+
+
+def wave_pr(number: int, branch: str, title: str = "Tasklane PR", body: str = "") -> dict:
+    return {
+        "number": number,
+        "url": f"https://github.com/example/demo/pull/{number}",
+        "title": title,
+        "body": body,
+        "state": "open",
+        "head_branch": branch,
+        "base_branch": "development",
+        "draft": False,
+    }
+
+
+def stub_wave_github(monkeypatch, *, issues: list[dict], prs: list[dict] | None = None) -> None:
+    monkeypatch.setattr(cli, "git_remote_for_repo", lambda repo_path: ("example", "demo"))
+    monkeypatch.setattr(cli, "github_open_pull_requests", lambda owner, repo: prs or [])
+    monkeypatch.setattr(cli, "github_open_issues", lambda owner, repo, limit: issues[:limit])
 
 
 def test_init_writes_example_outside_inbox(tmp_path: Path) -> None:
@@ -112,6 +155,749 @@ def test_sync_moves_inbox_task_to_submitted_and_writes_jobstore_record(tmp_path:
     assert len(state["submitted"]) == 1
     entry = next(iter(state["submitted"].values()))
     assert entry["job_id"] == payload["id"]
+
+
+def test_plan_wave_blocks_new_work_at_active_pr_cap(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(
+        monkeypatch,
+        issues=[wave_issue(1, "Client UI polish", "`apps/client/src/App.tsx`")],
+        prs=[wave_pr(10, "tasklane/a"), wave_pr(11, "tasklane/b"), wave_pr(12, "tasklane/c"), wave_pr(13, "feature/manual")],
+    )
+
+    report = cli.plan_wave_report(cfg, repo_path=repo, project="Demo", base_branch="development")
+
+    assert report["mode"] == "review-fix-unblock"
+    assert report["may_start_new_work"] is False
+    assert len(report["active_tasklane_prs"]) == 3
+    assert report["proposed_lanes"] == []
+    assert report["notification_payloads"][0]["reason"] == "max_active_prs=3 reached"
+    assert report["notification_payloads"][0]["safe_secret_names_only"] is True
+
+
+def test_plan_wave_ignores_non_tasklane_prs_for_cap(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(
+        monkeypatch,
+        issues=[wave_issue(1, "Client UI polish", "`apps/client/src/App.tsx`")],
+        prs=[wave_pr(10, "feature/manual"), wave_pr(11, "codex/manual")],
+    )
+
+    report = cli.plan_wave_report(cfg, repo_path=repo, project="Demo", base_branch="development")
+
+    assert report["may_start_new_work"] is True
+    assert report["active_tasklane_prs"] == []
+    assert report["proposed_lanes"][0]["lane_id"] == "ux"
+
+
+def test_plan_wave_limits_new_lanes_to_remaining_pr_slots(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(
+        monkeypatch,
+        issues=[
+            wave_issue(1, "Contract PDA claim", "`contracts/fogo/programs/treasure-hunter-programm/src/lib.rs`"),
+            wave_issue(2, "Client UI polish", "`apps/client/src/App.tsx`"),
+        ],
+        prs=[wave_pr(10, "tasklane/a"), wave_pr(11, "tasklane/b")],
+    )
+
+    report = cli.plan_wave_report(cfg, repo_path=repo, project="Demo", base_branch="development")
+
+    assert report["remaining_pr_slots"] == 1
+    assert len(report["proposed_lanes"]) == 1
+    assert report["proposed_lanes"][0]["lane_id"] == "contract"
+    assert any(item["reason"] == "lane-cap" and item["issue"]["number"] == 2 for item in report["blocked_items"])
+
+
+def test_plan_wave_serializes_conflicting_file_ownership(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(
+        monkeypatch,
+        issues=[
+            wave_issue(1, "Island panel UI", "`apps/client/src/components/game-ui/GameUI.tsx`"),
+            wave_issue(2, "Relic gate UI", "`apps/client/src/components/game-ui/GameUI.tsx`"),
+        ],
+    )
+
+    report = cli.plan_wave_report(cfg, repo_path=repo, project="Demo", base_branch="development")
+
+    lane = report["proposed_lanes"][0]
+    assert lane["lane_id"] == "ux"
+    assert lane["implementation_tasks"][0]["depends_on"] == []
+    assert lane["implementation_tasks"][1]["depends_on"] == ["issue-1"]
+    assert lane["final_pr_task"]["depends_on"] == ["issue-1", "issue-2"]
+    assert lane["final_pr_task"]["review_loops"] == 2
+
+
+def test_plan_wave_isolates_contract_tasks(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(
+        monkeypatch,
+        issues=[
+            wave_issue(1, "Contract PDA claim", "`contracts/fogo/programs/treasure-hunter-programm/src/lib.rs`"),
+            wave_issue(2, "IDL account update", "Regenerate IDL and client types"),
+            wave_issue(3, "Rollout checklist", "`docs/season-3/rollout.md`"),
+        ],
+    )
+
+    report = cli.plan_wave_report(cfg, repo_path=repo, project="Demo", base_branch="development")
+
+    lanes = {lane["lane_id"]: lane for lane in report["proposed_lanes"]}
+    assert set(lanes) == {"contract", "ops-readiness"}
+    assert [issue["number"] for issue in lanes["contract"]["issues"]] == [1]
+    assert any(item["reason"] == "contract-pr-cap" and item["issue"]["number"] == 2 for item in report["blocked_items"])
+
+
+def test_plan_wave_command_is_dry_run_non_mutating(tmp_path: Path, monkeypatch, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(
+        monkeypatch,
+        issues=[wave_issue(1, "Telemetry events", "`apps/server/src/game/game.gateway.ts` telemetry")],
+    )
+
+    before_inbox = sorted(path.name for path in (task_root / "inbox").glob("*"))
+    before_jobs = sorted(path.name for path in (hermes_home / "jobs" / "ready").glob("*.json"))
+    cli.command_plan_wave(
+        cfg,
+        repo_path=repo,
+        project="Demo",
+        base_branch="development",
+        max_active_prs=None,
+        branch_prefix=None,
+        issue_limit=None,
+        issue_scan_limit=None,
+        max_lanes=None,
+        issue_includes=None,
+        issue_excludes=None,
+        issue_labels_any=None,
+        issue_labels_all=None,
+        issue_milestone=None,
+        enqueue=False,
+        json_output=True,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["dry_run"] is True
+    assert sorted(path.name for path in (task_root / "inbox").glob("*")) == before_inbox
+    assert sorted(path.name for path in (hermes_home / "jobs" / "ready").glob("*.json")) == before_jobs
+
+
+def test_plan_wave_filters_issue_scope_after_wider_scan(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.wave_planner.update(
+        {
+            "max_issues_per_wave": 2,
+            "issue_scan_limit": 20,
+            "issue_include_terms": ["[S3-"],
+        }
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    old_issues = [wave_issue(number, f"Marketplace backlog {number}", "`apps/client/src/marketplace/Page.tsx`") for number in range(1, 12)]
+    stub_wave_github(
+        monkeypatch,
+        issues=[
+            *old_issues,
+            wave_issue(376, "[S3-T024] Tool-Gated Wood And Stone Nodes", "`contracts/fogo/programs/treasure-hunter-programm/src/lib.rs`"),
+            wave_issue(377, "[S3-T025] Tool Repair Kit", "`apps/client/src/components/panels/CraftsmanPanel.tsx`"),
+            wave_issue(378, "[S3-T026] Later Season 3 Issue", "`apps/client/src/App.tsx`"),
+        ],
+    )
+
+    report = cli.plan_wave_report(cfg, repo_path=repo, project="Demo", base_branch="development")
+
+    assert report["issue_scope"]["scanned_count"] == 14
+    assert report["issue_scope"]["matched_count"] == 3
+    assert report["issue_scope"]["selected_count"] == 2
+    assert [candidate["number"] for candidate in report["issue_candidates"]] == [376, 377]
+    assert all(item["reason"] == "missing-include-term" for item in report["scoped_out_items"])
+    assert [item["number"] for item in report["deferred_items"]] == [378]
+
+
+def test_plan_wave_filters_by_label_and_milestone(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.wave_planner.update(
+        {
+            "issue_labels_any": ["season-3"],
+            "issue_milestone": "Season 3",
+        }
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(
+        monkeypatch,
+        issues=[
+            wave_issue(1, "Season 2 client cleanup", "`apps/client/src/App.tsx`", labels=["season-2"], milestone="Season 2"),
+            wave_issue(2, "Season 3 client cleanup", "`apps/client/src/App.tsx`", labels=["season-3"], milestone="Season 3"),
+            wave_issue(3, "Season 3 wrong milestone", "`apps/client/src/App.tsx`", labels=["season-3"], milestone="Backlog"),
+        ],
+    )
+
+    report = cli.plan_wave_report(cfg, repo_path=repo, project="Demo", base_branch="development")
+
+    assert [candidate["number"] for candidate in report["issue_candidates"]] == [2]
+    assert {item["number"]: item["reason"] for item in report["scoped_out_items"]} == {
+        1: "missing-any-label",
+        3: "milestone-mismatch",
+    }
+
+
+def test_plan_wave_skips_issues_already_referenced_by_active_tasklane_pr(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.wave_planner.update({"issue_include_terms": ["[S3-"]})
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(
+        monkeypatch,
+        issues=[
+            wave_issue(381, "[S3-T033] Island UI Shell", "`apps/client/src/components/game-ui/GameUI.tsx`"),
+            wave_issue(410, "[S3-T080] Telemetry Events", "`apps/server/src/game/game.gateway.ts` telemetry"),
+        ],
+        prs=[wave_pr(433, "tasklane/th-s3-ux-gates", "S3 UX Gates Final PR (#381, #400, #403)")],
+    )
+
+    report = cli.plan_wave_report(cfg, repo_path=repo, project="Demo", base_branch="development")
+
+    assert [candidate["number"] for candidate in report["issue_candidates"]] == [410]
+    assert report["issue_scope"]["already_covered_count"] == 1
+    assert report["already_covered_items"] == [
+        {
+            "number": 381,
+            "url": "https://github.com/example/demo/issues/381",
+            "title": "[S3-T033] Island UI Shell",
+            "reason": "active-tasklane-pr",
+        }
+    ]
+
+
+def test_plan_wave_enqueue_creates_and_syncs_guarded_tasks(tmp_path: Path, monkeypatch, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(
+        monkeypatch,
+        issues=[wave_issue(376, "[S3-T024] Tool-Gated Wood And Stone Nodes", "`contracts/fogo/programs/treasure-hunter-programm/src/lib.rs`")],
+    )
+
+    cli.command_plan_wave(
+        cfg,
+        repo_path=repo,
+        project="Demo",
+        base_branch="development",
+        max_active_prs=None,
+        branch_prefix=None,
+        issue_limit=None,
+        issue_scan_limit=None,
+        max_lanes=None,
+        issue_includes=["[S3-"],
+        issue_excludes=None,
+        issue_labels_any=None,
+        issue_labels_all=None,
+        issue_milestone=None,
+        enqueue=True,
+        json_output=True,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["enqueue_result"]["status"] == "enqueued"
+    assert len(output["enqueue_result"]["created_task_files"]) == 2
+    assert sorted(path.name for path in (task_root / "inbox").glob("*.md")) == []
+    submitted_files = sorted(path.name for path in (task_root / "submitted").glob("*.md"))
+    assert len([name for name in submitted_files if "issue-376" in name or "final-pr" in name]) == 2
+    ready_jobs = [json.loads(path.read_text(encoding="utf-8")) for path in (hermes_home / "jobs" / "ready").glob("*.json")]
+    assert len(ready_jobs) == 3
+    assert any(job["spec"]["delivery_mode"] == "direct-push" for job in ready_jobs)
+    final_jobs = [job for job in ready_jobs if job["spec"]["delivery_mode"] == "pull-request"]
+    assert len(final_jobs) == 1
+    assert final_jobs[0]["spec"]["pipeline"]["codex_review"] is True
+
+
+def test_plan_wave_uses_project_specific_settings_and_review_docs(tmp_path: Path, monkeypatch, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    cfg.wave_planner["projects"] = {
+        "PeerPay": {
+            "max_active_prs": 2,
+            "issue_include_terms": ["[PP-"],
+            "review_docs": ["admin.md", "docs/"],
+            "merge_gate": True,
+            "auto_merge": True,
+            "verification_profile": "PeerPay",
+        }
+    }
+    cfg.watch["verification_profiles"] = {"PeerPay": ["npm run typecheck", "npm run test"]}
+    capsys.readouterr()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(
+        monkeypatch,
+        issues=[
+            wave_issue(1, "[S3-OLD] Wrong project", "`src/old.ts`"),
+            wave_issue(2, "[PP-001] PeerPay task", "`src/payments.ts`"),
+        ],
+    )
+
+    cli.command_plan_wave(
+        cfg,
+        repo_path=repo,
+        project="PeerPay",
+        base_branch="development",
+        max_active_prs=None,
+        branch_prefix=None,
+        issue_limit=None,
+        issue_scan_limit=None,
+        max_lanes=None,
+        issue_includes=None,
+        issue_excludes=None,
+        issue_labels_any=None,
+        issue_labels_all=None,
+        issue_milestone=None,
+        enqueue=True,
+        json_output=True,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["settings"]["max_active_prs"] == 2
+    assert output["issue_candidates"][0]["number"] == 2
+    ready_jobs = [json.loads(path.read_text(encoding="utf-8")) for path in (hermes_home / "jobs" / "ready").glob("*.json")]
+    final_job = next(job for job in ready_jobs if job["spec"]["delivery_mode"] == "pull-request")
+    assert final_job["spec"]["metadata"]["merge_gate"] == "true"
+    assert final_job["spec"]["metadata"]["auto_merge"] == "true"
+    assert final_job["spec"]["metadata"]["review_docs"] == "admin.md, docs/"
+    assert final_job["spec"]["metadata"]["required_verification_commands"] == "npm run typecheck, npm run test"
+    assert "admin.md" in final_job["spec"]["request"]["body"]
+    assert "`npm run typecheck`" in final_job["spec"]["request"]["body"]
+    assert "`npm run test`" in final_job["spec"]["request"]["body"]
+    assert "Open or update one PR for this lane" in final_job["spec"]["request"]["body"]
+    assert "Mark the PR ready for review" in final_job["spec"]["request"]["body"]
+    assert "Open or update one draft PR" not in final_job["spec"]["request"]["body"]
+
+
+def test_plan_wave_can_disable_contract_lane_for_non_contract_projects(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.wave_planner["projects"] = {
+        "PeerPay": {
+            "disable_contract_lane": True,
+            "max_issues_per_wave": 2,
+        }
+    }
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(
+        monkeypatch,
+        issues=[
+            wave_issue(1, "Database schema and payment contract rules", "`src/lib/db/schema.ts` `src/features/payments/model.ts`"),
+            wave_issue(2, "Wallet UI", "`src/components/Wallet.tsx`"),
+        ],
+    )
+
+    report = cli.plan_wave_report(cfg, repo_path=repo, project="PeerPay", base_branch="development")
+
+    lanes = {lane["lane_id"]: lane for lane in report["proposed_lanes"]}
+    assert "contract" not in lanes
+    assert any(issue["number"] == 1 for issue in lanes["backend"]["issues"])
+
+
+def test_reconcile_queues_merge_gate_after_review_pass(tmp_path: Path, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root_uid = "wave-demo-final-pr"
+    root_job_id = "tasklane_root"
+    review_job_id = cli.review_job_id(root_uid, 1)
+    cli.save_state(
+        cfg,
+        {
+            "submitted": {
+                root_uid: {
+                    "job_id": root_job_id,
+                    "run_id": root_job_id,
+                    "repo_key": f"repo://{repo}",
+                    "review_gate": {"enabled": True, "status": "pending", "max_loops": 2},
+                },
+                f"{root_uid}:codex-review:1": {
+                    "synthetic": True,
+                    "kind": "codex-review",
+                    "root_uid": root_uid,
+                    "job_id": review_job_id,
+                    "run_id": review_job_id,
+                    "repo_key": f"repo://{repo}",
+                    "review_iteration": 1,
+                },
+            }
+        },
+    )
+    write_job_record(
+        hermes_home,
+        "completed",
+        root_job_id,
+        {
+            "spec": {
+                "project": "PeerPay",
+                "repo": {"key": f"repo://{repo}", "path": str(repo)},
+                "request": {"title": "PeerPay Final PR", "body": "Finalize PR"},
+                "branch": {"base_branch": "development", "work_branch": "tasklane/peerpay-demo"},
+                "delivery_mode": "pull-request",
+                "pipeline": {"budgets": {"review_loops": 2}},
+                "scope": {"allowed_paths": [], "denied_paths": [], "allow_unlisted_paths": True},
+                "metadata": {"uid": root_uid, "merge_gate": "true", "auto_merge": "true", "review_docs": "admin.md, docs/", "required_verification_commands": "npm run typecheck, npm run test"},
+            },
+            "result": {"final_response": "PR opened"},
+        },
+    )
+    write_job_record(
+        hermes_home,
+        "completed",
+        review_job_id,
+        {
+            "spec": {"metadata": {"uid": f"{root_uid}:codex-review:1"}},
+            "result": {"final_response": "TASKLANE_REVIEW_DECISION: pass\nLooks good."},
+        },
+    )
+
+    command_reconcile(cfg)
+
+    output = json.loads(capsys.readouterr().out)
+    assert any(action["status"] == "merge-gate-queued" for action in output["actions"])
+    merge_id = cli.merge_job_id(root_uid)
+    merge_job = json.loads((hermes_home / "jobs" / "ready" / f"{merge_id}.json").read_text(encoding="utf-8"))
+    assert merge_job["spec"]["pipeline"]["role"] == "tasklane-merge-gate"
+    assert "TASKLANE_MERGE_DECISION: merged" in merge_job["spec"]["request"]["body"]
+    assert "authoritative Tasklane evidence" in merge_job["spec"]["request"]["body"]
+    assert "mark it ready for review before merging" in merge_job["spec"]["request"]["body"]
+    assert "`npm run typecheck`" in merge_job["spec"]["request"]["body"]
+    state = load_state(cfg)
+    assert state["submitted"][root_uid]["merge_gate"]["status"] == "queued"
+    assert state["submitted"][f"{root_uid}:merge-gate"]["kind"] == "tasklane-merge-gate"
+
+
+def test_status_and_watch_surface_submitted_gate_attention(tmp_path: Path, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.watch["require_notifications"] = True
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+    submitted_task = task_root / "submitted" / "final.md"
+    submitted_task.parent.mkdir(parents=True, exist_ok=True)
+    submitted_task.write_text("final task\n", encoding="utf-8")
+    cli.save_state(
+        cfg,
+        {
+            "submitted": {
+                "wave-demo-final": {
+                    "source_path": str(submitted_task),
+                    "job_id": "tasklane_root",
+                    "repo_key": "repo:///tmp/demo",
+                    "review_gate": {
+                        "enabled": True,
+                        "status": "needs-human",
+                        "reason": "max-review-loops-reached",
+                        "decision_job_id": "tasklane_review",
+                        "current_iteration": 2,
+                        "max_loops": 2,
+                    },
+                }
+            }
+        },
+    )
+
+    cli.command_status(cfg)
+
+    status = json.loads(capsys.readouterr().out)
+    assert status["gate_attention"][0]["task_uid"] == "wave-demo-final"
+    assert status["gate_attention"][0]["reason"] == "max-review-loops-reached"
+    report = cli.build_watch_report(cfg, check_gateway=False)
+    assert report["gate_attention"][0]["job_id"] == "tasklane_review"
+    assert any(problem["code"] == "review-gate-needs-human" for problem in report["problems"])
+    assert any(problem["code"] == "notification-misconfigured" for problem in report["problems"])
+    assert report["notification_config"]["configured"] is False
+    assert report["notification_config"]["provider"] == "hermes"
+    assert "What you need to do:" in cli.format_watch_report(report)
+    assert "Do not merge yet" in cli.format_watch_report(report)
+    assert "Hermes/project-chat delivery is not fully configured" in cli.format_watch_report(report)
+
+
+def test_tasklane_notification_uses_hermes_relay_first(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    agent_path = hermes_home / "hermes-agent"
+    python_path = agent_path / "venv" / "bin" / "python"
+    (agent_path / "tools").mkdir(parents=True)
+    python_path.parent.mkdir(parents=True)
+    (agent_path / "tools" / "send_message_tool.py").write_text("# marker\n", encoding="utf-8")
+    python_path.write_text("# marker\n", encoding="utf-8")
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.watch["hermes_target"] = "telegram:Treasure Hunter Dev"
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        assert kwargs["input"] == "hello"
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps({"success": True, "message_id": "1"}), stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    result = cli.send_tasklane_notification(cfg, "hello")
+
+    assert result["status"] == "sent"
+    assert result["provider"] == "hermes"
+    assert result["target"] == "telegram:Treasure Hunter Dev"
+    assert calls[0][0] == str(python_path)
+
+
+def test_tasklane_notification_dedupes_same_fingerprint_during_cooldown(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.watch["notification_cooldown_minutes"] = 240
+    command_init(cfg, str(config_path))
+    sent: list[str] = []
+
+    def fake_send(_cfg, text):
+        sent.append(text)
+        return {"status": "sent", "provider": "test"}
+
+    monkeypatch.setattr(cli, "send_tasklane_notification", fake_send)
+    payload = {"problems": [{"code": "review-gate-needs-human", "job_id": "tasklane_review"}]}
+
+    first = cli.maybe_send_tasklane_notification(cfg, channel="watch", text="hello", payload=payload)
+    second = cli.maybe_send_tasklane_notification(cfg, channel="watch", text="hello", payload=payload)
+
+    assert first["status"] == "sent"
+    assert second["status"] == "skipped"
+    assert second["reason"] == "duplicate-notification-cooldown"
+    assert sent == ["hello"]
+
+
+def test_tasklane_notification_sends_when_fingerprint_changes(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.watch["notification_cooldown_minutes"] = 240
+    command_init(cfg, str(config_path))
+    sent: list[str] = []
+    monkeypatch.setattr(cli, "send_tasklane_notification", lambda _cfg, text: sent.append(text) or {"status": "sent", "provider": "test"})
+
+    cli.maybe_send_tasklane_notification(cfg, channel="watch", text="first", payload={"jobs": ["a"]})
+    second = cli.maybe_send_tasklane_notification(cfg, channel="watch", text="second", payload={"jobs": ["a", "b"]})
+
+    assert second["status"] == "sent"
+    assert sent == ["first", "second"]
+
+
+def test_reconcile_finalizes_manual_merged_tasklane_pr(tmp_path: Path, monkeypatch, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    submitted_task = task_root / "submitted" / "final.md"
+    submitted_task.parent.mkdir(parents=True, exist_ok=True)
+    submitted_task.write_text("final task\n", encoding="utf-8")
+    cli.save_state(
+        cfg,
+        {
+            "submitted": {
+                "wave-demo-final": {
+                    "source_path": str(submitted_task),
+                    "job_id": "tasklane_root",
+                    "run_id": "tasklane_root",
+                    "repo_key": f"repo://{repo}",
+                    "review_gate": {"enabled": True, "status": "passed", "decision_job_id": "tasklane_review"},
+                    "merge_gate": {"enabled": True, "status": "needs-human", "merge_job_id": "tasklane_merge", "reason": "needs-human"},
+                }
+            }
+        },
+    )
+    write_job_record(
+        hermes_home,
+        "completed",
+        "tasklane_root",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": f"repo://{repo}", "path": str(repo)},
+                "request": {"title": "Demo Final PR"},
+                "branch": {"base_branch": "development", "work_branch": "tasklane/demo"},
+                "delivery_mode": "pull-request",
+            },
+            "result": {
+                "delivery_validation": {
+                    "pr": {"number": 42, "url": "https://github.com/example/demo/pull/42"},
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "github_pull_request",
+        lambda owner, repo_name, number: {
+            "number": number,
+            "state": "closed",
+            "merged_at": "2026-05-09T08:00:00Z",
+            "html_url": f"https://github.com/{owner}/{repo_name}/pull/{number}",
+            "draft": False,
+        },
+    )
+
+    command_reconcile(cfg)
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["actions"][0]["status"] == "completed-manual-merge-detected"
+    assert not load_state(cfg)["submitted"]
+    assert (task_root / "completed" / "final.md").exists()
+    result = json.loads((task_root / "completed" / "final.md.result.json").read_text(encoding="utf-8"))
+    assert result["result"]["merge_gate"]["status"] == "merged"
+    assert result["result"]["merge_gate"]["reason"] == "manual-merge-detected"
+
+
+def test_wave_runner_enqueues_when_project_has_free_slots(tmp_path: Path, monkeypatch, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    cfg.wave_planner["projects"] = {"PeerPay": {"issue_include_terms": ["[PP-"], "review_docs": ["admin.md", "docs/"]}}
+    capsys.readouterr()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(monkeypatch, issues=[wave_issue(2, "[PP-001] PeerPay task", "`src/payments.ts`")])
+    monkeypatch.setattr(
+        cli,
+        "build_watch_report",
+        lambda *args, **kwargs: {"health": "ok", "problems": [], "counts": {}, "gateway": {"state": "ok"}, "running": [], "ready": [], "waiting": [], "blocked": [], "needs_human": [], "failed": [], "notices": []},
+    )
+    monkeypatch.setattr(cli, "apply_guarded_watch_actions", lambda cfg, report: [])
+
+    rc = cli.command_wave_runner(
+        cfg,
+        repo_path=repo,
+        project="PeerPay",
+        base_branch="development",
+        enqueue=True,
+        notify=False,
+        json_output=True,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert output["enqueue_result"]["status"] == "enqueued"
+    assert output["plan"]["project"] == "PeerPay"
+    assert len(list((hermes_home / "jobs" / "ready").glob("*.json"))) == 3
+
+
+def test_sync_prunes_loaded_task_repos_once(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for name in ["one.md", "two.md"]:
+        (task_root / "inbox" / name).write_text(
+            f"---\nrepo_path: {repo}\nbranch_base: main\nproject: Demo\n---\nImplement {name}.\n",
+            encoding="utf-8",
+        )
+
+    calls: list[Path] = []
+
+    def fake_prune(repo_path: Path) -> dict:
+        calls.append(repo_path)
+        return {"ok": True, "reason": "pruned", "repo_path": str(repo_path)}
+
+    monkeypatch.setattr(cli, "git_worktree_prune", fake_prune)
+
+    command_sync(cfg)
+
+    assert calls == [repo]
 
 
 def test_sync_supports_scope_and_mode_frontmatter(tmp_path: Path) -> None:
@@ -199,6 +985,36 @@ def test_sync_preflight_blocks_same_branch_multiple_roots(tmp_path: Path, capsys
     assert not list((hermes_home / "jobs" / "ready").glob("*.json"))
 
 
+def test_sync_respects_max_pending_per_repo_for_same_batch(tmp_path: Path, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (task_root / "inbox" / "one.md").write_text(
+        f"---\nid: one\nrepo_path: {repo}\nbase_branch: main\n---\nBuild one.\n",
+        encoding="utf-8",
+    )
+    (task_root / "inbox" / "two.md").write_text(
+        f"---\nid: two\nrepo_path: {repo}\nbase_branch: main\n---\nBuild two.\n",
+        encoding="utf-8",
+    )
+
+    command_sync(cfg)
+
+    output = json.loads(capsys.readouterr().out)
+    assert [action["status"] for action in output["actions"]] == ["job-ready", "deferred"]
+    assert output["actions"][1]["reason"] == "repo-pending-limit"
+    assert len(list((hermes_home / "jobs" / "ready").glob("*.json"))) == 1
+    assert (task_root / "submitted" / "one.md").exists()
+    assert (task_root / "inbox" / "two.md").exists()
+
+
 def test_sync_applies_default_telegram_source_from_config(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"
@@ -236,6 +1052,27 @@ def test_sync_applies_default_telegram_source_from_config(tmp_path: Path) -> Non
     assert payload["spec"]["source"]["thread_id"] == "42"
 
 
+def test_task_metadata_cannot_override_verification_commands_by_default(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    cfg.watch["verification_commands"] = ["git diff --check"]
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    job = {
+        "spec": {
+            "project": "Demo",
+            "repo": {"key": f"repo://{repo}", "path": str(repo)},
+            "metadata": {"verification_commands": "touch SHOULD_NOT_RUN"},
+        }
+    }
+
+    assert cli.configured_commands_for_job(cfg, job, "verification") == ["git diff --check"]
+
+
 def test_sync_resolves_dependencies_and_delivery_group_branch(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"
@@ -265,6 +1102,296 @@ def test_sync_resolves_dependencies_and_delivery_group_branch(tmp_path: Path) ->
     assert second["spec"]["branch"]["work_branch"] == "tasklane/checkout-v2"
     assert second["spec"]["dependencies"] == [first["id"]]
     assert second["spec"]["metadata"]["delivery_group"] == "checkout-v2"
+
+
+def test_sync_creates_codex_review_gate_job_when_enabled(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "hermes_home": str(hermes_home),
+                "task_root": str(task_root),
+                "poll_repo_idle": True,
+                "review_gate": {"enabled": True},
+            }
+        )
+    )
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (task_root / "inbox" / "feature.md").write_text(
+        f"---\nid: feature-review\nrepo_path: {repo}\nbase_branch: development\nwork_branch: tasklane/feature-review\nreview_loops: 2\n---\nBuild the feature with tests.\n",
+        encoding="utf-8",
+    )
+
+    command_sync(cfg)
+
+    records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((hermes_home / "jobs" / "ready").glob("*.json"))]
+    impl = next(item for item in records if item["spec"]["metadata"]["source"] == "tasklane-file-bridge")
+    review = next(item for item in records if item["spec"]["metadata"]["source"] == "tasklane-review-gate")
+    assert review["spec"]["delivery_mode"] == "report-only"
+    assert review["spec"]["branch"]["mode"] == "existing-branch"
+    assert review["spec"]["branch"]["work_branch"] == "tasklane/feature-review"
+    assert review["spec"]["dependencies"] == [impl["id"]]
+    assert "TASKLANE_REVIEW_DECISION: pass" in review["spec"]["request"]["body"]
+    state = load_state(cfg)
+    assert state["submitted"]["feature-review"]["review_gate"]["review_job_id"] == review["id"]
+    assert state["submitted"]["feature-review:codex-review:1"]["kind"] == "codex-review"
+
+
+def test_sync_review_gate_does_not_defer_same_batch_tasks(tmp_path: Path, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "hermes_home": str(hermes_home),
+                "task_root": str(task_root),
+                "poll_repo_idle": True,
+                "max_pending_per_repo": 2,
+                "review_gate": {"enabled": True},
+            }
+        )
+    )
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (task_root / "inbox" / "a-final.md").write_text(
+        f"---\nid: group-final\nrepo_path: {repo}\nbase_branch: development\nbranch_mode: existing-branch\nwork_branch: tasklane/group\ndelivery_group: group\ndelivery_mode: pull-request\ndepends_on: group-impl\n---\nOpen the grouped PR.\n",
+        encoding="utf-8",
+    )
+    (task_root / "inbox" / "b-impl.md").write_text(
+        f"---\nid: group-impl\nrepo_path: {repo}\nbase_branch: development\ndelivery_group: group\ndelivery_mode: direct-push\n---\nImplement the grouped work.\n",
+        encoding="utf-8",
+    )
+
+    command_sync(cfg)
+
+    output = json.loads(capsys.readouterr().out)
+    assert [action["status"] for action in output["actions"]] == ["job-ready", "job-ready"]
+    assert all(action.get("reason") != "repo-active-job" for action in output["actions"])
+    ready = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((hermes_home / "jobs" / "ready").glob("*.json"))]
+    assert len(ready) == 3
+    assert sum(1 for item in ready if item["spec"]["metadata"]["source"] == "tasklane-review-gate") == 1
+
+
+def test_sync_allows_waiting_task_while_repo_has_active_job(tmp_path: Path, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    write_job_record(
+        hermes_home,
+        "running",
+        "tasklane_active",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": f"repo://{repo}", "path": str(repo)},
+                "request": {"title": "active"},
+                "branch": {"mode": "new-branch", "base_branch": "development"},
+                "dependencies": [],
+            }
+        },
+    )
+    (task_root / "inbox" / "waiting.md").write_text(
+        f"---\nid: waiting-task\nrepo_path: {repo}\nbase_branch: development\ndepends_on: tasklane_missing_dependency\n---\nQueue me as waiting.\n",
+        encoding="utf-8",
+    )
+
+    command_sync(cfg)
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["actions"][0]["status"] == "job-ready"
+    ready = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((hermes_home / "jobs" / "ready").glob("*.json"))]
+    assert ready[0]["spec"]["dependencies"] == ["tasklane_missing_dependency"]
+
+
+def test_reconcile_review_gate_needs_fix_queues_fix_and_next_review(tmp_path: Path, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "hermes_home": str(hermes_home),
+                "task_root": str(task_root),
+                "poll_repo_idle": True,
+                "review_gate": {"enabled": True},
+            }
+        )
+    )
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (task_root / "inbox" / "feature.md").write_text(
+        f"---\nid: feature-review\nrepo_path: {repo}\nbase_branch: development\nwork_branch: tasklane/feature-review\nreview_loops: 2\n---\nBuild the feature with tests.\n",
+        encoding="utf-8",
+    )
+    command_sync(cfg)
+    capsys.readouterr()
+    records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((hermes_home / "jobs" / "ready").glob("*.json"))]
+    impl = next(item for item in records if item["spec"]["metadata"]["source"] == "tasklane-file-bridge")
+    review = next(item for item in records if item["spec"]["metadata"]["source"] == "tasklane-review-gate")
+    complete_ready_job(hermes_home, impl["id"], {"final_response": "implementation done"})
+    complete_ready_job(hermes_home, review["id"], {"final_response": "TASKLANE_REVIEW_DECISION: needs-fix\n- Missing regression test."})
+
+    command_reconcile(cfg)
+
+    output = json.loads(capsys.readouterr().out)
+    assert any(action["status"] == "review-gate-fix-queued" for action in output["actions"])
+    ready = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((hermes_home / "jobs" / "ready").glob("*.json"))]
+    fix = next(item for item in ready if item["spec"]["metadata"]["source"] == "tasklane-review-fix")
+    next_review = next(item for item in ready if item["spec"]["metadata"]["source"] == "tasklane-review-gate")
+    assert fix["spec"]["delivery_mode"] == "direct-push"
+    assert fix["spec"]["branch"]["work_branch"] == "tasklane/feature-review"
+    assert "Missing regression test" in fix["spec"]["request"]["body"]
+    assert next_review["spec"]["dependencies"] == [fix["id"]]
+    state = load_state(cfg)
+    assert state["submitted"]["feature-review"]["review_gate"]["status"] == "fixing"
+
+
+def test_reconcile_allows_configured_extra_fix_after_review_loop_cap(tmp_path: Path, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "hermes_home": str(hermes_home),
+                "task_root": str(task_root),
+                "poll_repo_idle": True,
+                "wave_planner": {"projects": {"PeerPay": {"extra_review_fix_loops": 1}}},
+            }
+        )
+    )
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root_uid = "wave-peerpay-final-pr"
+    root_job_id = "tasklane_root"
+    review_job_id = cli.review_job_id(root_uid, 2)
+    cli.save_state(
+        cfg,
+        {
+            "submitted": {
+                root_uid: {
+                    "job_id": root_job_id,
+                    "run_id": root_job_id,
+                    "repo_key": f"repo://{repo}",
+                    "review_gate": {"enabled": True, "status": "pending", "max_loops": 2, "current_iteration": 2},
+                },
+                f"{root_uid}:codex-review:2": {
+                    "synthetic": True,
+                    "kind": "codex-review",
+                    "root_uid": root_uid,
+                    "job_id": review_job_id,
+                    "run_id": review_job_id,
+                    "repo_key": f"repo://{repo}",
+                    "review_iteration": 2,
+                },
+            }
+        },
+    )
+    write_job_record(
+        hermes_home,
+        "completed",
+        root_job_id,
+        {
+            "spec": {
+                "project": "PeerPay",
+                "repo": {"key": f"repo://{repo}", "path": str(repo)},
+                "request": {"title": "PeerPay Final PR", "body": "Finalize PR"},
+                "branch": {"base_branch": "development", "work_branch": "tasklane/peerpay-demo"},
+                "delivery_mode": "pull-request",
+                "pipeline": {"budgets": {"review_loops": 2}},
+                "scope": {"allowed_paths": [], "denied_paths": [], "allow_unlisted_paths": True},
+                "metadata": {"uid": root_uid},
+            },
+            "result": {"final_response": "PR opened"},
+        },
+    )
+    write_job_record(
+        hermes_home,
+        "completed",
+        review_job_id,
+        {
+            "spec": {"metadata": {"uid": f"{root_uid}:codex-review:2"}},
+            "result": {"final_response": "TASKLANE_REVIEW_DECISION: needs-fix\n- Actionable bug remains."},
+        },
+    )
+
+    command_reconcile(cfg)
+
+    output = json.loads(capsys.readouterr().out)
+    assert any(action["status"] == "review-gate-extra-fix-queued" for action in output["actions"])
+    ready = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((hermes_home / "jobs" / "ready").glob("*.json"))]
+    assert any(item["spec"]["metadata"]["source"] == "tasklane-review-fix" for item in ready)
+    assert any(item["spec"]["metadata"]["review_iteration"] == 3 for item in ready)
+    state = load_state(cfg)
+    assert state["submitted"][root_uid]["review_gate"]["current_iteration"] == 3
+    assert state["submitted"][root_uid]["review_gate"]["extra_fix_count"] == 1
+
+
+def test_reconcile_review_gate_pass_finalizes_original_task(tmp_path: Path, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "hermes_home": str(hermes_home),
+                "task_root": str(task_root),
+                "poll_repo_idle": True,
+                "review_gate": {"enabled": True},
+            }
+        )
+    )
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (task_root / "inbox" / "feature.md").write_text(
+        f"---\nid: feature-review\nrepo_path: {repo}\nbase_branch: development\nwork_branch: tasklane/feature-review\n---\nBuild the feature with tests.\n",
+        encoding="utf-8",
+    )
+    command_sync(cfg)
+    capsys.readouterr()
+    records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((hermes_home / "jobs" / "ready").glob("*.json"))]
+    impl = next(item for item in records if item["spec"]["metadata"]["source"] == "tasklane-file-bridge")
+    review = next(item for item in records if item["spec"]["metadata"]["source"] == "tasklane-review-gate")
+    complete_ready_job(hermes_home, impl["id"], {"final_response": "implementation done"})
+    complete_ready_job(hermes_home, review["id"], {"final_response": "TASKLANE_REVIEW_DECISION: pass\nVerification passed."})
+
+    command_reconcile(cfg)
+    capsys.readouterr()
+    command_reconcile(cfg)
+
+    assert not load_state(cfg)["submitted"]
+    assert (task_root / "completed" / "feature.md").exists()
+    result = json.loads((task_root / "completed" / "feature.md.result.json").read_text(encoding="utf-8"))
+    assert result["result"]["review_gate"]["status"] == "passed"
 
 
 def test_sync_resolves_dependencies_from_previously_submitted_active_tasks(tmp_path: Path) -> None:
@@ -758,6 +1885,97 @@ def test_guarded_watch_retries_safe_transient_failed_job(tmp_path: Path) -> None
     ready = json.loads((hermes_home / "jobs" / "ready" / "tasklane_retry.json").read_text(encoding="utf-8"))
     assert ready["state"] == "ready"
     assert ready["last_error"] is None
+
+
+def test_guarded_watch_recovers_stale_worktree_blocker(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    write_job_record(
+        hermes_home,
+        "blocked",
+        "tasklane_stale_worktree",
+        {
+            "attempt": 1,
+            "claimed_at": "2026-05-08T00:00:00+00:00",
+            "claimed_by": "dead-worker",
+            "failed_at": "2026-05-08T00:01:00+00:00",
+            "last_error": "work_branch is already checked out in another worktree: /tmp/missing",
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": f"repo://{repo}", "path": str(repo)},
+                "request": {"title": "recover me"},
+                "branch": {"mode": "existing-branch", "base_branch": "main", "work_branch": "tasklane/demo"},
+            },
+        },
+    )
+    monkeypatch.setattr(cli, "git_worktree_prune", lambda repo_path: {"ok": True, "reason": "pruned", "repo_path": str(repo_path)})
+    monkeypatch.setattr(cli, "git_worktree_branch_entries", lambda repo_path, branch: {"ok": True, "repo_path": str(repo_path), "branch": branch, "entries": []})
+    report = cli.build_watch_report(cfg, mode="guarded", ignored_blocked=set(), check_gateway=False)
+
+    actions = cli.apply_guarded_watch_actions(cfg, report)
+
+    assert actions == [
+        {
+            "job_id": "tasklane_stale_worktree",
+            "status": "retried",
+            "reason": "stale-worktree-pruned",
+            "from": str(hermes_home / "jobs" / "blocked" / "tasklane_stale_worktree.json"),
+            "to": str(hermes_home / "jobs" / "ready" / "tasklane_stale_worktree.json"),
+        }
+    ]
+    assert not (hermes_home / "jobs" / "blocked" / "tasklane_stale_worktree.json").exists()
+    ready = json.loads((hermes_home / "jobs" / "ready" / "tasklane_stale_worktree.json").read_text(encoding="utf-8"))
+    assert ready["state"] == "ready"
+    assert ready["last_error"] is None
+    assert "claimed_at" not in ready
+    assert ready["metadata"]["watchdog_retry"]["reason"] == "stale-worktree-pruned"
+
+
+def test_guarded_watch_does_not_recover_live_checked_out_worktree(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    write_job_record(
+        hermes_home,
+        "blocked",
+        "tasklane_live_worktree",
+        {
+            "last_error": "work_branch is already checked out in another worktree: /tmp/live",
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": f"repo://{repo}", "path": str(repo)},
+                "request": {"title": "do not recover"},
+                "branch": {"mode": "existing-branch", "base_branch": "main", "work_branch": "tasklane/demo"},
+            },
+        },
+    )
+    monkeypatch.setattr(cli, "git_worktree_prune", lambda repo_path: {"ok": True, "reason": "pruned", "repo_path": str(repo_path)})
+    monkeypatch.setattr(
+        cli,
+        "git_worktree_branch_entries",
+        lambda repo_path, branch: {"ok": True, "repo_path": str(repo_path), "branch": branch, "entries": [{"worktree": "/tmp/live", "branch": branch}]},
+    )
+    report = cli.build_watch_report(cfg, mode="guarded", ignored_blocked=set(), check_gateway=False)
+
+    actions = cli.apply_guarded_watch_actions(cfg, report)
+
+    assert actions[0]["status"] == "skipped"
+    assert actions[0]["reason"] == "work-branch-still-checked-out"
+    assert (hermes_home / "jobs" / "blocked" / "tasklane_live_worktree.json").exists()
+    assert not (hermes_home / "jobs" / "ready" / "tasklane_live_worktree.json").exists()
 
 
 def test_guarded_watch_restores_reconciled_failed_task_to_submitted(tmp_path: Path) -> None:

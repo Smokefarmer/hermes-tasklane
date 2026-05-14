@@ -7,6 +7,42 @@
   "default_platform": null,
   "default_chat_id": null,
   "default_thread_id": null,
+  "review_gate": {
+    "enabled": false
+  },
+  "wave_planner": {
+    "max_active_prs": 3,
+    "branch_prefix": "tasklane/",
+    "max_issues_per_wave": 10,
+    "issue_scan_limit": 50,
+    "issue_include_terms": [],
+    "issue_exclude_terms": [],
+    "issue_labels_any": [],
+    "issue_labels_all": [],
+    "issue_milestone": "",
+    "max_pr_lanes": 3,
+    "review_loops": 2,
+    "max_active_contract_prs": 1,
+    "max_active_large_feature_prs": 1,
+    "max_active_docs_prs": 2,
+    "merge_gate": false,
+    "auto_merge": false,
+    "projects": {
+      "Example Project": {
+        "max_active_prs": 3,
+        "max_pr_lanes": 3,
+        "issue_include_terms": [],
+        "disable_contract_lane": false,
+        "review_docs": [
+          "admin.md",
+          "docs/"
+        ],
+        "merge_gate": true,
+        "auto_merge": false,
+        "extra_review_fix_loops": 1
+      }
+    }
+  },
   "watch": {
     "mode": "observe",
     "auto_salvage": false,
@@ -22,6 +58,7 @@
       "git diff --check"
     ],
     "verification_profiles": {},
+    "allow_task_command_overrides": false,
     "expected_base_branches": {},
     "ignored_blocked_jobs": []
   }

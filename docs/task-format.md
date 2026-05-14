@@ -21,9 +21,13 @@ Each task is a `.md` or `.txt` file inside the inbox directory.
 - `allow_unlisted_paths`: `true` or `false`
 - `review_loops`: max self-review loops, default `3`
 - `security_review`: `true` or `false`
-- `bootstrap_commands`: comma-separated commands to run before salvage verification
+- `auto_merge`: `true` or `false` on final PR tasks when policy allows unattended merge
+- `merge_gate`: `true` or `false` on final PR tasks
+- `required_verification_commands`: comma-separated commands expected in PR evidence
+- `review_docs`: comma-separated docs the review gate should check
+- `github_issue`: issue number this task implements
+- `codex_review` or `review_gate`: `true` or `false`; enables a separate Codex review job for pull-request tasks
 - `bootstrap_profile`: named profile from `watch.bootstrap_profiles`
-- `verification_commands`: comma-separated commands for this task's salvage verification
 - `verification_profile`: named profile from `watch.verification_profiles`
 - `baseline_verification`: `true` or `false`
 - `allow_matching_baseline_failures`: `true` or `false`
@@ -69,7 +73,41 @@ Clean up the auth flow, add regression tests, run verification, and prepare a co
 - Add `platform: telegram` and `chat_id` when the group should receive start/completion/failure updates.
 - `default_platform`, `default_chat_id`, and `default_thread_id` in config are used when a task file omits these fields.
 - Use `bootstrap_profile` for dependency install or generated-client setup before verification.
-- Use `verification_commands` only for simple per-task overrides. Prefer named `verification_profile` values for larger repos.
+- Use `verification_profile` for salvage verification. Task files should not define raw shell commands; keep commands in trusted config profiles.
+- Raw per-task `bootstrap_commands` and `verification_commands` are ignored unless `watch.allow_task_command_overrides` is explicitly enabled in local config.
+- When `review_gate.enabled` or task-level `codex_review: true` is set on a pull-request task, sync creates a dependent `report-only` Codex review job. The reviewer must return `TASKLANE_REVIEW_DECISION: pass` or `TASKLANE_REVIEW_DECISION: needs-fix`. `needs-fix` queues a same-branch fix job and another review until `review_loops` is exhausted.
+
+
+## Delivery Groups And Final PR Tasks
+
+For a grouped PR, create implementation tasks plus one final PR task. Implementation tasks usually use `delivery_mode: direct-push`; the final task uses `delivery_mode: pull-request`, depends on all implementation task IDs, and has `codex_review: true`.
+
+Example final PR task frontmatter:
+
+```yaml
+id: wave-20260514-backend-final-pr
+repo_path: /mnt/data/workspace/app
+branch_base: development
+branch_mode: existing-branch
+work_branch: tasklane/app-wave-20260514-backend
+delivery_mode: pull-request
+request_type: task-small
+delivery_group: wave-20260514-backend
+depends_on: wave-20260514-backend-issue-7, wave-20260514-backend-issue-8
+project: App
+review_loops: 2
+codex_review: true
+merge_gate: true
+auto_merge: false
+review_docs: admin.md, docs/ARCHITECTURE.md
+required_verification_commands: npm run typecheck, npm run lint, npm test
+```
+
+The final task body should require the PR to include changed files, diffstat, verification results, linked issues, residual risks, and intentionally deferred follow-ups.
+
+## Wave-Runner Generated Tasks
+
+`plan-wave` and `wave-runner` generate these same task files automatically from GitHub issues and project config. Use manual task files for one-off work; use `wave-runner` for overnight/autonomous batches.
 
 ## Preflight Blockers
 
