@@ -13,6 +13,7 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1465,6 +1466,75 @@ def find_pr(owner: str, repo: str, branch: str) -> dict[str, Any] | None:
     return None
 
 
+def remote_branch_exists(repo_path: Path, branch: str) -> tuple[bool | None, str | None]:
+    """Return (exists, error); exists=None means git could not answer."""
+    if not branch:
+        return False, None
+    proc = run_process(["git", "-C", str(repo_path), "ls-remote", "--heads", "origin", branch], timeout=30)
+    if proc.returncode != 0:
+        return None, (proc.stderr or proc.stdout or "git ls-remote failed").strip()
+    return bool((proc.stdout or "").strip()), None
+
+
+def pr_visibility_status(cfg: Config, job: dict[str, Any]) -> dict[str, Any]:
+    spec = job.get("spec") or {}
+    branch = spec.get("branch") or {}
+    repo_path = job_repo_path_from_spec(job)
+    work_branch = str(branch.get("work_branch") or "").strip()
+    base_branch = str(branch.get("pr_target") or branch.get("base_branch") or "").strip()
+    cached = compact_pr_status_from_job(job)
+    if cached.get("status") == "found":
+        cached.setdefault("head", work_branch or cached.get("head"))
+        cached.setdefault("base", base_branch or cached.get("base"))
+        return cached
+    base = {"status": "not-found", "url": None, "number": None, "head": work_branch or None, "base": base_branch or None, "message": "No PR found for branch"}
+    if not repo_path or not work_branch:
+        return {**base, "status": "not-found", "message": "Job has no repository path or work branch"}
+    remote = git_remote_for_repo(repo_path)
+    if not remote:
+        exists, error = remote_branch_exists(repo_path, work_branch)
+        if exists is True:
+            return {**base, "status": "branch-pushed-no-pr", "message": "Remote branch exists; GitHub remote could not be parsed for PR lookup"}
+        if exists is None:
+            return {**base, "status": "query-failed", "message": error or "Remote branch check failed"}
+        return base
+    owner, repo = remote
+    if not github_auth_header():
+        exists, error = remote_branch_exists(repo_path, work_branch)
+        status = "unknown-auth-missing"
+        message = "GitHub credentials unavailable; PR lookup not attempted"
+        if exists is True:
+            message += "; remote branch exists"
+        elif exists is False:
+            message += "; remote branch not found"
+        elif error:
+            message += f"; remote branch check failed: {error}"
+        return {**base, "status": status, "message": message}
+    try:
+        pr = find_pr(owner, repo, work_branch)
+    except RuntimeError as exc:
+        if "credentials" in str(exc).lower():
+            return {**base, "status": "unknown-auth-missing", "message": str(exc)}
+        return {**base, "status": "query-failed", "message": str(exc)}
+    except Exception as exc:
+        return {**base, "status": "query-failed", "message": str(exc)}
+    if pr:
+        return {
+            "status": "found",
+            "url": pr.get("url"),
+            "number": pr.get("number"),
+            "head": pr.get("branch") or work_branch or None,
+            "base": pr.get("base_branch") or base_branch or None,
+            "message": "PR found",
+        }
+    exists, error = remote_branch_exists(repo_path, work_branch)
+    if exists is True:
+        return {**base, "status": "branch-pushed-no-pr", "message": "Remote branch exists but no PR was found"}
+    if exists is None:
+        return {**base, "status": "query-failed", "message": error or "Remote branch check failed after PR lookup"}
+    return base
+
+
 def create_pr(owner: str, repo: str, *, branch: str, base_branch: str, title: str, body: str) -> dict[str, Any]:
     pr = github_post(
         f"https://api.github.com/repos/{owner}/{repo}/pulls",
@@ -2008,11 +2078,11 @@ def current_job_summary(cfg: Config) -> dict[str, Any]:
     completed = completed_job_ids(cfg)
     ready, waiting, waiting_for = split_ready_jobs(cfg)
     return {
-        "running": [compact_job(job) for job in iter_job_records(cfg, {"running"})],
-        "ready": [compact_job(job) for job in ready],
-        "waiting": [compact_job(job, state="waiting", waiting_for=waiting_for.get(str(job.get("id") or ""), [])) for job in waiting],
-        "blocked": [compact_job(job) for job in iter_job_records(cfg, {"blocked", "needs-human"})],
-        "failed": [compact_job(job) for job in iter_job_records(cfg, {"failed"})],
+        "running": [compact_job(job, completed_ids=completed) for job in iter_job_records(cfg, {"running"})],
+        "ready": [compact_job(job, completed_ids=completed) for job in ready],
+        "waiting": [compact_job(job, state="waiting", waiting_for=waiting_for.get(str(job.get("id") or ""), []), completed_ids=completed) for job in waiting],
+        "blocked": [compact_job(job, completed_ids=completed) for job in iter_job_records(cfg, {"blocked", "needs-human"})],
+        "failed": [compact_job(job, completed_ids=completed) for job in iter_job_records(cfg, {"failed"})],
         "completed_count": len(completed),
     }
 
@@ -2314,6 +2384,90 @@ Do not merge, deploy, or upgrade contracts.
 """
 
 
+def lane_plan_artifact_path(cfg: Config, wave_id: str) -> Path:
+    return cfg.task_root / "lane-plans" / f"{wave_id}.json"
+
+
+def lane_plan_lookup(cfg: Config, job_id: str) -> dict[str, Any] | None:
+    directory = cfg.task_root / "lane-plans"
+    if not directory.exists():
+        return None
+    for path in sorted(directory.glob("*.json")):
+        payload = load_json(path)
+        if not isinstance(payload, dict):
+            continue
+        for lane in payload.get("lanes") or []:
+            if not isinstance(lane, dict):
+                continue
+            if job_id in {str(item) for item in lane.get("job_ids") or []}:
+                return {
+                    "wave_id": payload.get("wave_id"),
+                    "path": str(path),
+                    "artifact_status": payload.get("artifact_status"),
+                    "lane": lane,
+                }
+    return None
+
+
+def write_lane_plan_artifact(
+    cfg: Config,
+    *,
+    wave_id: str,
+    project: str,
+    repo_path: Path,
+    base_branch: str,
+    lanes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    path = lane_plan_artifact_path(cfg, wave_id)
+    try:
+        state = load_state(cfg)
+        submitted = state.get("submitted") if isinstance(state.get("submitted"), dict) else {}
+        artifact_lanes: list[dict[str, Any]] = []
+        partial = False
+        for lane in lanes:
+            task_uids = [str(uid) for uid in lane.get("task_uids") or []]
+            impl_uids = [str(uid) for uid in lane.get("implementation_task_uids") or []]
+            final_uid = str(lane.get("final_pr_task_uid") or "")
+            def jid(uid: str) -> str | None:
+                entry = submitted.get(uid) if isinstance(submitted, dict) else None
+                if isinstance(entry, dict):
+                    return str(entry.get("job_id") or entry.get("run_id") or "").strip() or None
+                return None
+            job_ids = [jid(uid) for uid in task_uids]
+            impl_job_ids = [jid(uid) for uid in impl_uids]
+            final_job_id = jid(final_uid) if final_uid else None
+            if any(value is None for value in job_ids + impl_job_ids) or (final_uid and final_job_id is None):
+                partial = True
+            artifact_lanes.append(
+                {
+                    "delivery_group": lane.get("delivery_group"),
+                    "lane_id": lane.get("lane_id"),
+                    "branch": lane.get("branch"),
+                    "issue_numbers": lane.get("issue_numbers") or [],
+                    "task_uids": task_uids,
+                    "job_ids": [value for value in job_ids if value],
+                    "implementation_task_uids": impl_uids,
+                    "implementation_job_ids": [value for value in impl_job_ids if value],
+                    "final_pr_task_uid": final_uid or None,
+                    "final_pr_job_id": final_job_id,
+                }
+            )
+        payload = {
+            "schema_version": 1,
+            "wave_id": wave_id,
+            "project": project,
+            "repo_path": str(repo_path),
+            "base_branch": base_branch,
+            "created_at": now_iso(),
+            "artifact_status": "partial" if partial else "complete",
+            "lanes": artifact_lanes,
+        }
+        atomic_write_json(path, payload)
+        return {"status": "partial" if partial else "written", "path": str(path), "error": None}
+    except Exception as exc:
+        return {"status": "failed", "path": str(path), "error": str(exc)}
+
+
 def enqueue_wave_tasks(cfg: Config, report: dict[str, Any], *, repo_path: Path, project: str, base_branch: str) -> dict[str, Any]:
     ensure_layout(cfg)
     lanes = report.get("proposed_lanes") or []
@@ -2334,12 +2488,22 @@ def enqueue_wave_tasks(cfg: Config, report: dict[str, Any], *, repo_path: Path, 
     verification_profile = str(project_settings.get("verification_profile") or "").strip()
     required_verification = project_verification_commands(cfg, project, verification_profile)
     created: list[str] = []
+    lane_plan_lanes: list[dict[str, Any]] = []
     for lane in lanes:
         lane_id = slugify(str(lane.get("lane_id") or "lane"))
         branch = f"{(report.get('settings') or {}).get('branch_prefix') or 'tasklane/'}{slugify(project)}-{wave_id}-{lane_id}"
         issue_uid_by_number: dict[int, str] = {}
         previous_uid: str | None = None
         issues = lane.get("issues") or []
+        lane_plan_entry = {
+            "delivery_group": f"{wave_id}-{lane_id}",
+            "lane_id": lane_id,
+            "branch": branch,
+            "issue_numbers": [int(issue.get("number")) for issue in issues if issue.get("number") is not None],
+            "task_uids": [],
+            "implementation_task_uids": [],
+            "final_pr_task_uid": None,
+        }
         for index, issue in enumerate(issues, start=1):
             number = int(issue.get("number"))
             uid = f"{wave_id}-{lane_id}-issue-{number}"
@@ -2369,6 +2533,8 @@ def enqueue_wave_tasks(cfg: Config, report: dict[str, Any], *, repo_path: Path, 
             path = cfg.inbox_dir / f"{uid}.md"
             path.write_text(f"{task_frontmatter(fields)}\n{implementation_prompt(issue, branch=branch, review_docs=review_docs)}", encoding="utf-8")
             created.append(str(path))
+            lane_plan_entry["task_uids"].append(uid)
+            lane_plan_entry["implementation_task_uids"].append(uid)
             previous_uid = uid
         final_uid = f"{wave_id}-{lane_id}-final-pr"
         final_fields = {
@@ -2396,6 +2562,9 @@ def enqueue_wave_tasks(cfg: Config, report: dict[str, Any], *, repo_path: Path, 
         final_path = cfg.inbox_dir / f"{final_uid}.md"
         final_path.write_text(f"{task_frontmatter(final_fields)}\n{final_pr_prompt(lane, branch=branch, base_branch=base_branch, review_docs=review_docs, required_verification=required_verification)}", encoding="utf-8")
         created.append(str(final_path))
+        lane_plan_entry["task_uids"].append(final_uid)
+        lane_plan_entry["final_pr_task_uid"] = final_uid
+        lane_plan_lanes.append(lane_plan_entry)
 
     sync_output = io.StringIO()
     with redirect_stdout(sync_output):
@@ -2405,11 +2574,22 @@ def enqueue_wave_tasks(cfg: Config, report: dict[str, Any], *, repo_path: Path, 
         sync_payload: Any = json.loads(raw_sync) if raw_sync else None
     except json.JSONDecodeError:
         sync_payload = {"raw": raw_sync}
+    lane_plan = {"status": "skipped", "path": None, "error": None}
+    if lane_plan_lanes:
+        lane_plan = write_lane_plan_artifact(
+            cfg,
+            wave_id=wave_id,
+            project=project,
+            repo_path=repo_path,
+            base_branch=base_branch,
+            lanes=lane_plan_lanes,
+        )
     return {
         "status": "enqueued",
         "wave_id": wave_id,
         "created_task_files": created,
         "sync": sync_payload,
+        "lane_plan": lane_plan,
     }
 
 
@@ -3482,14 +3662,116 @@ def verification_summary_for_job(payload: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
-def compact_job(payload: dict[str, Any], *, state: str | None = None, waiting_for: list[str] | None = None) -> dict[str, Any]:
+def job_liveness_summary(
+    job: dict[str, Any],
+    *,
+    completed_ids: set[str] | None = None,
+    now: datetime | None = None,
+    process_alive: Callable[[int], bool] | None = None,
+) -> dict[str, Any]:
+    """Return derived, read-only liveness fields for a JobStore job record."""
+    probe: Callable[[int], bool] = process_alive or process_is_alive
+    completed = completed_ids or set()
+    state = str(job.get("state") or "unknown")
+    claimed_by = job.get("claimed_by")
+    pid = claimant_pid(job)
+    alive: bool | None = None
+    if state == "running" and pid is not None:
+        try:
+            alive = bool(probe(pid))
+        except Exception:
+            alive = None
+    waiting_for = waiting_dependencies(job, completed) if state == "ready" else []
+    derived = "unknown"
+    recovery_eligible = False
+    recovery_blocked_reason = None
+    if state == "running":
+        if pid is None:
+            derived = "running-unknown-claimant"
+            recovery_blocked_reason = "claimant-pid-unknown"
+        elif alive is True:
+            derived = "running-alive"
+            recovery_blocked_reason = "claimant-alive"
+        elif alive is False:
+            derived = "dead-claimant"
+            recovery_eligible = True
+        else:
+            derived = "running-unknown-claimant"
+            recovery_blocked_reason = "claimant-liveness-unknown"
+    elif state == "ready":
+        derived = "waiting-on-dependency" if waiting_for else "ready"
+        if waiting_for:
+            recovery_blocked_reason = "waiting-on-dependency"
+    elif state == "blocked":
+        derived = "blocked"
+        recovery_blocked_reason = job.get("blocked_reason") or job.get("last_error")
+    elif state == "needs-human":
+        derived = "needs-human"
+        recovery_blocked_reason = job.get("needs_human_reason") or job.get("last_error")
+    elif state == "failed":
+        derived = "failed"
+    elif state == "completed":
+        derived = "completed"
+    metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+    watchdog = metadata.get("watchdog_retry") if isinstance(metadata, dict) else None
+    last_error = job.get("last_error")
+    historical_last_error = None
+    if watchdog and state in {"ready", "running"}:
+        historical_last_error = last_error or (watchdog.get("last_error") if isinstance(watchdog, dict) else None)
+        active_last_error = None
+    else:
+        active_last_error = last_error
+    runtime_seconds = None
+    if state == "running":
+        claimed_at = parse_timestamp(job.get("claimed_at"))
+        if claimed_at:
+            current = now or datetime.now(timezone.utc)
+            runtime_seconds = max(0, int((current - claimed_at).total_seconds()))
+    return {
+        "job_id": job.get("id"),
+        "state": state,
+        "derived_state": derived,
+        "claimed_by": claimed_by,
+        "claimant_pid": pid,
+        "claimant_alive": alive,
+        "runtime_seconds": runtime_seconds,
+        "waiting_for": waiting_for,
+        "recovery_eligible": recovery_eligible,
+        "recovery_blocked_reason": recovery_blocked_reason,
+        "last_error": active_last_error,
+        "historical_last_error": historical_last_error,
+        "last_watchdog_action": watchdog if isinstance(watchdog, dict) else None,
+    }
+
+
+def compact_pr_status_from_job(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    delivery = metadata.get("delivery") if isinstance(metadata, dict) else {}
+    pr = (delivery or {}).get("pr") if isinstance(delivery, dict) else None
+    if not isinstance(pr, dict):
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        pr = result.get("pr") if isinstance(result, dict) else None
+    if isinstance(pr, dict) and (pr.get("url") or pr.get("number")):
+        return {"status": "found", "url": pr.get("url"), "number": pr.get("number"), "head": pr.get("branch") or pr.get("head"), "base": pr.get("base_branch") or pr.get("base"), "message": "PR recorded in job metadata"}
+    return {"status": "unknown", "url": None, "number": None, "head": None, "base": None, "message": "No cached PR visibility available"}
+
+
+def operator_job_summary(
+    payload: dict[str, Any],
+    *,
+    state: str | None = None,
+    waiting_for: list[str] | None = None,
+    completed_ids: set[str] | None = None,
+    include_liveness: bool = True,
+) -> dict[str, Any]:
     spec = payload.get("spec") or {}
     branch = spec.get("branch") or {}
     request = spec.get("request") or {}
     metadata = payload.get("metadata") or {}
-    delivery = metadata.get("delivery") if isinstance(metadata, dict) else {}
     salvage = metadata.get("tasklane_salvage") if isinstance(metadata, dict) else {}
-    return {
+    delivery = metadata.get("delivery") if isinstance(metadata, dict) else {}
+    raw_pr = (delivery or {}).get("pr") if isinstance(delivery, dict) else None
+    summary = {
         "id": payload.get("id"),
         "state": state or payload.get("state"),
         "attempt": payload.get("attempt"),
@@ -3507,8 +3789,30 @@ def compact_job(payload: dict[str, Any], *, state: str | None = None, waiting_fo
         "needs_human_reason": payload.get("needs_human_reason"),
         "salvage": salvage if isinstance(salvage, dict) else None,
         "verification": verification_summary_for_job(payload),
-        "pr": (delivery or {}).get("pr") if isinstance(delivery, dict) else None,
+        "pr": raw_pr,
+        "pr_status": compact_pr_status_from_job(payload),
     }
+    if include_liveness:
+        live = job_liveness_summary(payload, completed_ids=completed_ids)
+        if waiting_for is not None:
+            live["waiting_for"] = waiting_for
+            if waiting_for and live.get("derived_state") == "ready":
+                live["derived_state"] = "waiting-on-dependency"
+        summary.update({k: live.get(k) for k in ["derived_state", "claimant_pid", "claimant_alive", "runtime_seconds", "last_watchdog_action", "historical_last_error", "recovery_eligible", "recovery_blocked_reason"]})
+        summary["waiting_for"] = live.get("waiting_for") or waiting_for or []
+        if live.get("last_error") is None and live.get("historical_last_error") is not None:
+            summary["error"] = None
+    return summary
+
+
+def compact_job(
+    payload: dict[str, Any],
+    *,
+    state: str | None = None,
+    waiting_for: list[str] | None = None,
+    completed_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    return operator_job_summary(payload, state=state, waiting_for=waiting_for, completed_ids=completed_ids)
 
 
 def systemd_gateway_status() -> dict[str, Any]:
@@ -3575,10 +3879,18 @@ def watch_ignored_blocked_jobs(cfg: Config, overrides: list[str] | None = None) 
     return ignored
 
 
-def add_watch_problem(problems: list[dict[str, Any]], severity: str, code: str, message: str, job: dict[str, Any] | None = None) -> None:
+def add_watch_problem(
+    problems: list[dict[str, Any]],
+    severity: str,
+    code: str,
+    message: str,
+    job: dict[str, Any] | None = None,
+    *,
+    completed_ids: set[str] | None = None,
+) -> None:
     entry: dict[str, Any] = {"severity": severity, "code": code, "message": message}
     if job:
-        entry["job"] = compact_job(job)
+        entry["job"] = compact_job(job, completed_ids=completed_ids)
     problems.append(entry)
 
 
@@ -4526,6 +4838,7 @@ def build_watch_report(
     expected = expected_base if expected_base is not None else watch_expected_base_map(cfg)
     ignored = ignored_blocked if ignored_blocked is not None else watch_ignored_blocked_jobs(cfg)
     jobs = iter_job_records(cfg)
+    completed = completed_job_ids(cfg)
     by_state = {state: 0 for state in sorted(JOB_STATES)}
     for job in jobs:
         state = str(job.get("state") or "unknown")
@@ -4554,37 +4867,37 @@ def build_watch_report(
     for job in running:
         runtime = minutes_since(job.get("claimed_at"))
         if runtime is None:
-            add_watch_problem(problems, "warning", "running-missing-claimed-at", "running job has no claimed_at timestamp", job)
+            add_watch_problem(problems, "warning", "running-missing-claimed-at", "running job has no claimed_at timestamp", job, completed_ids=completed)
         elif runtime > stale_after:
-            add_watch_problem(problems, "warning", "running-stale", f"running job has exceeded {stale_after} minutes", job)
+            add_watch_problem(problems, "warning", "running-stale", f"running job has exceeded {stale_after} minutes", job, completed_ids=completed)
         pid = claimant_pid(job)
         if pid is not None and not process_is_alive(pid):
-            add_watch_problem(problems, "critical", "running-dead-claimant", f"claimed gateway process {pid} is not alive", job)
+            add_watch_problem(problems, "critical", "running-dead-claimant", f"claimed gateway process {pid} is not alive", job, completed_ids=completed)
     active_blocked: list[dict[str, Any]] = []
     ignored_blocked_jobs: list[dict[str, Any]] = []
     for job in blocked:
         job_id = str(job.get("id") or "")
         if job_id in ignored:
             ignored_blocked_jobs.append(job)
-            notices.append({"code": "blocked-ignored", "job": compact_job(job)})
+            notices.append({"code": "blocked-ignored", "job": compact_job(job, completed_ids=completed)})
             continue
         active_blocked.append(job)
-        add_watch_problem(problems, "warning", "job-blocked", "job is blocked and needs review", job)
+        add_watch_problem(problems, "warning", "job-blocked", "job is blocked and needs review", job, completed_ids=completed)
     by_state["blocked"] = len(active_blocked)
     for job in needs_human:
-        add_watch_problem(problems, "warning", "job-needs-human", "job is waiting for human input", job)
+        add_watch_problem(problems, "warning", "job-needs-human", "job is waiting for human input", job, completed_ids=completed)
     for job in failed:
         classification = classify_failed_job(cfg, job, max_attempts)
         kind = classification.get("classification")
         if kind == "salvage-needed":
-            add_watch_problem(problems, "warning", "salvage-needed", "job failed after producing worktree changes; salvage instead of retry", job)
-            notices.append({"code": "salvage-needed", "job": compact_job(job), "inspection": classification.get("inspection")})
+            add_watch_problem(problems, "warning", "salvage-needed", "job failed after producing worktree changes; salvage instead of retry", job, completed_ids=completed)
+            notices.append({"code": "salvage-needed", "job": compact_job(job, completed_ids=completed), "inspection": classification.get("inspection")})
         elif kind == "retryable-clean":
-            add_watch_problem(problems, "warning", "job-retryable", "job failed with a clean transient error and can be retried", job)
+            add_watch_problem(problems, "warning", "job-retryable", "job failed with a clean transient error and can be retried", job, completed_ids=completed)
         elif kind == "needs-human":
-            add_watch_problem(problems, "warning", "salvage-needs-human", str(classification.get("reason") or "dirty failed job needs review"), job)
+            add_watch_problem(problems, "warning", "salvage-needs-human", str(classification.get("reason") or "dirty failed job needs review"), job, completed_ids=completed)
         else:
-            add_watch_problem(problems, "warning", "job-failed", "job failed and was not automatically retried", job)
+            add_watch_problem(problems, "warning", "job-failed", "job failed and was not automatically retried", job, completed_ids=completed)
     gate_attention = submitted_gate_attention(cfg)
     if gate_attention:
         by_state["needs-human"] = by_state.get("needs-human", 0) + len(gate_attention)
@@ -4596,6 +4909,7 @@ def build_watch_report(
                 f"{gate.get('gate')}-gate-needs-human",
                 f"submitted Tasklane {gate.get('gate')} gate needs human action: {gate.get('reason')}",
                 {"id": gate.get("job_id"), "state": "needs-human", "spec": {"project": gate.get("task_uid"), "request": {"title": gate.get("source_path")}}},
+                completed_ids=completed,
             )
     notify_config = notification_config(cfg)
     if bool_from_any(cfg.watch.get("require_notifications"), default=False) and not notify_config.get("configured"):
@@ -4615,9 +4929,9 @@ def build_watch_report(
         branch_mode = branch.get("mode")
         delivery_mode = spec.get("delivery_mode")
         if base_branch and base_branch != expected_branch:
-            add_watch_problem(problems, "warning", "base-branch-mismatch", f"expected base branch {expected_branch!r}, got {base_branch!r}", job)
+            add_watch_problem(problems, "warning", "base-branch-mismatch", f"expected base branch {expected_branch!r}, got {base_branch!r}", job, completed_ids=completed)
         elif not base_branch and (branch_mode in {"new-branch", "detached-review"} or delivery_mode == "pull-request"):
-            add_watch_problem(problems, "warning", "base-branch-missing", f"expected base branch {expected_branch!r}, but job has no base_branch", job)
+            add_watch_problem(problems, "warning", "base-branch-missing", f"expected base branch {expected_branch!r}, but job has no base_branch", job, completed_ids=completed)
     health = "critical" if any(item["severity"] == "critical" for item in problems) else "warning" if problems else "ok"
     report = {
         "timestamp": now_iso(),
@@ -4627,14 +4941,14 @@ def build_watch_report(
         "counts": by_state,
         "counts_all": counts_all,
         "inbox": len([p for p in cfg.inbox_dir.iterdir() if p.is_file()]) if cfg.inbox_dir.exists() else 0,
-        "running": [compact_job(job) for job in running],
-        "ready": [compact_job(job) for job in ready],
-        "waiting": [compact_job(job, state="waiting", waiting_for=waiting_for.get(str(job.get("id") or ""), [])) for job in waiting],
-        "blocked": [compact_job(job) for job in active_blocked],
-        "ignored_blocked": [compact_job(job) for job in ignored_blocked_jobs],
-        "needs_human": [compact_job(job) for job in needs_human],
+        "running": [compact_job(job, completed_ids=completed) for job in running],
+        "ready": [compact_job(job, completed_ids=completed) for job in ready],
+        "waiting": [compact_job(job, state="waiting", waiting_for=waiting_for.get(str(job.get("id") or ""), []), completed_ids=completed) for job in waiting],
+        "blocked": [compact_job(job, completed_ids=completed) for job in active_blocked],
+        "ignored_blocked": [compact_job(job, completed_ids=completed) for job in ignored_blocked_jobs],
+        "needs_human": [compact_job(job, completed_ids=completed) for job in needs_human],
         "gate_attention": gate_attention,
-        "failed": [compact_job(job) for job in failed],
+        "failed": [compact_job(job, completed_ids=completed) for job in failed],
         "notification_config": notify_config,
         "problems": problems,
         "notices": notices,
@@ -4918,6 +5232,119 @@ def maybe_send_tasklane_notification(cfg: Config, *, channel: str, text: str, pa
     return result
 
 
+def dependency_summaries(cfg: Config, job: dict[str, Any], completed: set[str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for dep_id in job_dependencies(job):
+        dep = find_job_record(cfg, dep_id)
+        rows.append({
+            "job_id": dep_id,
+            "found": isinstance(dep, dict),
+            "completed": dep_id in completed,
+            "state": dep.get("state") if isinstance(dep, dict) else None,
+            "derived_state": job_liveness_summary(dep, completed_ids=completed).get("derived_state") if isinstance(dep, dict) else "unknown",
+        })
+    return rows
+
+
+def recommended_action_for_liveness(liveness: dict[str, Any]) -> str:
+    derived = str(liveness.get("derived_state") or "unknown")
+    if derived == "running-alive":
+        return "No action; worker claimant is alive."
+    if derived == "dead-claimant":
+        return "Run guarded watch or recover the dead claimant." if liveness.get("recovery_eligible") else "Re-check shortly before recovery."
+    if derived == "running-unknown-claimant":
+        return "Inspect claimant metadata; Tasklane cannot verify this worker process."
+    if derived == "waiting-on-dependency":
+        waiting = ", ".join(liveness.get("waiting_for") or [])
+        return f"Wait for dependency {waiting}." if waiting else "Wait for dependencies to complete."
+    if derived == "ready":
+        return "No manual action; job is ready for the gateway."
+    if derived == "blocked":
+        return "Inspect blocker and decide whether to retry, salvage, or stop."
+    if derived == "needs-human":
+        return "Human decision required; inspect prompt/blocker details."
+    if derived == "failed":
+        return "Review failure and use salvage/retry only if safe."
+    if derived == "completed":
+        return "No action; job is completed."
+    return "Inspect job record and events."
+
+
+def build_job_inspection(cfg: Config, job_id: str, *, events_limit: int = 5) -> dict[str, Any]:
+    job = find_job_record(cfg, job_id)
+    if not isinstance(job, dict):
+        raise KeyError(job_id)
+    completed = completed_job_ids(cfg)
+    liveness = job_liveness_summary(job, completed_ids=completed)
+    summary = operator_job_summary(job, completed_ids=completed)
+    events = read_job_events(cfg, job_id)
+    if events_limit >= 0:
+        events = events[-events_limit:]
+    spec = job.get("spec") or {}
+    branch = spec.get("branch") or {}
+    lane_plan = lane_plan_lookup(cfg, job_id)
+    return {
+        "job": summary,
+        "liveness": liveness,
+        "dependencies": dependency_summaries(cfg, job, completed),
+        "events": events,
+        "pr_status": pr_visibility_status(cfg, job),
+        "branch": {
+            "mode": branch.get("mode"),
+            "base_branch": branch.get("base_branch"),
+            "work_branch": branch.get("work_branch"),
+            "pr_target": branch.get("pr_target"),
+            "delivery_mode": spec.get("delivery_mode"),
+        },
+        "lane_plan": lane_plan,
+        "recommended_action": recommended_action_for_liveness(liveness),
+    }
+
+
+def format_job_inspection(report: dict[str, Any]) -> str:
+    job = report.get("job") or {}
+    live = report.get("liveness") or {}
+    pr = report.get("pr_status") or {}
+    branch = report.get("branch") or {}
+    lines = [
+        f"Tasklane job {job.get('id')}",
+        f"State: {job.get('state')} / {live.get('derived_state')}",
+        f"Project: {job.get('project') or ''}",
+        f"Title: {job.get('title') or ''}",
+        f"Branch: {branch.get('work_branch') or '-'} -> {branch.get('pr_target') or branch.get('base_branch') or '-'} ({branch.get('delivery_mode') or '-'})",
+        f"PR: {pr.get('status')} {pr.get('url') or pr.get('message') or ''}".rstrip(),
+    ]
+    if live.get("claimed_by"):
+        lines.append(f"Claimant: {live.get('claimed_by')} pid={live.get('claimant_pid')} alive={live.get('claimant_alive')}")
+    if live.get("waiting_for"):
+        lines.append("Waiting for: " + ", ".join(live.get("waiting_for") or []))
+    deps = report.get("dependencies") or []
+    if deps:
+        lines.append("Dependencies:")
+        for dep in deps:
+            lines.append(f"- {dep.get('job_id')}: {dep.get('state') or 'missing'} / {dep.get('derived_state')} completed={dep.get('completed')}")
+    lane = report.get("lane_plan") or {}
+    if lane:
+        lane_data = lane.get("lane") or {}
+        lines.append(f"Lane: {lane.get('wave_id')} / {lane_data.get('lane_id')} ({lane_data.get('delivery_group')})")
+    events = report.get("events") or []
+    if events:
+        lines.append("Recent events:")
+        for event in events:
+            lines.append(f"- {event.get('timestamp')}: {event.get('event_type') or event.get('type')} {event.get('state') or ''}".rstrip())
+    lines.append(f"Recommended action: {report.get('recommended_action')}")
+    return "\n".join(lines)
+
+
+def command_inspect(cfg: Config, job_id: str, *, json_output: bool, events_limit: int) -> int:
+    report = build_job_inspection(cfg, job_id, events_limit=events_limit)
+    if json_output:
+        print(json.dumps(report, indent=2))
+    else:
+        print(format_job_inspection(report))
+    return 0
+
+
 def command_watch(
     cfg: Config,
     *,
@@ -5031,27 +5458,17 @@ def command_status(cfg: Config) -> int:
         if item["state"] == "blocked":
             blocked_runs.append(item)
     for payload in iter_job_records(cfg, {"ready", "running", "blocked", "needs-human"}):
-        spec = payload.get("spec") or {}
-        item = {
-            "id": payload.get("id"),
-            "state": payload.get("state"),
-            "repo_key": ((spec.get("repo") or {}).get("key")),
-            "project": spec.get("project"),
-            "title": ((spec.get("request") or {}).get("title")),
-            "error": payload.get("last_error"),
-        }
-        if item["state"] == "ready":
+        state = str(payload.get("state") or "")
+        if state == "ready":
             missing = waiting_dependencies(payload, completed)
             if missing:
-                item["state"] = "waiting"
-                item["waiting_for"] = missing
-                waiting_jobs.append(item)
+                waiting_jobs.append(operator_job_summary(payload, state="waiting", waiting_for=missing, completed_ids=completed))
                 continue
-            active_jobs.append(item)
-        if item["state"] == "running":
-            active_jobs.append(item)
-        if item["state"] in {"blocked", "needs-human"}:
-            blocked_jobs.append(item)
+            active_jobs.append(operator_job_summary(payload, completed_ids=completed))
+        elif state == "running":
+            active_jobs.append(operator_job_summary(payload, completed_ids=completed))
+        elif state in {"blocked", "needs-human"}:
+            blocked_jobs.append(operator_job_summary(payload, completed_ids=completed))
     gate_attention = submitted_gate_attention(cfg)
     report = {
         "inbox": len([p for p in cfg.inbox_dir.iterdir() if p.is_file()]) if cfg.inbox_dir.exists() else 0,
@@ -5149,6 +5566,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("sync", help="Convert inbox files into Hermes queue items")
     sub.add_parser("reconcile", help="Reconcile submitted tasks from governed run state")
     sub.add_parser("status", help="Show tasklane and run status")
+    inspect = sub.add_parser("inspect", help="Inspect one job with liveness, dependency, PR, and event context")
+    inspect.add_argument("job_id", help="Hermes JobStore job id")
+    inspect.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    inspect.add_argument("--events", type=int, default=5, help="Number of recent job events to include")
     plan_wave = sub.add_parser("plan-wave", help="Dry-run a grouped issue wave without queueing jobs")
     plan_wave.add_argument("--repo", required=True, help="Local repository path to inspect")
     plan_wave.add_argument("--project", required=True, help="Project label used in reports")
@@ -5223,6 +5644,8 @@ def main(argv: list[str] | None = None) -> int:
                 return command_reconcile(cfg)
             if args.command == "status":
                 return command_status(cfg)
+            if args.command == "inspect":
+                return command_inspect(cfg, args.job_id, json_output=args.json, events_limit=args.events)
             if args.command == "plan-wave":
                 return command_plan_wave(
                     cfg,
@@ -5258,13 +5681,14 @@ def main(argv: list[str] | None = None) -> int:
                 mode = args.mode or str(cfg.watch.get("mode") or "observe")
                 if mode not in {"observe", "guarded"}:
                     raise ValueError("watch mode must be observe or guarded")
+                notify = args.notify if mode == "observe" else args.notify or bool_from_any(cfg.watch.get("notify"), default=False)
                 return command_watch(
                     cfg,
                     mode=mode,
                     stale_minutes=args.stale_minutes,
                     expected_base_values=args.expected_base,
                     ignored_blocked_values=args.ignore_blocked,
-                    notify=args.notify or bool_from_any(cfg.watch.get("notify"), default=False),
+                    notify=notify,
                     quiet_ok=args.quiet_ok,
                     json_output=args.json,
                     fail_on_problems=args.fail_on_problems,

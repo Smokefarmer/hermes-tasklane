@@ -28,12 +28,13 @@ The normal production loop is:
 
 ```bash
 hermes-tasklane status
+hermes-tasklane inspect <job-id> --json
 hermes-tasklane watch --mode guarded --json
 hermes-tasklane reconcile
 hermes-tasklane wave-runner --repo /path/to/repo --project "Project Name" --base development --enqueue --notify --json
 ```
 
-Use `status` to see queue state, `watch` to detect and safely recover queue problems, `reconcile` to clean up completed work, and `wave-runner` to queue the next issue wave only when project PR caps allow it.
+Use `status` for the default machine-readable queue summary, `inspect <job-id>` for a read-only operator drill-down, `watch` to detect and safely recover queue problems, `reconcile` to clean up completed work, and `wave-runner` to queue the next issue wave only when project PR caps allow it.
 
 ## Features At A Glance
 
@@ -49,6 +50,8 @@ Use `status` to see queue state, `watch` to detect and safely recover queue prob
 - Guarded watchdog recovery for stale worktrees and narrow transient failures.
 - Telegram/Hermes notifications for real blockers.
 - Read-only dashboard for queue inspection.
+- Shared operator liveness summaries for status, watch, inspect, and dashboard views.
+- Optional wave lane-plan artifacts that map issues, lanes, branches, tasks, and jobs.
 
 For a teammate-facing walkthrough, start with [docs/onboarding.md](docs/onboarding.md).
 
@@ -77,6 +80,19 @@ For a teammate-facing walkthrough, start with [docs/onboarding.md](docs/onboardi
 - checks expected base-branch policy per project or repo
 - defaults to observe-only and can optionally run guarded safe retries
 - can auto-salvage failed pull-request jobs that already produced scoped, verified code changes
+
+
+## Operator inspection workflow
+
+`hermes-tasklane status` remains JSON by default and is the fastest overview for automation. Active, waiting, blocked, and needs-human job summaries include shared liveness fields such as `derived_state`, `waiting_for`, `claimant_pid`, `claimant_alive`, `runtime_seconds`, `recovery_eligible`, `last_watchdog_action`, and `historical_last_error`. Derived states include `ready`, `waiting-on-dependency`, `running-alive`, `dead-claimant`, `running-unknown-claimant`, `blocked`, `needs-human`, `failed`, `completed`, and `unknown`.
+
+Use `hermes-tasklane inspect <job-id>` when an operator needs detail for one job. `inspect` is read-only and does not take the Tasklane lock. It supports human output by default and `--json` for tooling, plus `--events N` to limit recent JobStore events. The report includes the job summary, liveness, dependency states, recent events, branch/delivery info, PR visibility, lane-plan context when available, and a recommended next action.
+
+`watch --mode observe --json` is read-only by default. Config-level `watch.notify` is ignored in observe mode unless the CLI explicitly passes `--notify`; guarded mode preserves the existing explicit/config notification behavior.
+
+PR visibility is normalized as `found`, `not-found`, `unknown-auth-missing`, `branch-pushed-no-pr`, or `query-failed` depending on cached PR metadata, GitHub auth, API lookup, and remote branch checks.
+
+Wave enqueue writes a best-effort lane-plan artifact after sync at `~/.local/share/hermes-tasklane/lane-plans/<wave_id>.json`. Artifacts include `schema_version`, wave/project/repo/base metadata, `artifact_status`, and per-lane issue numbers, branch, delivery group, task UIDs, job IDs, implementation job IDs, and final PR job ID. Missing or partial artifacts do not block enqueue; the enqueue result reports `written`, `partial`, `skipped`, or `failed`.
 
 ## What it does not replace
 
