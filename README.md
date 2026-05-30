@@ -90,6 +90,8 @@ Use `hermes-tasklane inspect <job-id>` when an operator needs detail for one job
 
 `watch --mode observe --json` is read-only by default. Config-level `watch.notify` is ignored in observe mode unless the CLI explicitly passes `--notify`; guarded mode preserves the existing explicit/config notification behavior.
 
+If `status`, `inspect`, or `watch` reports `derived_state: dead-claimant`, use `hermes-tasklane recover-dead-claims --dry-run --json` first to verify the claimant process is gone and the claim is older than the grace period. Re-run without `--dry-run` to move eligible dead-claim jobs from `running/` back to `ready/`; live claimants, recent claims, unknown claimant formats, and missing timestamps are left untouched for manual review.
+
 PR visibility is normalized as `found`, `not-found`, `unknown-auth-missing`, `branch-pushed-no-pr`, or `query-failed` depending on cached PR metadata, GitHub auth, API lookup, and remote branch checks.
 
 Wave enqueue writes a best-effort lane-plan artifact after sync at `~/.local/share/hermes-tasklane/lane-plans/<wave_id>.json`. Artifacts include `schema_version`, wave/project/repo/base metadata, `artifact_status`, and per-lane issue numbers, branch, delivery group, task UIDs, job IDs, implementation job IDs, and final PR job ID. Missing or partial artifacts do not block enqueue; the enqueue result reports `written`, `partial`, `skipped`, or `failed`.

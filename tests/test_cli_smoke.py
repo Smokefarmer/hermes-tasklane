@@ -2775,3 +2775,174 @@ def test_dashboard_job_detail_includes_event_log(tmp_path: Path) -> None:
 
     assert detail["job"]["id"] == "tasklane_detail"
     assert detail["events"][0]["event_type"] == "job_completed"
+
+
+def test_review_actionable_lines_skip_review_plan_before_findings() -> None:
+    payload = {
+        "result": {
+            "final_response": "\n".join(
+                [
+                    "TASKLANE_REVIEW_DECISION: needs-fix",
+                    "",
+                    "Review plan executed:",
+                    "1. Read AGENTS.md and project docs.",
+                    "2. Ran verification.",
+                    "",
+                    "Blocking finding:",
+                    "",
+                    "1. Datenschutzerklaerung acceptance criterion is still unmet while production Clarity can be enabled.",
+                    "   - The fix should update the relevant legal/privacy text before production activation is possible.",
+                    "",
+                    "Verification evidence:",
+                    "- typecheck passed.",
+                ]
+            )
+        }
+    }
+
+    assert cli.first_actionable_finding(payload) == "1. Datenschutzerklaerung acceptance criterion is still unmet while production Clarity can be enabled."
+    assert cli.review_blocker_classification(payload)["class"] == "concrete-fix"
+
+
+def test_review_blocker_classification_ignores_secret_scan_boilerplate() -> None:
+    payload = {
+        "result": {
+            "final_response": "\n".join(
+                [
+                    "TASKLANE_REVIEW_DECISION: needs-fix",
+                    "",
+                    "Findings:",
+                    "- The consent masking docs still omit the exact legal/privacy disclosure text and env-doc update required for PR #61.",
+                    "",
+                    "Security scan:",
+                    "- Secret scan was reviewed; no leaked secrets were found.",
+                    "",
+                    "Verification:",
+                    "- npm test passed.",
+                ]
+            )
+        }
+    }
+
+    assert cli.review_blocker_classification(payload)["class"] == "concrete-fix"
+    assert "consent masking docs" in (cli.first_actionable_finding(payload) or "")
+
+
+def test_review_blocker_classification_scope_narrowing_is_human_decision() -> None:
+    payload = {
+        "result": {
+            "final_response": "\n".join(
+                [
+                    "TASKLANE_REVIEW_DECISION: needs-fix",
+                    "Findings:",
+                    "1. Production activation acceptance criterion is not implemented.",
+                    "Expected fix:",
+                    "- Either update the relevant legal copy in an allowed scope, or",
+                    "- explicitly narrow this PR/task as staging/testable consent only and do not present it as completing ALV-33 production Clarity.",
+                ]
+            )
+        }
+    }
+
+    assert cli.review_blocker_classification(payload)["class"] == "needs-human"
+
+
+def test_review_blocker_classification_true_human_blockers() -> None:
+    findings = [
+        "- Missing API key for the staging payment provider.",
+        "- This requires manual approval before continuing.",
+        "- Missing product decision on whether to mask names or initials.",
+        "- Needs design decision for the public consent banner layout.",
+    ]
+    for finding in findings:
+        payload = {"result": {"final_response": f"TASKLANE_REVIEW_DECISION: needs-fix\nFindings:\n{finding}"}}
+        assert cli.review_blocker_classification(payload)["class"] == "needs-human"
+
+
+def test_recover_dead_running_claim_requires_gateway_pid(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    job = {"id": "tasklane_manual", "state": "running", "claimed_by": "worker-x", "claimed_at": "2000-01-01T00:00:00+00:00"}
+
+    action = cli.recover_dead_running_claim(cfg, job)
+
+    assert action["status"] == "manual-recovery-required"
+    assert action["reason"] == "claimed-by-not-gateway-pid"
+
+
+def test_recover_dead_running_claim_skips_recent_dead_claim(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    job = {
+        "id": "tasklane_recent",
+        "state": "running",
+        "claimed_by": "gateway-12345",
+        "claimed_at": cli.now_iso(),
+    }
+    write_job_record(hermes_home, "running", "tasklane_recent", job)
+    monkeypatch.setattr(cli, "process_is_alive", lambda pid: False)
+
+    action = cli.recover_dead_running_claim(cfg, job)
+
+    assert action["status"] == "skipped"
+    assert action["reason"] == "too-recent"
+    assert (hermes_home / "jobs" / "running" / "tasklane_recent.json").exists()
+
+
+def test_recover_dead_running_claim_requeues_old_dead_gateway_claim(tmp_path: Path, monkeypatch) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    write_job_record(
+        hermes_home,
+        "running",
+        "tasklane_dead",
+        {
+            "claimed_by": "gateway-12345",
+            "claimed_at": "2000-01-01T00:00:00+00:00",
+            "attempt": 1,
+            "spec": {"request": {"title": "dead"}, "repo": {"key": "repo:///tmp/demo"}},
+        },
+    )
+    monkeypatch.setattr(cli, "process_is_alive", lambda pid: False)
+
+    job = json.loads((hermes_home / "jobs" / "running" / "tasklane_dead.json").read_text(encoding="utf-8"))
+    action = cli.recover_dead_running_claim(cfg, job)
+
+    assert action["status"] == "dead-claim-requeued"
+    assert not (hermes_home / "jobs" / "running" / "tasklane_dead.json").exists()
+    ready = json.loads((hermes_home / "jobs" / "ready" / "tasklane_dead.json").read_text(encoding="utf-8"))
+    assert ready["state"] == "ready"
+    assert "claimed_by" not in ready
+    assert "claimed_at" not in ready
+    assert ready["metadata"]["watchdog_retry"]["reason"] == "dead-gateway-claimant"
+
+
+def test_recover_dead_claims_command_dry_run_leaves_job_running(tmp_path: Path, monkeypatch, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    write_job_record(
+        hermes_home,
+        "running",
+        "tasklane_dead",
+        {"claimed_by": "gateway-12345", "claimed_at": "2000-01-01T00:00:00+00:00"},
+    )
+    monkeypatch.setattr(cli, "process_is_alive", lambda pid: False)
+
+    exit_code = cli.command_recover_dead_claims(cfg, job_id=None, dry_run=True, json_output=True)
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert json.loads(captured.out)["actions"][0]["status"] == "would-requeue"
+    assert (hermes_home / "jobs" / "running" / "tasklane_dead.json").exists()

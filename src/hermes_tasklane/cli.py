@@ -59,19 +59,19 @@ STALE_WORKTREE_ERROR_PATTERNS = (
     "already checked out in another worktree",
 )
 REVIEW_HUMAN_DECISION_PATTERNS = (
-    "approval required",
-    "cannot proceed without",
-    "contract upgrade required",
-    "deployer",
-    "design decision",
-    "manual approval",
-    "missing api key",
-    "missing product decision",
-    "needs product decision",
-    "product decision",
-    "requires george",
-    "secret",
-    "what should",
+    r"\bmissing\s+(?:a\s+)?(?:secret|api[- ]?key|token|credential)\b",
+    r"\b(?:secret|api[- ]?key|token|credential)\s+(?:is|are|was)?\s*(?:missing|required|needed|not configured)\b",
+    r"\brequires?\s+(?:manual|human|operator|user)\s+approval\b",
+    r"\b(?:manual|human|operator|user)\s+approval\s+(?:required|needed)\b",
+    r"\bneeds?\s+(?:a\s+)?(?:product|design)\s+decision\b",
+    r"\bmissing\s+(?:product|design)\s+decision\b",
+    r"\brequires?\s+(?:product|design)\s+decision\b",
+    r"\bcontract\s+upgrade\s+(?:approval|required|needed)\b",
+    r"\bdeploy(?:er|ment)?\s+approval\s+(?:required|needed)\b",
+    r"\bcannot proceed without\s+(?:manual approval|human approval|api[- ]?key|secret|product decision|design decision)\b",
+    r"\bexplicitly narrow this pr/task\b",
+    r"\bdo not present it as completing\b",
+    r"\boutside this (?:job'?s |task'?s )?allowed .*scope\b",
 )
 REVIEW_EVIDENCE_ONLY_PATTERNS = (
     "diffstat",
@@ -82,6 +82,18 @@ REVIEW_EVIDENCE_ONLY_PATTERNS = (
     "test count",
     "verification command",
     "verification evidence",
+)
+REVIEW_CONCRETE_FIX_PATTERNS = (
+    "acceptance criterion",
+    "bug",
+    "contradictory",
+    "file:",
+    "line:",
+    "not enough",
+    "production activation",
+    "technically impossible",
+    "unmet",
+    "update the relevant",
 )
 UNSAFE_RETRY_ERROR_PATTERNS = (
     "invalid execution_mode",
@@ -2908,12 +2920,89 @@ def review_gate_decision(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def review_actionable_lines(text: str) -> list[str]:
+    lines = [line.strip() for line in str(text or "").splitlines()]
+    start = 0
+    for index, line in enumerate(lines):
+        if re.search(r"TASKLANE_REVIEW_DECISION:\s*needs-fix", line, flags=re.IGNORECASE):
+            start = index + 1
+            break
+    candidate_lines = lines[start:]
+    finding_lines: list[str] = []
+    in_findings = False
+    saw_findings_heading = False
+    stop_headings = (
+        "verification",
+        "security scan",
+        "secret scan",
+        "residual risk",
+        "residual risks",
+        "summary",
+        "notes",
+        "evidence",
+        "review plan",
+        "review plan executed",
+        "unresolved github",
+        "changed files",
+        "delivery",
+    )
+    finding_headings = (
+        "finding",
+        "findings",
+        "blocking finding",
+        "blocking findings",
+        "actionable finding",
+        "actionable findings",
+        "issues",
+        "required fix",
+        "required fixes",
+    )
+    for line in candidate_lines:
+        normalized = line.strip(":#* ").lower()
+        if not normalized:
+            if in_findings:
+                finding_lines.append("")
+            continue
+        is_heading = bool(re.match(r"^[A-Za-z][A-Za-z0-9 /_-]{1,60}:?$", line.strip("#* ")))
+        if is_heading and any(normalized.startswith(prefix) for prefix in stop_headings):
+            if saw_findings_heading:
+                break
+            in_findings = False
+            continue
+        if is_heading and any(normalized.startswith(prefix) for prefix in finding_headings):
+            if not saw_findings_heading:
+                finding_lines = []
+            in_findings = True
+            saw_findings_heading = True
+            continue
+        lowered = line.lower()
+        if "secret scan" in lowered or "security scan" in lowered:
+            continue
+        if in_findings:
+            finding_lines.append(line)
+            continue
+        if re.match(r"^[-*]\s+\S+", line) or re.match(r"^\d+[.)]\s+\S+", line):
+            finding_lines.append(line)
+            continue
+        if any(word in lowered for word in ("missing", "needs", "failed", "must", "should", "blocker")):
+            finding_lines.append(line)
+    return [line for line in finding_lines if line.strip()]
+
+
+def review_actionable_text(payload: dict[str, Any]) -> str:
+    lines = review_actionable_lines(result_text(payload))
+    return "\n".join(lines).strip()
+
+
 def review_blocker_classification(payload: dict[str, Any]) -> dict[str, str]:
     text = result_text(payload)
-    lowered = text.lower()
-    if any(pattern in lowered for pattern in REVIEW_HUMAN_DECISION_PATTERNS):
+    actionable_text = review_actionable_text(payload) or text
+    lowered = actionable_text.lower()
+    if any(re.search(pattern, lowered) for pattern in REVIEW_HUMAN_DECISION_PATTERNS):
         return {"class": "needs-human", "reason": "product-secret-deploy-decision"}
-    if any(pattern in lowered for pattern in REVIEW_EVIDENCE_ONLY_PATTERNS):
+    has_evidence_signal = any(pattern in lowered for pattern in REVIEW_EVIDENCE_ONLY_PATTERNS)
+    has_concrete_signal = any(pattern in lowered for pattern in REVIEW_CONCRETE_FIX_PATTERNS)
+    if has_evidence_signal and not has_concrete_signal:
         return {"class": "evidence-only", "reason": "verification-or-pr-evidence"}
     return {"class": "concrete-fix", "reason": "review-finding-is-actionable"}
 
@@ -4610,6 +4699,93 @@ def retry_failed_job(cfg: Config, job: dict[str, Any]) -> dict[str, Any]:
     return action
 
 
+def dead_claim_grace_minutes(cfg: Config, override: int | None = None) -> int:
+    if override is not None:
+        return max(0, int(override))
+    try:
+        return max(0, int(cfg.watch.get("dead_claim_grace_minutes", 10)))
+    except (TypeError, ValueError):
+        return 10
+
+
+def recover_dead_running_claim(
+    cfg: Config,
+    job: dict[str, Any],
+    *,
+    grace_minutes: int | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        return {"status": "manual-recovery-required", "reason": "missing-job-id"}
+    pid = claimant_pid(job)
+    if pid is None:
+        return {"job_id": job_id, "status": "manual-recovery-required", "reason": "claimed-by-not-gateway-pid"}
+    if process_is_alive(pid):
+        return {"job_id": job_id, "status": "skipped", "reason": "claimant-alive", "claimed_by": job.get("claimed_by")}
+    runtime = minutes_since(job.get("claimed_at"))
+    if runtime is None:
+        return {"job_id": job_id, "status": "manual-recovery-required", "reason": "missing-claimed-at", "claimed_by": job.get("claimed_by")}
+    grace = dead_claim_grace_minutes(cfg, grace_minutes)
+    if runtime < grace:
+        return {"job_id": job_id, "status": "skipped", "reason": "too-recent", "runtime_minutes": runtime, "grace_minutes": grace, "claimed_by": job.get("claimed_by")}
+    running_path = job_path(cfg, job_id, "running")
+    if not running_path.exists():
+        return {"job_id": job_id, "status": "skipped", "reason": "running-record-missing"}
+    ready_path = job_path(cfg, job_id, "ready")
+    if ready_path.exists():
+        return {"job_id": job_id, "status": "manual-recovery-required", "reason": "ready-record-already-exists", "from": str(running_path), "to": str(ready_path)}
+    payload = load_json(running_path)
+    if not isinstance(payload, dict):
+        return {"job_id": job_id, "status": "manual-recovery-required", "reason": "running-record-invalid", "from": str(running_path)}
+    if payload.get("state") != "running":
+        return {"job_id": job_id, "status": "skipped", "reason": "record-no-longer-running", "state": payload.get("state")}
+    fresh_pid = claimant_pid(payload)
+    if fresh_pid != pid:
+        return {"job_id": job_id, "status": "skipped", "reason": "claimant-changed", "claimed_by": payload.get("claimed_by")}
+    if process_is_alive(pid):
+        return {"job_id": job_id, "status": "skipped", "reason": "claimant-alive-after-reload", "claimed_by": payload.get("claimed_by")}
+    if dry_run:
+        return {
+            "job_id": job_id,
+            "status": "would-requeue",
+            "reason": "dead-gateway-claimant",
+            "runtime_minutes": runtime,
+            "claimed_by": payload.get("claimed_by"),
+            "from": str(running_path),
+            "to": str(ready_path),
+        }
+
+    previous_claimed_by = payload.get("claimed_by")
+    payload["state"] = "ready"
+    payload["updated_at"] = now_iso()
+    payload["last_error"] = "Requeued by Tasklane watchdog: previous gateway claimant process was dead."
+    payload.pop("claimed_at", None)
+    payload.pop("claimed_by", None)
+    metadata = dict(payload.get("metadata") or {})
+    metadata["watchdog_retry"] = {
+        "at": now_iso(),
+        "reason": "dead-gateway-claimant",
+        "claimed_by": previous_claimed_by,
+        "runtime_minutes": runtime,
+    }
+    payload["metadata"] = metadata
+    atomic_write_json(ready_path, payload)
+    running_path.unlink()
+    append_jsonl(
+        job_event_log_path(cfg, job_id),
+        {
+            "timestamp": now_iso(),
+            "job_id": job_id,
+            "event_type": "job_state_changed",
+            "state": "ready",
+            "reason": "tasklane-watchdog-dead-claimant",
+            "metadata": {"claimed_by": previous_claimed_by, "pid": pid, "runtime_minutes": runtime},
+        },
+    )
+    return {"job_id": job_id, "status": "dead-claim-requeued", "reason": "dead-gateway-claimant", "from": str(running_path), "to": str(ready_path), "claimed_by": previous_claimed_by, "runtime_minutes": runtime}
+
+
 def job_repo_path(job: dict[str, Any]) -> Path | None:
     spec = job.get("spec") or {}
     repo = spec.get("repo") or {}
@@ -4702,7 +4878,8 @@ def compact_message_line(text: str, *, limit: int = 170) -> str:
 def first_actionable_finding(job: dict[str, Any] | None) -> str | None:
     if not isinstance(job, dict):
         return None
-    for raw in result_text(job).splitlines():
+    actionable = review_actionable_lines(result_text(job))
+    for raw in actionable or result_text(job).splitlines():
         line = raw.strip()
         if not line:
             continue
@@ -5345,6 +5522,33 @@ def command_inspect(cfg: Config, job_id: str, *, json_output: bool, events_limit
     return 0
 
 
+def command_recover_dead_claims(
+    cfg: Config,
+    *,
+    job_id: str | None,
+    dry_run: bool,
+    json_output: bool,
+    grace_minutes: int | None = None,
+) -> int:
+    ensure_layout(cfg)
+    jobs = iter_job_records(cfg, {"running"})
+    if job_id:
+        jobs = [job for job in jobs if str(job.get("id") or "") == job_id]
+    actions = [recover_dead_running_claim(cfg, job, grace_minutes=grace_minutes, dry_run=dry_run) for job in jobs]
+    if job_id and not actions:
+        actions.append({"job_id": job_id, "status": "skipped", "reason": "running-job-not-found"})
+    report = {"dry_run": dry_run, "actions": actions}
+    if json_output:
+        print(json.dumps(report, indent=2))
+    else:
+        if not actions:
+            print("No running dead-claim candidates found.")
+        for action in actions:
+            job_label = action.get("job_id") or "(unknown job)"
+            print(f"{job_label}: {action.get('status')} ({action.get('reason')})")
+    return 0
+
+
 def command_watch(
     cfg: Config,
     *,
@@ -5597,6 +5801,11 @@ def build_parser() -> argparse.ArgumentParser:
     salvage.add_argument("job_id", help="Failed Hermes job ID to inspect or salvage")
     salvage.add_argument("--verify", action="store_true", help="Run configured verification commands without committing or pushing")
     salvage.add_argument("--auto", action="store_true", help="Run verification, commit, push, open PR, and mark the task completed when safe")
+    recover_dead = sub.add_parser("recover-dead-claims", help="Requeue running jobs whose gateway claimant process is dead")
+    recover_dead.add_argument("job_id", nargs="?", help="Limit recovery to one running job ID")
+    recover_dead.add_argument("--dry-run", action="store_true", help="Report what would be requeued without moving job files")
+    recover_dead.add_argument("--grace-minutes", type=int, help="Minimum age before a dead claim is eligible for recovery")
+    recover_dead.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     watch = sub.add_parser("watch", help="Review queue health and optionally apply guarded recovery")
     watch.add_argument("--mode", choices=["observe", "guarded"], default=None, help="observe reports only; guarded retries narrowly safe transient failures")
     watch.add_argument("--stale-minutes", type=int, help="Warn when a running job exceeds this age")
@@ -5617,6 +5826,8 @@ def command_requires_lock(args: argparse.Namespace, cfg: Config) -> bool:
         return True
     if args.command == "salvage":
         return bool(getattr(args, "auto", False))
+    if args.command == "recover-dead-claims":
+        return not bool(getattr(args, "dry_run", False))
     if args.command == "watch":
         mode = getattr(args, "mode", None) or str(cfg.watch.get("mode") or "observe")
         return mode == "guarded"
@@ -5677,6 +5888,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
             if args.command == "salvage":
                 return command_salvage(cfg, args.job_id, auto=args.auto, verify=args.verify)
+            if args.command == "recover-dead-claims":
+                return command_recover_dead_claims(
+                    cfg,
+                    job_id=args.job_id,
+                    dry_run=args.dry_run,
+                    json_output=args.json,
+                    grace_minutes=args.grace_minutes,
+                )
             if args.command == "watch":
                 mode = args.mode or str(cfg.watch.get("mode") or "observe")
                 if mode not in {"observe", "guarded"}:
