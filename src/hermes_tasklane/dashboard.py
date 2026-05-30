@@ -136,14 +136,14 @@ def session_activity(cfg: cli.Config, job_id: str) -> dict[str, Any] | None:
     }
 
 
-def current_run_summary(cfg: cli.Config, job: dict[str, Any]) -> dict[str, Any]:
+def current_run_summary(cfg: cli.Config, job: dict[str, Any], *, completed_ids: set[str] | None = None) -> dict[str, Any]:
     job_id = str(job.get("id") or "")
     spec = job.get("spec") or {}
     branch = spec.get("branch") or {}
     events = read_job_events(cfg, job_id, limit=8)
     workspace_event = next((event for event in reversed(events) if event.get("event_type") == "job_workspace_prepared"), None)
     workspace_meta = workspace_event.get("metadata") if isinstance(workspace_event, dict) else {}
-    compact = cli.compact_job(job)
+    compact = cli.compact_job(job, completed_ids=completed_ids)
     compact.update(
         {
             "claimed_at": job.get("claimed_at"),
@@ -240,9 +240,9 @@ def dashboard_state(cfg: cli.Config) -> dict[str, Any]:
         if state == "ready":
             missing = cli.waiting_dependencies(job, completed)
             if missing:
-                jobs_by_state["waiting"].append(cli.compact_job(job, state="waiting", waiting_for=missing))
+                jobs_by_state["waiting"].append(cli.compact_job(job, state="waiting", waiting_for=missing, completed_ids=completed))
                 continue
-        jobs_by_state.setdefault(state, []).append(cli.compact_job(job))
+        jobs_by_state.setdefault(state, []).append(cli.compact_job(job, completed_ids=completed))
     for records in jobs_by_state.values():
         records.sort(key=lambda item: str(item.get("id") or ""))
     return {
@@ -250,7 +250,7 @@ def dashboard_state(cfg: cli.Config) -> dict[str, Any]:
         "refresh_seconds": REFRESH_SECONDS,
         "watch": watch,
         "jobs": jobs_by_state,
-        "current_runs": [current_run_summary(cfg, job) for job in jobs if job.get("state") == "running"],
+        "current_runs": [current_run_summary(cfg, job, completed_ids=completed) for job in jobs if job.get("state") == "running"],
         "resources": server_resources(cfg),
         "totals": watch.get("counts") or {},
         "tasklane": {

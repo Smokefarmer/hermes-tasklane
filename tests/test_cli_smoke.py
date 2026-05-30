@@ -2620,6 +2620,51 @@ def test_dashboard_exposes_dependency_waiting_jobs(tmp_path: Path) -> None:
     assert state["jobs"]["waiting"][0]["waiting_for"] == ["tasklane_base"]
 
 
+def test_dashboard_preserves_completed_dependency_context_for_ready_jobs(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+
+    write_job_record(
+        hermes_home,
+        "completed",
+        "tasklane_base",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "base work"},
+                "branch": {"mode": "new-branch", "base_branch": "main"},
+            },
+        },
+    )
+    write_job_record(
+        hermes_home,
+        "ready",
+        "tasklane_final",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": "repo:///repo/demo"},
+                "request": {"title": "final PR"},
+                "branch": {"mode": "existing-branch", "base_branch": "main"},
+                "dependencies": ["tasklane_base"],
+            },
+        },
+    )
+
+    state = dashboard_state(cfg)
+    ready = state["jobs"]["ready"][0]
+
+    assert ready["id"] == "tasklane_final"
+    assert ready["derived_state"] == "ready"
+    assert ready["waiting_for"] == []
+    assert ready["recovery_blocked_reason"] is None
+
+
 def test_dashboard_exposes_needs_human_verification_summary(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"
