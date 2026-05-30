@@ -207,6 +207,7 @@ def test_observe_json_ignores_config_notify_without_cli_notify(tmp_path: Path, m
     capsys.readouterr()
     write_job_record(hermes_home, "blocked", "blocked1", {"spec": {"project": "Demo", "request": {"title": "blocked"}}})
     sent: list[dict] = []
+    monkeypatch.setattr(cli, "systemd_gateway_status", lambda: {"available": False, "state": "unchecked", "ok": None})
     monkeypatch.setattr(cli, "maybe_send_tasklane_notification", lambda *a, **k: sent.append(k) or {"status": "sent"})
 
     rc = cli.main(["--config", str(config_path), "watch", "--mode", "observe", "--json"])
@@ -219,6 +220,37 @@ def test_observe_json_ignores_config_notify_without_cli_notify(tmp_path: Path, m
     rc = cli.main(["--config", str(config_path), "watch", "--mode", "observe", "--json", "--notify"])
     assert rc == 0
     assert sent
+
+
+def test_watch_problem_job_preserves_completed_dependency_context(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    cfg = cli.Config(
+        hermes_home,
+        task_root,
+        True,
+        1,
+        None,
+        None,
+        None,
+        None,
+        {"expected_base_branches": {"Demo": "develop"}},
+        {},
+        {},
+    )
+    cli.ensure_layout(cfg)
+    repo = tmp_path / "repo"
+    write_job_record(hermes_home, "completed", "dep", demo_job(repo, title="dependency"))
+    ready_job = demo_job(repo, title="ready with completed dependency", deps=["dep"])
+    ready_job["spec"]["branch"]["base_branch"] = "main"
+    write_job_record(hermes_home, "ready", "ready1", ready_job)
+
+    report = cli.build_watch_report(cfg, check_gateway=False)
+
+    assert report["ready"][0]["derived_state"] == "ready"
+    problem = next(item for item in report["problems"] if item["code"] == "base-branch-mismatch")
+    assert problem["job"]["derived_state"] == "ready"
+    assert problem["job"]["waiting_for"] == []
 
 
 def test_pr_visibility_distinguishes_auth_missing_branch_no_pr_and_found(tmp_path: Path, monkeypatch) -> None:

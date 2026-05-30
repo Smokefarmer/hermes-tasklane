@@ -3879,10 +3879,18 @@ def watch_ignored_blocked_jobs(cfg: Config, overrides: list[str] | None = None) 
     return ignored
 
 
-def add_watch_problem(problems: list[dict[str, Any]], severity: str, code: str, message: str, job: dict[str, Any] | None = None) -> None:
+def add_watch_problem(
+    problems: list[dict[str, Any]],
+    severity: str,
+    code: str,
+    message: str,
+    job: dict[str, Any] | None = None,
+    *,
+    completed_ids: set[str] | None = None,
+) -> None:
     entry: dict[str, Any] = {"severity": severity, "code": code, "message": message}
     if job:
-        entry["job"] = compact_job(job)
+        entry["job"] = compact_job(job, completed_ids=completed_ids)
     problems.append(entry)
 
 
@@ -4859,37 +4867,37 @@ def build_watch_report(
     for job in running:
         runtime = minutes_since(job.get("claimed_at"))
         if runtime is None:
-            add_watch_problem(problems, "warning", "running-missing-claimed-at", "running job has no claimed_at timestamp", job)
+            add_watch_problem(problems, "warning", "running-missing-claimed-at", "running job has no claimed_at timestamp", job, completed_ids=completed)
         elif runtime > stale_after:
-            add_watch_problem(problems, "warning", "running-stale", f"running job has exceeded {stale_after} minutes", job)
+            add_watch_problem(problems, "warning", "running-stale", f"running job has exceeded {stale_after} minutes", job, completed_ids=completed)
         pid = claimant_pid(job)
         if pid is not None and not process_is_alive(pid):
-            add_watch_problem(problems, "critical", "running-dead-claimant", f"claimed gateway process {pid} is not alive", job)
+            add_watch_problem(problems, "critical", "running-dead-claimant", f"claimed gateway process {pid} is not alive", job, completed_ids=completed)
     active_blocked: list[dict[str, Any]] = []
     ignored_blocked_jobs: list[dict[str, Any]] = []
     for job in blocked:
         job_id = str(job.get("id") or "")
         if job_id in ignored:
             ignored_blocked_jobs.append(job)
-            notices.append({"code": "blocked-ignored", "job": compact_job(job)})
+            notices.append({"code": "blocked-ignored", "job": compact_job(job, completed_ids=completed)})
             continue
         active_blocked.append(job)
-        add_watch_problem(problems, "warning", "job-blocked", "job is blocked and needs review", job)
+        add_watch_problem(problems, "warning", "job-blocked", "job is blocked and needs review", job, completed_ids=completed)
     by_state["blocked"] = len(active_blocked)
     for job in needs_human:
-        add_watch_problem(problems, "warning", "job-needs-human", "job is waiting for human input", job)
+        add_watch_problem(problems, "warning", "job-needs-human", "job is waiting for human input", job, completed_ids=completed)
     for job in failed:
         classification = classify_failed_job(cfg, job, max_attempts)
         kind = classification.get("classification")
         if kind == "salvage-needed":
-            add_watch_problem(problems, "warning", "salvage-needed", "job failed after producing worktree changes; salvage instead of retry", job)
-            notices.append({"code": "salvage-needed", "job": compact_job(job), "inspection": classification.get("inspection")})
+            add_watch_problem(problems, "warning", "salvage-needed", "job failed after producing worktree changes; salvage instead of retry", job, completed_ids=completed)
+            notices.append({"code": "salvage-needed", "job": compact_job(job, completed_ids=completed), "inspection": classification.get("inspection")})
         elif kind == "retryable-clean":
-            add_watch_problem(problems, "warning", "job-retryable", "job failed with a clean transient error and can be retried", job)
+            add_watch_problem(problems, "warning", "job-retryable", "job failed with a clean transient error and can be retried", job, completed_ids=completed)
         elif kind == "needs-human":
-            add_watch_problem(problems, "warning", "salvage-needs-human", str(classification.get("reason") or "dirty failed job needs review"), job)
+            add_watch_problem(problems, "warning", "salvage-needs-human", str(classification.get("reason") or "dirty failed job needs review"), job, completed_ids=completed)
         else:
-            add_watch_problem(problems, "warning", "job-failed", "job failed and was not automatically retried", job)
+            add_watch_problem(problems, "warning", "job-failed", "job failed and was not automatically retried", job, completed_ids=completed)
     gate_attention = submitted_gate_attention(cfg)
     if gate_attention:
         by_state["needs-human"] = by_state.get("needs-human", 0) + len(gate_attention)
@@ -4901,6 +4909,7 @@ def build_watch_report(
                 f"{gate.get('gate')}-gate-needs-human",
                 f"submitted Tasklane {gate.get('gate')} gate needs human action: {gate.get('reason')}",
                 {"id": gate.get("job_id"), "state": "needs-human", "spec": {"project": gate.get("task_uid"), "request": {"title": gate.get("source_path")}}},
+                completed_ids=completed,
             )
     notify_config = notification_config(cfg)
     if bool_from_any(cfg.watch.get("require_notifications"), default=False) and not notify_config.get("configured"):
@@ -4920,9 +4929,9 @@ def build_watch_report(
         branch_mode = branch.get("mode")
         delivery_mode = spec.get("delivery_mode")
         if base_branch and base_branch != expected_branch:
-            add_watch_problem(problems, "warning", "base-branch-mismatch", f"expected base branch {expected_branch!r}, got {base_branch!r}", job)
+            add_watch_problem(problems, "warning", "base-branch-mismatch", f"expected base branch {expected_branch!r}, got {base_branch!r}", job, completed_ids=completed)
         elif not base_branch and (branch_mode in {"new-branch", "detached-review"} or delivery_mode == "pull-request"):
-            add_watch_problem(problems, "warning", "base-branch-missing", f"expected base branch {expected_branch!r}, but job has no base_branch", job)
+            add_watch_problem(problems, "warning", "base-branch-missing", f"expected base branch {expected_branch!r}, but job has no base_branch", job, completed_ids=completed)
     health = "critical" if any(item["severity"] == "critical" for item in problems) else "warning" if problems else "ok"
     report = {
         "timestamp": now_iso(),
