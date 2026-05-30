@@ -262,11 +262,7 @@ def dashboard_state(cfg: cli.Config) -> dict[str, Any]:
 
 
 def job_detail(cfg: cli.Config, job_id: str) -> dict[str, Any]:
-    payload = cli.find_job_record(cfg, job_id)
-    if not isinstance(payload, dict):
-        raise KeyError(job_id)
-    events = read_job_events(cfg, job_id)
-    return {"job": payload, "events": events}
+    return cli.build_job_inspection(cfg, job_id, events_limit=25)
 
 
 def format_age(timestamp: str | None) -> str:

@@ -43,17 +43,27 @@ Always inspect and reconcile before queueing new work:
 
 ```bash
 hermes-tasklane status
+hermes-tasklane inspect <job-id> --json
 hermes-tasklane watch --mode guarded --json
 hermes-tasklane reconcile
 ```
 
 Interpretation:
 
-- `active_jobs`: ready/running jobs that Hermes may claim or is already running.
-- `waiting_jobs`: dependency chain is not complete yet.
+- `active_jobs`: ready/running jobs that Hermes may claim or is already running. Items include `derived_state`, claimant, runtime, watchdog, and PR summary fields.
+- `waiting_jobs`: dependency chain is not complete yet. Inspect `waiting_for` or run `hermes-tasklane inspect <job-id>` for dependency detail.
 - `blocked_jobs`: Tasklane or Hermes needs recovery. Run guarded watch before manual action.
 - `gate_attention`: review or merge gates that require either a fix, a merge decision, or human input.
 - `failed`: failures that were not safely salvaged.
+
+
+## Inspecting One Job
+
+Use `hermes-tasklane inspect <job-id>` for an operator drill-down. It is read-only and does not require the Tasklane lock. Human output is the default; add `--json` for automation and `--events N` to change the recent event count.
+
+The inspection report combines the same shared liveness summary used by `status`, `watch`, and the dashboard with dependency rows, recent events, branch and delivery details, normalized PR visibility, lane-plan context, and a recommended next action. Treat watchdog retry metadata on ready/running jobs as historical context, not as proof of an active failure.
+
+Derived states you will see include `running-alive`, `dead-claimant`, `running-unknown-claimant`, `waiting-on-dependency`, `ready`, `blocked`, `needs-human`, `failed`, `completed`, and `unknown`.
 
 ## When To Queue A Wave
 
@@ -80,6 +90,9 @@ The wave runner should tell you:
 - blocked/deferred issues and why
 - whether new work may start
 - PRs needing review/fix/merge attention
+
+
+After a successful enqueue, Tasklane also writes a best-effort lane-plan artifact under `~/.local/share/hermes-tasklane/lane-plans/<wave_id>.json`. Use it to map lane IDs and delivery groups back to branches, issue numbers, task UIDs, implementation job IDs, and final PR job IDs. A `partial` or `failed` artifact status is an operator visibility warning, not an enqueue blocker.
 
 ## Wave Design Rules
 

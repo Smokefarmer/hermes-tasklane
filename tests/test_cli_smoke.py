@@ -108,6 +108,184 @@ def stub_wave_github(monkeypatch, *, issues: list[dict], prs: list[dict] | None 
     monkeypatch.setattr(cli, "github_open_issues", lambda owner, repo, limit: issues[:limit])
 
 
+
+
+def demo_job(repo: Path, *, title: str = "demo", deps: list[str] | None = None) -> dict:
+    return {
+        "spec": {
+            "project": "Demo",
+            "repo": {"key": f"repo://{repo}", "path": str(repo)},
+            "request": {"title": title, "body": "Implement demo."},
+            "branch": {"mode": "new-branch", "base_branch": "main", "work_branch": "tasklane/demo", "pr_target": "main"},
+            "delivery_mode": "pull-request",
+            "dependencies": deps or [],
+        }
+    }
+
+
+def test_job_liveness_summary_classifies_claimants_and_dependencies(tmp_path: Path) -> None:
+    live = cli.job_liveness_summary(
+        {"id": "run1", "state": "running", "claimed_by": "gateway-123", "claimed_at": "2026-05-30T10:00:00+00:00"},
+        now=cli.datetime.fromisoformat("2026-05-30T10:02:00+00:00"),
+        process_alive=lambda pid: True,
+    )
+    assert live["derived_state"] == "running-alive"
+    assert live["claimant_pid"] == 123
+    assert live["claimant_alive"] is True
+    assert live["runtime_seconds"] == 120
+
+    dead = cli.job_liveness_summary({"id": "run2", "state": "running", "claimed_by": "gateway-999"}, process_alive=lambda pid: False)
+    assert dead["derived_state"] == "dead-claimant"
+    assert dead["recovery_eligible"] is True
+
+    unknown = cli.job_liveness_summary({"id": "run3", "state": "running", "claimed_by": "worker-x"})
+    assert unknown["derived_state"] == "running-unknown-claimant"
+
+    waiting = cli.job_liveness_summary({"id": "ready1", "state": "ready", "spec": {"dependencies": ["dep1"]}}, completed_ids=set())
+    assert waiting["derived_state"] == "waiting-on-dependency"
+    assert waiting["waiting_for"] == ["dep1"]
+
+    retried = cli.job_liveness_summary({"id": "ready2", "state": "ready", "last_error": "old watchdog error", "metadata": {"watchdog_retry": {"at": "now", "reason": "safe-transient-failure"}}})
+    assert retried["derived_state"] == "ready"
+    assert retried["last_error"] is None
+    assert retried["historical_last_error"] == "old watchdog error"
+    assert retried["last_watchdog_action"]["reason"] == "safe-transient-failure"
+
+
+def test_status_watch_inspect_and_dashboard_include_liveness(tmp_path: Path, monkeypatch, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    write_job_record(hermes_home, "ready", "dep_job", demo_job(repo, title="dep"))
+    write_job_record(hermes_home, "ready", "wait_job", demo_job(repo, title="waiting", deps=["dep_job"]))
+    write_job_record(hermes_home, "running", "run_job", {**demo_job(repo, title="running"), "claimed_by": "gateway-555", "claimed_at": "2026-05-30T10:00:00+00:00"})
+    monkeypatch.setattr(cli, "process_is_alive", lambda pid: True)
+
+    cli.command_status(cfg)
+    status = json.loads(capsys.readouterr().out)
+    active = {item["id"]: item for item in status["active_jobs"]}
+    waiting = {item["id"]: item for item in status["waiting_jobs"]}
+    assert active["run_job"]["derived_state"] == "running-alive"
+    assert waiting["wait_job"]["derived_state"] == "waiting-on-dependency"
+    assert waiting["wait_job"]["waiting_for"] == ["dep_job"]
+
+    ready_after_dep = cli.operator_job_summary(
+        {**demo_job(repo, title="ready", deps=["dep_job"]), "id": "ready_after_dep", "state": "ready"},
+        completed_ids={"dep_job"},
+    )
+    assert ready_after_dep["derived_state"] == "ready"
+    assert ready_after_dep["waiting_for"] == []
+
+    watch = cli.build_watch_report(cfg, check_gateway=False)
+    assert watch["running"][0]["derived_state"] == "running-alive"
+    assert watch["waiting"][0]["derived_state"] == "waiting-on-dependency"
+
+    inspection = cli.build_job_inspection(cfg, "wait_job")
+    assert inspection["liveness"]["derived_state"] == "waiting-on-dependency"
+    assert inspection["dependencies"][0]["job_id"] == "dep_job"
+    assert "Wait for dependency" in inspection["recommended_action"]
+
+    detail = job_detail(cfg, "wait_job")
+    assert detail["liveness"]["derived_state"] == "waiting-on-dependency"
+    dashboard = dashboard_state(cfg)
+    assert dashboard["jobs"]["waiting"][0]["derived_state"] == "waiting-on-dependency"
+
+
+def test_observe_json_ignores_config_notify_without_cli_notify(tmp_path: Path, monkeypatch, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"hermes_home": str(hermes_home), "task_root": str(task_root), "watch": {"notify": True}}), encoding="utf-8")
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+    write_job_record(hermes_home, "blocked", "blocked1", {"spec": {"project": "Demo", "request": {"title": "blocked"}}})
+    sent: list[dict] = []
+    monkeypatch.setattr(cli, "maybe_send_tasklane_notification", lambda *a, **k: sent.append(k) or {"status": "sent"})
+
+    rc = cli.main(["--config", str(config_path), "watch", "--mode", "observe", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["health"] == "warning"
+    assert sent == []
+    assert not (task_root / "notification-state.json").exists()
+
+    rc = cli.main(["--config", str(config_path), "watch", "--mode", "observe", "--json", "--notify"])
+    assert rc == 0
+    assert sent
+
+
+def test_pr_visibility_distinguishes_auth_missing_branch_no_pr_and_found(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = cli.Config(tmp_path / "hermes", tmp_path / "tasklane", True, 1, None, None, None, None, {}, {}, {})
+    job = {"id": "job1", "state": "completed", **demo_job(repo)}
+    monkeypatch.setattr(cli, "git_remote_for_repo", lambda path: ("example", "demo"))
+    monkeypatch.setattr(cli, "remote_branch_exists", lambda path, branch: (True, None))
+    monkeypatch.setattr(cli, "github_auth_header", lambda: None)
+    assert cli.pr_visibility_status(cfg, job)["status"] == "unknown-auth-missing"
+
+    monkeypatch.setattr(cli, "github_auth_header", lambda: "token x")
+    monkeypatch.setattr(cli, "find_pr", lambda owner, repo_name, branch: None)
+    assert cli.pr_visibility_status(cfg, job)["status"] == "branch-pushed-no-pr"
+
+    monkeypatch.setattr(cli, "find_pr", lambda owner, repo_name, branch: {"number": 7, "url": "https://github.com/example/demo/pull/7", "branch": branch, "base_branch": "main"})
+    found = cli.pr_visibility_status(cfg, job)
+    assert found["status"] == "found"
+    assert found["number"] == 7
+
+
+def test_plan_wave_enqueue_writes_lane_plan_artifact(tmp_path: Path, monkeypatch, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stub_wave_github(monkeypatch, issues=[wave_issue(41, "Client UI polish", "`apps/client/src/App.tsx`")], prs=[])
+    monkeypatch.setattr(cli, "github_merged_prs_for_issue", lambda owner, repo_name, issue: [])
+
+    rc = cli.command_plan_wave(
+        cfg,
+        repo_path=repo,
+        project="Demo",
+        base_branch="development",
+        max_active_prs=None,
+        branch_prefix=None,
+        issue_limit=None,
+        issue_scan_limit=None,
+        max_lanes=None,
+        issue_includes=None,
+        issue_excludes=None,
+        issue_labels_any=None,
+        issue_labels_all=None,
+        issue_milestone=None,
+        enqueue=True,
+        json_output=True,
+    )
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    lane_plan = report["enqueue_result"]["lane_plan"]
+    assert lane_plan["status"] == "written"
+    artifact = json.loads(Path(lane_plan["path"]).read_text(encoding="utf-8"))
+    assert artifact["schema_version"] == 1
+    assert artifact["wave_id"] == report["enqueue_result"]["wave_id"]
+    assert artifact["artifact_status"] == "complete"
+    lane = artifact["lanes"][0]
+    assert lane["issue_numbers"] == [41]
+    assert lane["implementation_job_ids"]
+    assert lane["final_pr_job_id"]
+
+
 def test_init_writes_example_outside_inbox(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"
