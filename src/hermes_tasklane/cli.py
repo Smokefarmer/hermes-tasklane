@@ -3159,7 +3159,17 @@ def github_pr_reference_from_job(job: dict[str, Any]) -> dict[str, Any] | None:
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
     delivery = result.get("delivery_validation") if isinstance(result.get("delivery_validation"), dict) else {}
     pr = delivery.get("pr") if isinstance(delivery.get("pr"), dict) else {}
-    text = "\n".join(str(value or "") for value in (pr.get("url"), result.get("final_response"), result.get("summary"), result.get("output")))
+    text = "\n".join(
+        str(value or "")
+        for value in (
+            pr.get("url"),
+            result.get("pr_url"),
+            result.get("pull_request_url"),
+            result.get("final_response"),
+            result.get("summary"),
+            result.get("output"),
+        )
+    )
     match = re.search(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)", text)
     if not match:
         return None

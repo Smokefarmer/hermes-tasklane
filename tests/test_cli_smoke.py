@@ -1085,9 +1085,7 @@ def test_reconcile_finalizes_review_gate_task_when_pr_already_merged(tmp_path: P
                 "delivery_mode": "pull-request",
             },
             "result": {
-                "delivery_validation": {
-                    "pr": {"number": 43, "url": "https://github.com/example/demo/pull/43"},
-                }
+                "pr_url": "https://github.com/example/demo/pull/43",
             },
         },
     )
