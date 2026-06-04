@@ -3570,6 +3570,15 @@ def command_reconcile(cfg: Config) -> int:
                     continue
                 gate = dict(entry.get("review_gate") or {})
                 if gate.get("enabled"):
+                    if gate.get("status") != "passed":
+                        manual_merge = github_pr_merge_status_from_job(job_payload)
+                        if manual_merge.get("status") == "merged":
+                            result = dict(job_payload.get("result") or {})
+                            result["review_gate"] = gate
+                            result["manual_merge"] = manual_merge
+                            finalize_submitted_task(cfg, task_uid, entry, cfg.completed_dir, {"job_id": job_id, "state": job_state, "result": result})
+                            actions.append({"task_uid": task_uid, "status": "completed-manual-merge-detected", "job_id": job_id, "review_gate": gate, "pr": manual_merge})
+                            continue
                     if gate.get("status") == "passed":
                         merge_gate = dict(entry.get("merge_gate") or {})
                         if merge_gate.get("enabled") and merge_gate.get("status") != "merged":

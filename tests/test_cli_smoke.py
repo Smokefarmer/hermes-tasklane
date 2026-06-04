@@ -1045,6 +1045,75 @@ def test_reconcile_finalizes_manual_merged_tasklane_pr(tmp_path: Path, monkeypat
     assert result["result"]["merge_gate"]["reason"] == "manual-merge-detected"
 
 
+def test_reconcile_finalizes_review_gate_task_when_pr_already_merged(tmp_path: Path, monkeypatch, capsys) -> None:
+    hermes_home = tmp_path / "hermes"
+    task_root = tmp_path / "tasklane"
+    config_path = tmp_path / "config.json"
+    write_config(config_path, hermes_home=hermes_home, task_root=task_root)
+    cfg = load_config(str(config_path))
+    command_init(cfg, str(config_path))
+    capsys.readouterr()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    submitted_task = task_root / "submitted" / "stale.md"
+    submitted_task.parent.mkdir(parents=True, exist_ok=True)
+    submitted_task.write_text("stale task\n", encoding="utf-8")
+    cli.save_state(
+        cfg,
+        {
+            "submitted": {
+                "wave-demo-stale": {
+                    "source_path": str(submitted_task),
+                    "job_id": "tasklane_root",
+                    "run_id": "tasklane_root",
+                    "repo_key": f"repo://{repo}",
+                    "review_gate": {"enabled": True, "status": "needs-human", "reason": "max-review-loops-reached"},
+                }
+            }
+        },
+    )
+    write_job_record(
+        hermes_home,
+        "completed",
+        "tasklane_root",
+        {
+            "spec": {
+                "project": "Demo",
+                "repo": {"key": f"repo://{repo}", "path": str(repo)},
+                "request": {"title": "Demo Final PR"},
+                "branch": {"base_branch": "development", "work_branch": "tasklane/demo"},
+                "delivery_mode": "pull-request",
+            },
+            "result": {
+                "delivery_validation": {
+                    "pr": {"number": 43, "url": "https://github.com/example/demo/pull/43"},
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "github_pull_request",
+        lambda owner, repo_name, number: {
+            "number": number,
+            "state": "closed",
+            "merged_at": "2026-05-10T08:00:00Z",
+            "html_url": f"https://github.com/{owner}/{repo_name}/pull/{number}",
+            "draft": False,
+        },
+    )
+
+    command_reconcile(cfg)
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["actions"][0]["status"] == "completed-manual-merge-detected"
+    assert output["actions"][0]["pr"]["number"] == 43
+    assert not load_state(cfg)["submitted"]
+    result = json.loads((task_root / "completed" / "stale.md.result.json").read_text(encoding="utf-8"))
+    assert result["result"]["manual_merge"]["merged_at"] == "2026-05-10T08:00:00Z"
+    assert result["result"]["review_gate"]["status"] == "needs-human"
+
+
 def test_wave_runner_enqueues_when_project_has_free_slots(tmp_path: Path, monkeypatch, capsys) -> None:
     hermes_home = tmp_path / "hermes"
     task_root = tmp_path / "tasklane"
