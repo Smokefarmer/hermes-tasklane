@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from tasklane.config import Config, load_config
+from tasklane.metrics import merge_metrics, run_metrics, spend_last_24h
 from tasklane.paths import logs_root
 from tasklane.reconcile import backoff_not_before, reconcile
 from tasklane.runner import run_claude_cli_job
@@ -89,7 +90,8 @@ def _repair_prompt(record: Dict[str, Any], validation: Dict[str, Any], final_res
     ])
 
 
-def _fail_or_requeue(store: JobStore, cfg: Config, job_id: str, *, reason: str) -> str:
+def _fail_or_requeue(store: JobStore, cfg: Config, job_id: str, *, reason: str,
+                     metrics: Dict[str, Any] | None = None) -> str:
     """Auto-retry a transient failure with backoff, or park it in blocked at the attempt cap.
 
     The record is re-read so the attempt count reflects any transition that
@@ -104,9 +106,10 @@ def _fail_or_requeue(store: JobStore, cfg: Config, job_id: str, *, reason: str) 
         not_before = backoff_not_before(cfg, attempt)
         store.append_event(job_id, "job_auto_retry_scheduled", state="running", reason=reason,
                            metadata={"attempt": attempt, "max_attempts": cfg.max_attempts, "not_before": not_before})
-        store.requeue(job_id, reason="auto-retry-scheduled", not_before=not_before, last_error=reason)
+        store.requeue(job_id, reason="auto-retry-scheduled", not_before=not_before, last_error=reason, metrics=metrics)
         return "requeued"
-    store.fail(job_id, reason=f"{reason} (attempt cap reached: {attempt}/{cfg.max_attempts})", run_id=job_id, retryable=True)
+    store.fail(job_id, reason=f"{reason} (attempt cap reached: {attempt}/{cfg.max_attempts})",
+               run_id=job_id, retryable=True, metrics=metrics)
     return "blocked"
 
 
@@ -115,6 +118,15 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
     job_id = str(record.get("id") or "")
     store.append_event(job_id, "job_agent_started", state="running", reason="worker-started")
     worktree_info: Dict[str, Any] | None = None
+    started_at = datetime.now(timezone.utc)
+    collected_runs: list[Dict[str, Any]] = []
+
+    def _job_metrics() -> Dict[str, Any]:
+        # merge this attempt's runs (main + repairs) with prior attempts' totals
+        prior = (store.get(job_id) or {}).get("metrics")
+        wall = {"wall_seconds": round((datetime.now(timezone.utc) - started_at).total_seconds(), 1)}
+        return merge_metrics(prior, *collected_runs, wall)
+
     try:
         prepared_record, worktree_info = prepare_job_workspace(record)
         if worktree_info:
@@ -128,13 +140,15 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
         _append_log(job_id, f"PROMPT:\n{prompt}")
 
         def _run(prompt_text: str) -> Dict[str, Any]:
-            return run_claude_cli_job(
+            result = run_claude_cli_job(
                 prompt_text,
                 cwd=workspace_path or os.getcwd(),
                 model=cfg.default_model,
                 permission_mode=cfg.permission_mode,
                 timeout_seconds=cfg.timeout_seconds,
             )
+            collected_runs.append(run_metrics(result))
+            return result
 
         result = _run(prompt)
         final_response = (result or {}).get("final_response") or ""
@@ -164,25 +178,27 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
         if not validation.get("ok"):
             reason = str(validation.get("reason") or "delivery validation failed")
             store.append_event(job_id, "job_delivery_validation_failed", state="running", reason=reason, metadata=validation)
-            store.fail(job_id, reason=reason, run_id=job_id, retryable=True)  # -> blocked, worktree kept
+            store.fail(job_id, reason=reason, run_id=job_id, retryable=True, metrics=_job_metrics())  # -> blocked, worktree kept
             cleanup_worktree(worktree_info, keep=True)
             logger.warning("Job %s blocked: %s", job_id, reason)
             return
 
         cleanup_worktree(worktree_info, keep=False)
-        store.complete(job_id, run_id=job_id, result={"final_response": final_response[:8000], "delivery_validation": validation})
+        store.complete(job_id, run_id=job_id,
+                       result={"final_response": final_response[:8000], "delivery_validation": validation},
+                       metrics=_job_metrics())
         logger.info("Job %s completed", job_id)
 
     except WorktreePreparationError as exc:
         _append_log(job_id, f"WORKSPACE ERROR: {exc}")
         store.append_event(job_id, "job_workspace_preparation_failed", state="running", reason=str(exc))
-        outcome = _fail_or_requeue(store, cfg, job_id, reason=f"workspace preparation failed: {exc}")
+        outcome = _fail_or_requeue(store, cfg, job_id, reason=f"workspace preparation failed: {exc}", metrics=_job_metrics())
         cleanup_worktree(worktree_info, keep=True)
         logger.warning("Job %s workspace prep failed (%s): %s", job_id, outcome, exc)
     except Exception as exc:  # noqa: BLE001 — surface any failure to the store
         _append_log(job_id, f"AGENT ERROR: {exc}")
         store.append_event(job_id, "job_agent_failed", state="running", reason=str(exc))
-        outcome = _fail_or_requeue(store, cfg, job_id, reason=str(exc))
+        outcome = _fail_or_requeue(store, cfg, job_id, reason=str(exc), metrics=_job_metrics())
         cleanup_worktree(worktree_info, keep=True)
         logger.warning("Job %s failed (%s): %s", job_id, outcome, exc)
 
@@ -203,6 +219,7 @@ def worker_loop(stop: threading.Event) -> None:
     logger.info("TaskLane worker started (owner=%s, max_in_progress=%s, poll=%ss)", _OWNER, cfg.max_in_progress, cfg.poll_interval_seconds)
     _reconcile_safely(store, cfg)  # recover orphans from a previous worker right away
     last_reconcile = time.monotonic()
+    budget_paused = False
     with ThreadPoolExecutor(max_workers=max(1, cfg.max_in_progress)) as pool:
         while not stop.is_set():
             try:
@@ -210,6 +227,19 @@ def worker_loop(stop: threading.Event) -> None:
                 if time.monotonic() - last_reconcile >= cfg.reconcile_interval_seconds:
                     _reconcile_safely(store, cfg)
                     last_reconcile = time.monotonic()
+                if cfg.daily_budget_usd > 0:
+                    spend = spend_last_24h(store)
+                    if spend >= cfg.daily_budget_usd:
+                        if not budget_paused:
+                            logger.warning("Daily budget reached ($%.2f >= $%.2f/24h); pausing new claims",
+                                           spend, cfg.daily_budget_usd)
+                            budget_paused = True
+                        stop.wait(cfg.poll_interval_seconds)
+                        continue
+                    if budget_paused:
+                        logger.info("Spend back under budget ($%.2f < $%.2f/24h); resuming claims",
+                                    spend, cfg.daily_budget_usd)
+                        budget_paused = False
                 running = len(store.list(states=["running"]))
                 slots = max(0, cfg.max_in_progress - running)
                 for _ in range(slots):

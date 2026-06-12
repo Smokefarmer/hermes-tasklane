@@ -114,6 +114,22 @@ def run_claude_cli_job(
     return _parse_result(proc.stdout, proc.stderr, proc.returncode)
 
 
+def _extract_metrics(payload: dict) -> dict:
+    """Pull usage/cost telemetry out of the CLI's JSON result (fields optional)."""
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    candidates = {
+        "cost_usd": payload.get("total_cost_usd"),
+        "duration_ms": payload.get("duration_ms"),
+        "num_turns": payload.get("num_turns"),
+        "session_id": payload.get("session_id"),
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cache_read_tokens": usage.get("cache_read_input_tokens"),
+        "cache_creation_tokens": usage.get("cache_creation_input_tokens"),
+    }
+    return {key: value for key, value in candidates.items() if value is not None}
+
+
 def _parse_result(stdout: str, stderr: str, returncode: int) -> dict:
     text = (stdout or "").strip()
     if text:
@@ -123,16 +139,17 @@ def _parse_result(stdout: str, stderr: str, returncode: int) -> dict:
             payload = None
         if isinstance(payload, dict):
             result_text = str(payload.get("result") or "")
+            metrics = _extract_metrics(payload)
             if payload.get("is_error"):
                 reason = (
                     result_text
                     or payload.get("api_error_status")
                     or "claude CLI reported an error"
                 )
-                return {"final_response": result_text, "error": str(reason)}
-            return {"final_response": result_text, "error": None}
+                return {"final_response": result_text, "error": str(reason), "metrics": metrics}
+            return {"final_response": result_text, "error": None, "metrics": metrics}
 
     if returncode != 0:
         err = (stderr or stdout or "").strip()[:2000] or f"claude CLI exited with code {returncode}"
-        return {"final_response": "", "error": err}
-    return {"final_response": text, "error": None}
+        return {"final_response": "", "error": err, "metrics": {}}
+    return {"final_response": text, "error": None, "metrics": {}}

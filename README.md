@@ -73,6 +73,11 @@ Key fields:
 - `reconcile_interval_seconds` / `stale_lock_seconds` — the worker recovers orphaned `running`
   jobs (claimant process died, e.g. crash/reboot) and sweeps stale claim locks on this cadence,
   and once at startup. Also available on demand: `tasklane reconcile` / the `reconcile_jobs` MCP tool.
+- `daily_budget_usd` — per-job cost/token telemetry is captured from the CLI's JSON output onto
+  each record (`metrics`: cost, tokens, turns, runs, wall time, summed across repair passes and
+  retries). When 24h spend reaches this budget the worker pauses claiming new jobs (running jobs
+  finish; claiming resumes when the window rolls). `0` = unlimited. Inspect via `tasklane stats`,
+  the `metrics` MCP tool, or the status page.
 
 ## Connect an MCP client
 
@@ -93,7 +98,7 @@ A browser status page is available at `https://tasklane.<your-domain>/status?tok
   `cancel_task`, `run_task_now`
 - **Inspect & fix** (confined to the job's worktree): `get_diff`, `list_dir`, `read_file`,
   `write_file`, `apply_patch`, `exec`, `git`, `run_tests`
-- **Ops:** `worker_status`, `restart_worker`, `prune_worktrees`, `reconcile_jobs`,
+- **Ops:** `worker_status`, `restart_worker`, `prune_worktrees`, `reconcile_jobs`, `metrics`,
   `admin_exec` (gated by config)
 
 A typical operator flow: `create_task` → watch with `get_task`/`task_logs` → if it blocks,
@@ -108,7 +113,7 @@ A typical operator flow: `create_task` → watch with `get_task`/`task_logs` →
 ## CLI (local ops without MCP)
 
 ```bash
-tasklane {submit|list|show|events|logs|retry|cancel|reconcile}   # after `pip install -e .`
+tasklane {submit|list|show|events|logs|retry|cancel|reconcile|stats}   # after `pip install -e .`
 ```
 
 ## Security
