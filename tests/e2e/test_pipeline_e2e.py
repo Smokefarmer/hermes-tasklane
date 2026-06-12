@@ -38,6 +38,11 @@ def test_report_only_job_completes(store, fast_cfg, fake_claude, git_repo, monke
     assert final["state"] == "completed"
     assert "Analysis complete" in final["result"]["final_response"]
     assert final["result"]["delivery_validation"]["ok"] is True
+    # telemetry captured from the CLI JSON output
+    m = final["metrics"]
+    assert m["cost_usd"] == pytest.approx(0.05)
+    assert m["input_tokens"] == 1000 and m["output_tokens"] == 250
+    assert m["runs"] == 1 and m["wall_seconds"] >= 0
     # worktree cleaned up on success
     wt = final.get("worktree") or {}
     assert wt.get("worktree_path") and not Path(wt["worktree_path"]).exists()

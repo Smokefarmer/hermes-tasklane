@@ -171,21 +171,32 @@ class JobStore:
                 self._release_claim_lock(lock_path)
         return None
 
-    def complete(self, job_id: str, *, run_id: str | None = None, result: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        return self.transition(
-            job_id,
-            "completed",
-            reason="job-completed",
-            updates={"run_id": run_id, "result": dict(result or {}), "completed_at": utc_now()},
-        )
+    def complete(
+        self,
+        job_id: str,
+        *,
+        run_id: str | None = None,
+        result: Mapping[str, Any] | None = None,
+        metrics: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        updates: dict[str, Any] = {"run_id": run_id, "result": dict(result or {}), "completed_at": utc_now()}
+        if metrics:
+            updates["metrics"] = dict(metrics)
+        return self.transition(job_id, "completed", reason="job-completed", updates=updates)
 
-    def fail(self, job_id: str, *, reason: str, run_id: str | None = None, retryable: bool = False) -> dict[str, Any]:
-        return self.transition(
-            job_id,
-            "blocked" if retryable else "failed",
-            reason=reason,
-            updates={"run_id": run_id, "last_error": reason, "failed_at": utc_now()},
-        )
+    def fail(
+        self,
+        job_id: str,
+        *,
+        reason: str,
+        run_id: str | None = None,
+        retryable: bool = False,
+        metrics: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        updates: dict[str, Any] = {"run_id": run_id, "last_error": reason, "failed_at": utc_now()}
+        if metrics:
+            updates["metrics"] = dict(metrics)
+        return self.transition(job_id, "blocked" if retryable else "failed", reason=reason, updates=updates)
 
     def retry(self, job_id: str, *, reason: str = "job-retry-requested") -> dict[str, Any]:
         record = self.get(job_id)
@@ -213,24 +224,23 @@ class JobStore:
         reason: str,
         not_before: str | None = None,
         last_error: str | None = None,
+        metrics: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Return a job to ``ready`` keeping its attempt count (auto-retry / orphan recovery).
 
         Unlike :meth:`retry`, the error context is preserved on the record and an
         optional ``not_before`` timestamp delays the next claim (backoff).
         """
-        return self.transition(
-            job_id,
-            "ready",
-            reason=reason,
-            updates={
-                "last_error": last_error,
-                "claimed_by": None,
-                "claimed_at": None,
-                "failed_at": None,
-                "not_before": not_before,
-            },
-        )
+        updates: dict[str, Any] = {
+            "last_error": last_error,
+            "claimed_by": None,
+            "claimed_at": None,
+            "failed_at": None,
+            "not_before": not_before,
+        }
+        if metrics:
+            updates["metrics"] = dict(metrics)
+        return self.transition(job_id, "ready", reason=reason, updates=updates)
 
     def cancel(self, job_id: str, *, reason: str = "job-cancelled") -> dict[str, Any]:
         record = self.get(job_id)

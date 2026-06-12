@@ -35,6 +35,8 @@ class Config:
     retry_backoff_seconds: float = 60.0  # backoff base; delay = base * 2^(attempt-1)
     stale_lock_seconds: float = 900.0  # claim locks older than this are debris from a killed process
     reconcile_interval_seconds: float = 60.0  # how often the worker runs orphan/lock recovery
+    # Observability / cost control
+    daily_budget_usd: float = 0.0  # pause claiming new jobs when 24h spend reaches this; 0 = unlimited
 
     # MCP server
     mcp_host: str = "127.0.0.1"
@@ -70,6 +72,7 @@ def _coerce(data: dict[str, Any]) -> Config:
         # let the sweep delete a lock mid-claim under clock skew
         stale_lock_seconds=max(60.0, float(data.get("stale_lock_seconds", defaults.stale_lock_seconds))),
         reconcile_interval_seconds=max(5.0, float(data.get("reconcile_interval_seconds", defaults.reconcile_interval_seconds))),
+        daily_budget_usd=max(0.0, float(data.get("daily_budget_usd", defaults.daily_budget_usd))),
         mcp_host=str(data.get("mcp_host", defaults.mcp_host)).strip() or defaults.mcp_host,
         mcp_port=int(data.get("mcp_port", defaults.mcp_port)),
         app_token=str(data.get("app_token", "")).strip(),
@@ -94,6 +97,7 @@ def _write_default() -> Config:
         "retry_backoff_seconds": 60.0,
         "stale_lock_seconds": 900.0,
         "reconcile_interval_seconds": 60.0,
+        "daily_budget_usd": 0.0,
         "mcp_host": "127.0.0.1",
         "mcp_port": 8788,
         "app_token": token,

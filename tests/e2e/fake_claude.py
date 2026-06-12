@@ -23,7 +23,17 @@ def arg(flag: str) -> str:
 
 
 def out(result: str, is_error: bool = False) -> None:
-    print(json.dumps({"result": result, "is_error": is_error}))
+    print(json.dumps({
+        "result": result,
+        "is_error": is_error,
+        # telemetry fields mirroring the real CLI's JSON output
+        "total_cost_usd": 0.05,
+        "duration_ms": 1200,
+        "num_turns": 3,
+        "session_id": "fake-session",
+        "usage": {"input_tokens": 1000, "output_tokens": 250,
+                  "cache_read_input_tokens": 400, "cache_creation_input_tokens": 100},
+    }))
     sys.exit(0)
 
 
