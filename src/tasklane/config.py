@@ -49,6 +49,7 @@ class Config:
     allowed_origins: List[str] = field(default_factory=list)  # extra Origin values to accept
     enable_admin_exec: bool = False  # server-level shell (off by default)
     exec_timeout_seconds: int = 600
+    pairing_enabled: bool = True  # allow clients to request pairing via POST /pair (operator approval required)
 
 
 _DEFAULTS_COMMENT = """\
@@ -84,6 +85,7 @@ def _coerce(data: dict[str, Any]) -> Config:
         allowed_origins=[str(o).strip() for o in (data.get("allowed_origins") or []) if str(o).strip()],
         enable_admin_exec=bool(data.get("enable_admin_exec", defaults.enable_admin_exec)),
         exec_timeout_seconds=int(data.get("exec_timeout_seconds", defaults.exec_timeout_seconds)),
+        pairing_enabled=bool(data.get("pairing_enabled", defaults.pairing_enabled)),
     )
 
 
@@ -110,6 +112,7 @@ def _write_default() -> Config:
         "allowed_origins": [],
         "enable_admin_exec": False,
         "exec_timeout_seconds": 600,
+        "pairing_enabled": True,
     }
     path.write_text(_DEFAULTS_COMMENT + yaml.safe_dump(body, sort_keys=False), encoding="utf-8")
     os.chmod(path, 0o600)
