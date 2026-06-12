@@ -7,12 +7,9 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "Installing TaskLane from $REPO_DIR into $PREFIX"
 mkdir -p "$PREFIX"
-cp -r "$REPO_DIR/tasklane" "$PREFIX/"
-cp "$REPO_DIR/requirements.txt" "$PREFIX/"
-
 python3 -m venv "$PREFIX/venv"
 "$PREFIX/venv/bin/pip" install --quiet --upgrade pip
-"$PREFIX/venv/bin/pip" install -r "$PREFIX/requirements.txt"
+"$PREFIX/venv/bin/pip" install "$REPO_DIR"   # installs the tasklane package + console scripts
 
 echo
 echo "Done. Next steps:"

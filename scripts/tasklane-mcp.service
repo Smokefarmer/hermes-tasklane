@@ -12,9 +12,8 @@ Group=tasklane
 WorkingDirectory=/opt/tasklane
 Environment="HOME=/home/tasklane"
 Environment="TASKLANE_HOME=/opt/tasklane/data"
-Environment="PYTHONPATH=/opt/tasklane"
 Environment="PATH=/home/tasklane/.local/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/opt/tasklane/venv/bin/python -m tasklane.mcp_server
+ExecStart=/opt/tasklane/venv/bin/tasklane-mcp
 Restart=always
 RestartSec=5
 RestartMaxDelaySec=300

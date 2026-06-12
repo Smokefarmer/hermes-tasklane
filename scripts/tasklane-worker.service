@@ -12,11 +12,10 @@ Group=tasklane
 WorkingDirectory=/opt/tasklane
 Environment="HOME=/home/tasklane"
 Environment="TASKLANE_HOME=/opt/tasklane/data"
-Environment="PYTHONPATH=/opt/tasklane"
 Environment="PATH=/home/tasklane/.local/bin:/usr/local/bin:/usr/bin:/bin"
 # Optional: token for `gh` so pull-request delivery can open PRs (keep this file mode 600).
 # EnvironmentFile=/opt/tasklane/data/gh.env
-ExecStart=/opt/tasklane/venv/bin/python -m tasklane.worker
+ExecStart=/opt/tasklane/venv/bin/tasklane-worker
 Restart=always
 RestartSec=5
 RestartMaxDelaySec=300

@@ -45,11 +45,10 @@ and fix them, then `retry`.
 ## Install
 
 ```bash
-git clone https://github.com/Smokefarmer/hermes-tasklane.git tasklane && cd tasklane
-python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
-# run directly (PYTHONPATH=.), or `pip install -e .` for the `tasklane*` entry points
-PYTHONPATH=. ./venv/bin/python -m tasklane.worker      # the worker
-PYTHONPATH=. ./venv/bin/python -m tasklane.mcp_server  # the MCP control plane
+git clone https://github.com/Smokefarmer/tasklane.git && cd tasklane
+python3 -m venv venv && ./venv/bin/pip install -e .
+./venv/bin/tasklane-worker   # the worker
+./venv/bin/tasklane-mcp      # the MCP control plane
 ```
 
 For a service install see `scripts/install.sh` and the `scripts/tasklane-*.service` unit templates.
@@ -101,7 +100,7 @@ A typical operator flow: `create_task` → watch with `get_task`/`task_logs` →
 ## CLI (local ops without MCP)
 
 ```bash
-PYTHONPATH=. python -m tasklane.cli {submit|list|show|events|logs|retry|cancel}
+tasklane {submit|list|show|events|logs|retry|cancel}   # after `pip install -e .`
 ```
 
 ## Security
