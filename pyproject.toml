@@ -16,6 +16,13 @@ tasklane = "tasklane.cli:main"
 tasklane-worker = "tasklane.worker:main"
 tasklane-mcp = "tasklane.mcp_server:main"
 
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["e2e: end-to-end tests (real worker/MCP server, fake claude CLI)"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

@@ -384,7 +384,11 @@ def validate_job_delivery(record: Dict[str, Any], final_response: str) -> Dict[s
         unpushed = run_git(["git", "log", "--oneline", "HEAD", "--not", "--remotes"], cwd=repo_path)
         if unpushed.returncode != 0:
             return {"ok": False, "reason": "direct-push job could not verify pushed commits", "stderr": unpushed.stderr[-2000:]}
-        if "ahead" in branch_summary or unpushed.stdout.strip():
+        # NOTE: do not use the "[ahead N]" marker from `git status --branch` here —
+        # a work branch created from origin/<base> tracks the *base* branch, so it
+        # reads "ahead" even when fully pushed to its own remote ref. `git log HEAD
+        # --not --remotes` is the authoritative unpushed-commit check.
+        if unpushed.stdout.strip():
             return {"ok": False, "reason": "direct-push job has local commits that are not pushed",
                     "branch_status": branch_summary, "unpushed_commits": unpushed.stdout.splitlines()[:20]}
         return {"ok": True, "delivery_mode": delivery_mode, "worktree_clean": True, "branch_status": branch_summary}
