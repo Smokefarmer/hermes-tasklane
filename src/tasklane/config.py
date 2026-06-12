@@ -30,6 +30,11 @@ class Config:
     permission_mode: str = "bypassPermissions"
     timeout_seconds: int = 3600
     repos_allowlist: List[str] = field(default_factory=list)  # absolute path prefixes; [] = allow any
+    # Reliability: auto-retry transient failures and recover orphaned jobs.
+    max_attempts: int = 3  # total claims per job before a retryable failure parks it in blocked
+    retry_backoff_seconds: float = 60.0  # backoff base; delay = base * 2^(attempt-1)
+    stale_lock_seconds: float = 900.0  # claim locks older than this are debris from a killed process
+    reconcile_interval_seconds: float = 60.0  # how often the worker runs orphan/lock recovery
 
     # MCP server
     mcp_host: str = "127.0.0.1"
@@ -59,6 +64,12 @@ def _coerce(data: dict[str, Any]) -> Config:
         permission_mode=str(data.get("permission_mode", defaults.permission_mode)).strip() or defaults.permission_mode,
         timeout_seconds=int(data.get("timeout_seconds", defaults.timeout_seconds)),
         repos_allowlist=[str(p).strip() for p in (data.get("repos_allowlist") or []) if str(p).strip()],
+        max_attempts=max(1, int(data.get("max_attempts", defaults.max_attempts))),
+        retry_backoff_seconds=max(0.0, float(data.get("retry_backoff_seconds", defaults.retry_backoff_seconds))),
+        # floor of 60s: claim locks live for milliseconds, but a lower value would
+        # let the sweep delete a lock mid-claim under clock skew
+        stale_lock_seconds=max(60.0, float(data.get("stale_lock_seconds", defaults.stale_lock_seconds))),
+        reconcile_interval_seconds=max(5.0, float(data.get("reconcile_interval_seconds", defaults.reconcile_interval_seconds))),
         mcp_host=str(data.get("mcp_host", defaults.mcp_host)).strip() or defaults.mcp_host,
         mcp_port=int(data.get("mcp_port", defaults.mcp_port)),
         app_token=str(data.get("app_token", "")).strip(),
@@ -79,6 +90,10 @@ def _write_default() -> Config:
         "permission_mode": "bypassPermissions",
         "timeout_seconds": 3600,
         "repos_allowlist": [],
+        "max_attempts": 3,
+        "retry_backoff_seconds": 60.0,
+        "stale_lock_seconds": 900.0,
+        "reconcile_interval_seconds": 60.0,
         "mcp_host": "127.0.0.1",
         "mcp_port": 8788,
         "app_token": token,

@@ -66,6 +66,13 @@ Key fields:
 - `public_hostnames` — set to your external host (e.g. `tasklane.example.com`) when fronting it with a
   proxy/tunnel, or the MCP transport rejects the `Host` header.
 - `enable_admin_exec` — server-level shell tool, off by default.
+- `max_attempts` / `retry_backoff_seconds` — transient failures (workspace prep, agent errors)
+  auto-retry with exponential backoff until the attempt cap, then park in `blocked`.
+  Delivery-validation failures go straight to `blocked` (the in-job repair pass already ran
+  and the worktree is kept for the fix tools).
+- `reconcile_interval_seconds` / `stale_lock_seconds` — the worker recovers orphaned `running`
+  jobs (claimant process died, e.g. crash/reboot) and sweeps stale claim locks on this cadence,
+  and once at startup. Also available on demand: `tasklane reconcile` / the `reconcile_jobs` MCP tool.
 
 ## Connect an MCP client
 
@@ -86,7 +93,8 @@ A browser status page is available at `https://tasklane.<your-domain>/status?tok
   `cancel_task`, `run_task_now`
 - **Inspect & fix** (confined to the job's worktree): `get_diff`, `list_dir`, `read_file`,
   `write_file`, `apply_patch`, `exec`, `git`, `run_tests`
-- **Ops:** `worker_status`, `restart_worker`, `prune_worktrees`, `admin_exec` (gated by config)
+- **Ops:** `worker_status`, `restart_worker`, `prune_worktrees`, `reconcile_jobs`,
+  `admin_exec` (gated by config)
 
 A typical operator flow: `create_task` → watch with `get_task`/`task_logs` → if it blocks,
 `get_diff` + `exec` to find the problem, `write_file`/`apply_patch` to fix, `retry_task`.
@@ -100,7 +108,7 @@ A typical operator flow: `create_task` → watch with `get_task`/`task_logs` →
 ## CLI (local ops without MCP)
 
 ```bash
-tasklane {submit|list|show|events|logs|retry|cancel}   # after `pip install -e .`
+tasklane {submit|list|show|events|logs|retry|cancel|reconcile}   # after `pip install -e .`
 ```
 
 ## Security

@@ -365,6 +365,16 @@ def prune_worktrees() -> dict[str, Any]:
 
 @mcp.tool()
 @audited
+def reconcile_jobs() -> dict[str, Any]:
+    """Recover orphaned running jobs (dead worker process) and remove stale claim
+    locks. Safe to run anytime; the worker also runs this periodically."""
+    from tasklane.reconcile import reconcile
+
+    return reconcile(_store(), _cfg())
+
+
+@mcp.tool()
+@audited
 def admin_exec(command: str, timeout: int | None = None) -> dict[str, Any]:
     """Run a server-level shell command (NOT confined to a worktree). Disabled unless
     enable_admin_exec is true in config. Use for broader server fixes."""

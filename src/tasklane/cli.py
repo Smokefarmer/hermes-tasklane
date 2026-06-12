@@ -91,6 +91,13 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    from tasklane.reconcile import reconcile
+
+    print(json.dumps(reconcile(JobStore(), load_config()), indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tasklane", description="TaskLane job control")
     sub = p.add_subparsers(dest="command", required=True)
@@ -114,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("logs", help="job log"); s.add_argument("id"); s.set_defaults(func=cmd_logs)
     s = sub.add_parser("retry", help="retry a job"); s.add_argument("id"); s.set_defaults(func=cmd_retry)
     s = sub.add_parser("cancel", help="cancel a job"); s.add_argument("id"); s.set_defaults(func=cmd_cancel)
+    s = sub.add_parser("reconcile", help="recover orphaned jobs and stale locks"); s.set_defaults(func=cmd_reconcile)
     return p
 
 

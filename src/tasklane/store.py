@@ -122,6 +122,7 @@ class JobStore:
         blocked_repos = {str(item).strip() for item in active_repo_keys if str(item).strip()}
         blocked_repos.update(str(item).strip() for item in pending_repo_keys if str(item).strip())
         completed_ids = {record["id"] for record in self.list(states=["completed"])}
+        now = datetime.now(timezone.utc)
         ready: list[dict[str, Any]] = []
         for record in self.list(states=["ready"]):
             spec = dict(record.get("spec") or {})
@@ -130,6 +131,9 @@ class JobStore:
                 continue
             dependencies = [str(item).strip() for item in spec.get("dependencies") or [] if str(item).strip()]
             if any(dep not in completed_ids for dep in dependencies):
+                continue
+            not_before = parse_timestamp(record.get("not_before"))
+            if not_before is not None and not_before > now:
                 continue
             ready.append(record)
         return ready
@@ -160,6 +164,7 @@ class JobStore:
                         "attempt": attempt,
                         "claimed_by": owner,
                         "claimed_at": utc_now(),
+                        "not_before": None,
                     },
                 )
             finally:
@@ -197,6 +202,33 @@ class JobStore:
                 "claimed_by": None,
                 "claimed_at": None,
                 "failed_at": None,
+                "not_before": None,
+            },
+        )
+
+    def requeue(
+        self,
+        job_id: str,
+        *,
+        reason: str,
+        not_before: str | None = None,
+        last_error: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a job to ``ready`` keeping its attempt count (auto-retry / orphan recovery).
+
+        Unlike :meth:`retry`, the error context is preserved on the record and an
+        optional ``not_before`` timestamp delays the next claim (backoff).
+        """
+        return self.transition(
+            job_id,
+            "ready",
+            reason=reason,
+            updates={
+                "last_error": last_error,
+                "claimed_by": None,
+                "claimed_at": None,
+                "failed_at": None,
+                "not_before": not_before,
             },
         )
 
@@ -287,6 +319,20 @@ def normalize_job_state(value: Any) -> str:
     if text not in JOB_STATES:
         raise ValueError(f"Invalid job state {value!r}; expected one of: {', '.join(sorted(JOB_STATES))}")
     return text
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    """Parse a record ISO timestamp (``not_before``, ``claimed_at``); invalid/missing → None."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def validate_job_id(value: Any) -> str:

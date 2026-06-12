@@ -10,6 +10,12 @@ permission_mode: bypassPermissions  # required so headless jobs can run git comm
 timeout_seconds: 3600
 repos_allowlist: []                 # [] = any path allowed; list absolute path prefixes to restrict (recommended for remote use)
 
+# --- reliability ---
+max_attempts: 3                     # total claims per job; transient failures auto-retry until this cap, then park in blocked
+retry_backoff_seconds: 60.0         # auto-retry delay = base * 2^(attempt-1)
+stale_lock_seconds: 900.0           # claim locks older than this are removed (debris from a killed process)
+reconcile_interval_seconds: 60.0    # worker recovers orphaned running jobs / stale locks on this cadence
+
 # --- MCP control plane ---
 mcp_host: "127.0.0.1"               # bind localhost only; expose via a tunnel, not directly
 mcp_port: 8788

@@ -22,6 +22,7 @@ from typing import Any, Dict
 
 from tasklane.config import Config, load_config
 from tasklane.paths import logs_root
+from tasklane.reconcile import backoff_not_before, reconcile
 from tasklane.runner import run_claude_cli_job
 from tasklane.store import JobStore
 from tasklane.worktree import (
@@ -86,6 +87,27 @@ def _repair_prompt(record: Dict[str, Any], validation: Dict[str, Any], final_res
         "",
         "Finish with changed files, verification performed, delivery URL/branch, and residual risks.",
     ])
+
+
+def _fail_or_requeue(store: JobStore, cfg: Config, job_id: str, *, reason: str) -> str:
+    """Auto-retry a transient failure with backoff, or park it in blocked at the attempt cap.
+
+    The record is re-read so the attempt count reflects any transition that
+    happened after this worker claimed the job (e.g. a concurrent reconcile).
+    """
+    record = store.get(job_id)
+    if record is None:
+        logger.error("Job %s vanished before fail/requeue (reason was: %s)", job_id, reason)
+        return "not-found"
+    attempt = int(record.get("attempt") or 0)
+    if attempt < cfg.max_attempts:
+        not_before = backoff_not_before(cfg, attempt)
+        store.append_event(job_id, "job_auto_retry_scheduled", state="running", reason=reason,
+                           metadata={"attempt": attempt, "max_attempts": cfg.max_attempts, "not_before": not_before})
+        store.requeue(job_id, reason="auto-retry-scheduled", not_before=not_before, last_error=reason)
+        return "requeued"
+    store.fail(job_id, reason=f"{reason} (attempt cap reached: {attempt}/{cfg.max_attempts})", run_id=job_id, retryable=True)
+    return "blocked"
 
 
 def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
@@ -154,15 +176,24 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
     except WorktreePreparationError as exc:
         _append_log(job_id, f"WORKSPACE ERROR: {exc}")
         store.append_event(job_id, "job_workspace_preparation_failed", state="running", reason=str(exc))
-        store.fail(job_id, reason=f"workspace preparation failed: {exc}", run_id=job_id, retryable=True)
+        outcome = _fail_or_requeue(store, cfg, job_id, reason=f"workspace preparation failed: {exc}")
         cleanup_worktree(worktree_info, keep=True)
-        logger.warning("Job %s workspace prep failed: %s", job_id, exc)
+        logger.warning("Job %s workspace prep failed (%s): %s", job_id, outcome, exc)
     except Exception as exc:  # noqa: BLE001 — surface any failure to the store
         _append_log(job_id, f"AGENT ERROR: {exc}")
         store.append_event(job_id, "job_agent_failed", state="running", reason=str(exc))
-        store.fail(job_id, reason=str(exc), run_id=job_id, retryable=True)  # retryable so the remote agent can fix + retry
+        outcome = _fail_or_requeue(store, cfg, job_id, reason=str(exc))
         cleanup_worktree(worktree_info, keep=True)
-        logger.warning("Job %s failed: %s", job_id, exc)
+        logger.warning("Job %s failed (%s): %s", job_id, outcome, exc)
+
+
+def _reconcile_safely(store: JobStore, cfg: Config) -> None:
+    try:
+        report = reconcile(store, cfg)
+        if report["orphans"] or report["stale_locks_removed"]:
+            logger.info("Reconcile: %s", json.dumps(report, sort_keys=True))
+    except Exception as exc:  # noqa: BLE001 — recovery must never kill the loop
+        logger.warning("Reconcile error: %s", exc)
 
 
 def worker_loop(stop: threading.Event) -> None:
@@ -170,10 +201,15 @@ def worker_loop(stop: threading.Event) -> None:
     store = JobStore()
     store.ensure_dirs()
     logger.info("TaskLane worker started (owner=%s, max_in_progress=%s, poll=%ss)", _OWNER, cfg.max_in_progress, cfg.poll_interval_seconds)
+    _reconcile_safely(store, cfg)  # recover orphans from a previous worker right away
+    last_reconcile = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, cfg.max_in_progress)) as pool:
         while not stop.is_set():
             try:
                 cfg = load_config()  # pick up config edits live
+                if time.monotonic() - last_reconcile >= cfg.reconcile_interval_seconds:
+                    _reconcile_safely(store, cfg)
+                    last_reconcile = time.monotonic()
                 running = len(store.list(states=["running"]))
                 slots = max(0, cfg.max_in_progress - running)
                 for _ in range(slots):
