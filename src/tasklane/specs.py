@@ -93,7 +93,9 @@ def normalize_job_spec(raw: dict) -> dict:
         "request": request,
         "branch": branch,
         "delivery_mode": delivery_mode,
-        "dependencies": _normalize_dependencies(payload.get("dependencies")),
+        "dependencies": _normalize_dependencies(payload.get("dependencies"), field="dependencies"),
+        # upstream job ids whose final responses are injected into this job's prompt
+        "context_from": _normalize_dependencies(payload.get("context_from"), field="context_from"),
         "pipeline": _normalize_pipeline(_mapping_value(payload, "pipeline")),
         "scope": _normalize_scope(_mapping_value(payload, "scope")),
     }
@@ -236,7 +238,7 @@ def _normalize_scope(scope: dict) -> dict:
     }
 
 
-def _normalize_dependencies(value: Any) -> list[str]:
+def _normalize_dependencies(value: Any, *, field: str = "dependencies") -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
@@ -244,7 +246,7 @@ def _normalize_dependencies(value: Any) -> list[str]:
     elif isinstance(value, (list, tuple, set)):
         candidates = list(value)
     else:
-        raise ValueError("dependencies must be a list or comma-separated string")
+        raise ValueError(f"{field} must be a list or comma-separated string")
 
     normalized: list[str] = []
     seen: set[str] = set()
