@@ -1,0 +1,3 @@
+# Allow the tasklane user to restart ONLY the worker service (for the restart_worker MCP tool).
+# Install to /etc/sudoers.d/tasklane (mode 440), then `sudo visudo -c`.
+tasklane ALL=(root) NOPASSWD: /usr/bin/systemctl restart tasklane-worker.service

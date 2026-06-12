@@ -1,7 +1,0 @@
-[Unit]
-Description=hermes-tasklane watch
-After=default.target
-
-[Service]
-Type=oneshot
-ExecStart=__EXECUTABLE__ --config __CONFIG_PATH__ watch --notify --quiet-ok

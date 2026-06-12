@@ -1,0 +1,26 @@
+[Unit]
+Description=TaskLane worker - runs autonomous coding jobs via claude -p
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+# Adjust User=, paths, and the Python interpreter to your install.
+[Service]
+Type=simple
+User=tasklane
+Group=tasklane
+WorkingDirectory=/opt/tasklane
+Environment="HOME=/home/tasklane"
+Environment="TASKLANE_HOME=/opt/tasklane/data"
+Environment="PYTHONPATH=/opt/tasklane"
+Environment="PATH=/home/tasklane/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# Optional: token for `gh` so pull-request delivery can open PRs (keep this file mode 600).
+# EnvironmentFile=/opt/tasklane/data/gh.env
+ExecStart=/opt/tasklane/venv/bin/python -m tasklane.worker
+Restart=always
+RestartSec=5
+RestartMaxDelaySec=300
+RestartSteps=5
+
+[Install]
+WantedBy=multi-user.target

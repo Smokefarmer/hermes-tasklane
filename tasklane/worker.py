@@ -1,0 +1,199 @@
+"""TaskLane worker — claims ready jobs and runs them via the Claude Code CLI.
+
+Standalone replacement for Hermes's gateway job watcher. Polls the file-backed
+job store, claims ready jobs (atomic file locks), prepares an isolated git
+worktree, runs ``claude -p``, validates delivery, and marks the job
+completed/blocked/failed. Per-job output is captured under
+``~/.tasklane/jobs/logs/<job_id>.log``.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict
+
+from tasklane.config import Config, load_config
+from tasklane.paths import logs_root
+from tasklane.runner import run_claude_cli_job
+from tasklane.store import JobStore
+from tasklane.worktree import (
+    WorktreePreparationError,
+    cleanup_worktree,
+    job_prompt,
+    prepare_job_workspace,
+    validate_job_delivery,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("tasklane.worker")
+
+_OWNER = f"worker-{os.getpid()}"
+
+
+def _repair_attempts() -> int:
+    try:
+        return max(0, min(3, int(os.getenv("TASKLANE_DELIVERY_REPAIR_ATTEMPTS", "1"))))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _job_log(job_id: str) -> Path:
+    return logs_root() / f"{job_id}.log"
+
+
+def _append_log(job_id: str, text: str) -> None:
+    stamp = datetime.now(timezone.utc).isoformat()
+    with _job_log(job_id).open("a", encoding="utf-8") as handle:
+        handle.write(f"\n===== {stamp} =====\n{text}\n")
+
+
+def _repair_prompt(record: Dict[str, Any], validation: Dict[str, Any], final_response: str, *, attempt: int, max_attempts: int) -> str:
+    spec = record.get("spec") if isinstance(record.get("spec"), dict) else {}
+    repo = spec.get("repo") if isinstance(spec.get("repo"), dict) else {}
+    branch = spec.get("branch") if isinstance(spec.get("branch"), dict) else {}
+    delivery_mode = str(spec.get("delivery_mode") or "pull-request").strip().lower()
+    validation_json = json.dumps(validation, indent=2, sort_keys=True, ensure_ascii=True)[:6000]
+    return "\n".join([
+        "TaskLane delivery validation failed. This is a bounded delivery-repair pass.",
+        "",
+        f"Repair attempt: {attempt}/{max_attempts}",
+        f"Job ID: {record.get('id')}",
+        f"Repo path: {repo.get('path') or ''}",
+        f"Delivery mode: {delivery_mode}",
+        f"Work branch: {branch.get('work_branch') or ''}",
+        f"PR target: {branch.get('pr_target') or branch.get('base_branch') or ''}",
+        "",
+        "Validation failure:",
+        validation_json,
+        "",
+        "Previous final response:",
+        (final_response or "").strip()[:3000] or "(empty)",
+        "",
+        "Repair contract:",
+        "1. Start by inspecting git status --short --branch in the repo path.",
+        "2. Do not broaden scope or start new feature work.",
+        "3. If the current changes are correct, finish verification and deliver per the delivery mode.",
+        "4. If the changes are unsafe/incomplete, revert only your own job changes and leave the worktree clean.",
+        "5. Never stop with uncommitted changes.",
+        "",
+        "Finish with changed files, verification performed, delivery URL/branch, and residual risks.",
+    ])
+
+
+def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
+    """Execute one already-claimed (running) job to completion/failure."""
+    job_id = str(record.get("id") or "")
+    store.append_event(job_id, "job_agent_started", state="running", reason="worker-started")
+    worktree_info: Dict[str, Any] | None = None
+    try:
+        prepared_record, worktree_info = prepare_job_workspace(record)
+        if worktree_info:
+            store.append_event(job_id, "job_workspace_prepared", state="running", reason="isolated-worktree-ready",
+                               metadata={k: worktree_info.get(k) for k in ("original_repo_path", "worktree_path", "mode", "base_ref", "reused")})
+            # Persist worktree location on the record so the MCP fix-tools can find
+            # the worktree of a blocked/failed job (kept on failure).
+            store.transition(job_id, "running", reason="workspace-recorded", updates={"worktree": worktree_info})
+        prompt = job_prompt(prepared_record)
+        workspace_path = str((worktree_info or {}).get("worktree_path") or "") or str((prepared_record.get("spec") or {}).get("repo", {}).get("path") or "")
+        _append_log(job_id, f"PROMPT:\n{prompt}")
+
+        def _run(prompt_text: str) -> Dict[str, Any]:
+            return run_claude_cli_job(
+                prompt_text,
+                cwd=workspace_path or os.getcwd(),
+                model=cfg.default_model,
+                permission_mode=cfg.permission_mode,
+                timeout_seconds=cfg.timeout_seconds,
+            )
+
+        result = _run(prompt)
+        final_response = (result or {}).get("final_response") or ""
+        _append_log(job_id, f"RESULT error={result.get('error')!r}\nFINAL_RESPONSE:\n{final_response}")
+        if result.get("error"):
+            raise RuntimeError(str(result.get("error")))
+        store.append_event(job_id, "job_agent_completed", state="running", reason="agent-loop-completed",
+                           metadata={"final_response_preview": final_response[:500]})
+
+        validation = validate_job_delivery(prepared_record, final_response)
+        max_repairs = _repair_attempts()
+        for attempt in range(1, max_repairs + 1):
+            if validation.get("ok"):
+                break
+            store.append_event(job_id, "job_delivery_repair_started", state="running",
+                               reason=str(validation.get("reason") or "delivery validation failed"),
+                               metadata={"attempt": attempt, "validation": validation})
+            repair_result = _run(_repair_prompt(prepared_record, validation, final_response, attempt=attempt, max_attempts=max_repairs))
+            _append_log(job_id, f"REPAIR {attempt} error={repair_result.get('error')!r}\n{(repair_result.get('final_response') or '')}")
+            if repair_result.get("error"):
+                validation = {"ok": False, "reason": f"delivery repair failed: {repair_result.get('error')}", "previous_validation": validation}
+                break
+            if repair_result.get("final_response"):
+                final_response = repair_result["final_response"]
+            validation = validate_job_delivery(prepared_record, final_response)
+
+        if not validation.get("ok"):
+            reason = str(validation.get("reason") or "delivery validation failed")
+            store.append_event(job_id, "job_delivery_validation_failed", state="running", reason=reason, metadata=validation)
+            store.fail(job_id, reason=reason, run_id=job_id, retryable=True)  # -> blocked, worktree kept
+            cleanup_worktree(worktree_info, keep=True)
+            logger.warning("Job %s blocked: %s", job_id, reason)
+            return
+
+        cleanup_worktree(worktree_info, keep=False)
+        store.complete(job_id, run_id=job_id, result={"final_response": final_response[:8000], "delivery_validation": validation})
+        logger.info("Job %s completed", job_id)
+
+    except WorktreePreparationError as exc:
+        _append_log(job_id, f"WORKSPACE ERROR: {exc}")
+        store.append_event(job_id, "job_workspace_preparation_failed", state="running", reason=str(exc))
+        store.fail(job_id, reason=f"workspace preparation failed: {exc}", run_id=job_id, retryable=True)
+        cleanup_worktree(worktree_info, keep=True)
+        logger.warning("Job %s workspace prep failed: %s", job_id, exc)
+    except Exception as exc:  # noqa: BLE001 — surface any failure to the store
+        _append_log(job_id, f"AGENT ERROR: {exc}")
+        store.append_event(job_id, "job_agent_failed", state="running", reason=str(exc))
+        store.fail(job_id, reason=str(exc), run_id=job_id, retryable=True)  # retryable so the remote agent can fix + retry
+        cleanup_worktree(worktree_info, keep=True)
+        logger.warning("Job %s failed: %s", job_id, exc)
+
+
+def worker_loop(stop: threading.Event) -> None:
+    cfg = load_config()
+    store = JobStore()
+    store.ensure_dirs()
+    logger.info("TaskLane worker started (owner=%s, max_in_progress=%s, poll=%ss)", _OWNER, cfg.max_in_progress, cfg.poll_interval_seconds)
+    with ThreadPoolExecutor(max_workers=max(1, cfg.max_in_progress)) as pool:
+        while not stop.is_set():
+            try:
+                cfg = load_config()  # pick up config edits live
+                running = len(store.list(states=["running"]))
+                slots = max(0, cfg.max_in_progress - running)
+                for _ in range(slots):
+                    record = store.claim_next(owner=_OWNER)
+                    if not record:
+                        break
+                    logger.info("Claimed job %s", record.get("id"))
+                    pool.submit(run_job, store, cfg, record)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Worker loop error: %s", exc)
+            stop.wait(cfg.poll_interval_seconds)
+    logger.info("TaskLane worker stopped")
+
+
+def main() -> None:
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    worker_loop(stop)
+
+
+if __name__ == "__main__":
+    main()

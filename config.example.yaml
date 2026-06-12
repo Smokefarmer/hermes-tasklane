@@ -1,0 +1,20 @@
+# TaskLane configuration.
+# Copy to $TASKLANE_HOME/config.yaml (default ~/.tasklane/config.yaml) and keep it mode 600.
+# If the file is absent on first run, TaskLane writes one automatically with a random app_token.
+
+# --- worker ---
+poll_interval_seconds: 5.0
+max_in_progress: 1
+default_model: null                 # null = use the claude CLI default model
+permission_mode: bypassPermissions  # required so headless jobs can run git commit/push
+timeout_seconds: 3600
+repos_allowlist: []                 # [] = any path allowed; list absolute path prefixes to restrict (recommended for remote use)
+
+# --- MCP control plane ---
+mcp_host: "127.0.0.1"               # bind localhost only; expose via a tunnel, not directly
+mcp_port: 8788
+app_token: ""                       # bearer token every client must send; auto-generated on first run
+public_hostnames: []                # e.g. [tasklane.example.com] — required when fronted by a reverse proxy / tunnel
+allowed_origins: []                 # extra browser Origins to accept (usually empty)
+enable_admin_exec: false            # server-level shell tool, OFF by default
+exec_timeout_seconds: 600

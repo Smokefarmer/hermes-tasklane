@@ -1,30 +1,24 @@
+[project]
+name = "tasklane"
+version = "0.1.0"
+description = "Standalone autonomous coding-job control plane — runs claude -p in isolated git worktrees, driven remotely over MCP."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "mcp>=1.2.0",
+    "PyYAML>=6.0",
+    "uvicorn>=0.27",
+]
+
+[project.scripts]
+tasklane = "tasklane.cli:main"
+tasklane-worker = "tasklane.worker:main"
+tasklane-mcp = "tasklane.mcp_server:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[project]
-name = "hermes-tasklane"
-version = "0.1.0"
-description = "File-based task inbox and delivery reconciliation for Hermes JobStore runs"
-readme = "README.md"
-requires-python = ">=3.10"
-license = {text = "MIT"}
-authors = [{name = "Smokefarmer"}]
-keywords = ["hermes", "queue", "automation", "governed-runs", "github"]
-classifiers = [
-  "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent"
-]
-
-[project.scripts]
-hermes-tasklane = "hermes_tasklane.cli:main"
-
-[project.optional-dependencies]
-test = ["pytest>=8"]
-
 [tool.setuptools]
-package-dir = {"" = "src"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
+packages = ["tasklane"]
