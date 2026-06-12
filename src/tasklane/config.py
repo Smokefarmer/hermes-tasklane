@@ -37,6 +37,9 @@ class Config:
     reconcile_interval_seconds: float = 60.0  # how often the worker runs orphan/lock recovery
     # Observability / cost control
     daily_budget_usd: float = 0.0  # pause claiming new jobs when 24h spend reaches this; 0 = unlimited
+    # Parallelism: never run two jobs on the same repo concurrently (branch/remote
+    # collisions are possible even in separate worktrees)
+    serialize_per_repo: bool = True
 
     # MCP server
     mcp_host: str = "127.0.0.1"
@@ -73,6 +76,7 @@ def _coerce(data: dict[str, Any]) -> Config:
         stale_lock_seconds=max(60.0, float(data.get("stale_lock_seconds", defaults.stale_lock_seconds))),
         reconcile_interval_seconds=max(5.0, float(data.get("reconcile_interval_seconds", defaults.reconcile_interval_seconds))),
         daily_budget_usd=max(0.0, float(data.get("daily_budget_usd", defaults.daily_budget_usd))),
+        serialize_per_repo=bool(data.get("serialize_per_repo", defaults.serialize_per_repo)),
         mcp_host=str(data.get("mcp_host", defaults.mcp_host)).strip() or defaults.mcp_host,
         mcp_port=int(data.get("mcp_port", defaults.mcp_port)),
         app_token=str(data.get("app_token", "")).strip(),
@@ -98,6 +102,7 @@ def _write_default() -> Config:
         "stale_lock_seconds": 900.0,
         "reconcile_interval_seconds": 60.0,
         "daily_budget_usd": 0.0,
+        "serialize_per_repo": True,
         "mcp_host": "127.0.0.1",
         "mcp_port": 8788,
         "app_token": token,

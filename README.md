@@ -94,8 +94,8 @@ A browser status page is available at `https://tasklane.<your-domain>/status?tok
 
 ## MCP tools
 
-- **Lifecycle:** `create_task`, `list_tasks`, `get_task`, `task_events`, `task_logs`, `retry_task`,
-  `cancel_task`, `run_task_now`
+- **Lifecycle:** `create_task`, `create_pipeline`, `list_tasks`, `get_task`, `task_events`,
+  `task_logs`, `retry_task`, `cancel_task`, `run_task_now`
 - **Inspect & fix** (confined to the job's worktree): `get_diff`, `list_dir`, `read_file`,
   `write_file`, `apply_patch`, `exec`, `git`, `run_tests`
 - **Ops:** `worker_status`, `restart_worker`, `prune_worktrees`, `reconcile_jobs`, `metrics`,
@@ -103,6 +103,18 @@ A browser status page is available at `https://tasklane.<your-domain>/status?tok
 
 A typical operator flow: `create_task` → watch with `get_task`/`task_logs` → if it blocks,
 `get_diff` + `exec` to find the problem, `write_file`/`apply_patch` to fix, `retry_task`.
+
+### Pipelines (assembly line)
+
+`create_pipeline` creates dependency-chained stage jobs from one call:
+**plan** (report-only on the base branch) → **implement** (delivers on `work_branch`) →
+**review** (report-only on the work-branch tip). Each stage's prompt includes the previous
+stage's final response (`context_from`), and a stage only becomes claimable once its
+predecessor completed (`dependencies`). `stages` selects a subset (implement is required).
+
+Parallelism: raise `max_in_progress` to run multiple jobs concurrently; `serialize_per_repo`
+(default true) ensures at most one job per repository at a time, so parallel jobs across
+different repos are safe while same-repo jobs queue behind each other.
 
 ## Delivery modes
 

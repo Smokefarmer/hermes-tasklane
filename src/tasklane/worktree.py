@@ -316,6 +316,17 @@ def job_prompt(record: Dict[str, Any]) -> str:
             "- Work only in the repo path above; do not edit the original checkout.",
             "",
         ]
+    upstream = (spec.get("metadata") or {}).get("upstream_context") or []
+    if upstream:
+        lines += ["Context from upstream pipeline jobs (read before planning):", ""]
+        for entry in upstream:
+            if not isinstance(entry, dict):
+                continue
+            header = f"--- upstream job {entry.get('job_id')}"
+            if entry.get("title"):
+                header += f" ({entry['title']})"
+            header += f" [{entry.get('state') or '?'}] ---"
+            lines += [header, str(entry.get("final_response") or entry.get("note") or ""), ""]
     lines += [
         "Scope contract:",
         f"- allowed_paths: {', '.join(map(str, allowed_paths)) if allowed_paths else '(none declared)'}",

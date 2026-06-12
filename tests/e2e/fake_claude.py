@@ -41,16 +41,32 @@ def git(*args: str) -> None:
     subprocess.run(["git", *args], check=True, capture_output=True, text=True)
 
 
+def job_id_from(prompt: str) -> str:
+    for line in prompt.splitlines():
+        if line.startswith("Job ID:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
 def main() -> None:
-    scenario = os.environ.get("FAKE_CLAUDE_SCENARIO", "report_only")
     prompt = arg("-p")
     is_repair = prompt.startswith("TaskLane delivery validation failed")
+    job_id = job_id_from(prompt)
+
+    # per-job scenario map takes precedence over the global scenario
+    scenario = os.environ.get("FAKE_CLAUDE_SCENARIO", "report_only")
+    scenario_map = os.environ.get("FAKE_CLAUDE_SCENARIO_MAP")
+    if scenario_map and job_id:
+        scenario = json.loads(scenario_map).get(job_id, scenario)
 
     state_dir = os.environ.get("FAKE_CLAUDE_STATE")
     if state_dir:
         calls = Path(state_dir) / "calls"
         n = int(calls.read_text()) if calls.exists() else 0
         calls.write_text(str(n + 1))
+        (Path(state_dir) / f"prompt-{n + 1}.txt").write_text(prompt)
+        if job_id:
+            (Path(state_dir) / f"prompt-{job_id}.txt").write_text(prompt)
 
     if scenario == "report_only":
         out("Analysis complete. No changes required.")

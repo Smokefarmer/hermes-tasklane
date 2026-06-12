@@ -13,6 +13,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -152,6 +153,100 @@ def create_task(
         spec["id"] = id
     record = _store().put(spec)
     return {"id": record["id"], "state": record["state"]}
+
+
+_PIPELINE_STAGES = ("plan", "implement", "review")
+
+
+def _pipeline_stage_specs(base_id: str, repo: str, title: str, body: str, *, stages: list[str],
+                          work_branch: str, base_branch: str, pr_target: str | None,
+                          delivery_mode: str) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    prior_stage_id: str | None = None
+    for stage in stages:
+        stage_id = f"{base_id}-{stage}"
+        if stage == "plan":
+            spec: dict[str, Any] = {
+                "id": stage_id,
+                "repo": {"path": repo},
+                "request": {"type": "task", "title": f"[plan] {title}",
+                            "body": ("Planning stage of a TaskLane pipeline. Produce a concrete, "
+                                     "step-by-step implementation plan for the task below: files to "
+                                     "touch, approach, risks, and test strategy. Do NOT modify any "
+                                     f"files.\n\nTask:\n{body}")},
+                "branch": {"mode": "detached-review", "base_branch": base_branch},
+                "delivery_mode": "report-only",
+            }
+        elif stage == "implement":
+            spec = {
+                "id": stage_id,
+                "repo": {"path": repo},
+                "request": {"type": "task", "title": f"[implement] {title}", "body": body},
+                "branch": {"mode": "new-branch", "base_branch": base_branch,
+                           "work_branch": work_branch, "pr_target": pr_target},
+                "delivery_mode": delivery_mode,
+            }
+        else:  # review
+            spec = {
+                "id": stage_id,
+                "repo": {"path": repo},
+                "request": {"type": "task", "title": f"[review] {title}",
+                            "body": (f"Review stage of a TaskLane pipeline. Review the changes on "
+                                     f"branch {work_branch} relative to {base_branch} "
+                                     f"(git diff {base_branch}...HEAD). Check correctness, security, "
+                                     "and test coverage. Report findings with severity; do NOT "
+                                     f"modify any files.\n\nOriginal task:\n{body}")},
+                "branch": {"mode": "detached-review", "base_branch": work_branch},
+                "delivery_mode": "report-only",
+            }
+        if prior_stage_id:
+            spec["dependencies"] = [prior_stage_id]
+            spec["context_from"] = [prior_stage_id]
+        specs.append(spec)
+        prior_stage_id = stage_id
+    return specs
+
+
+@mcp.tool()
+@audited
+def create_pipeline(
+    repo: str,
+    title: str,
+    body: str,
+    work_branch: str,
+    base_branch: str = "main",
+    pr_target: str | None = None,
+    delivery_mode: str = "pull-request",
+    id: str | None = None,
+    stages: str = "plan,implement,review",
+) -> dict[str, Any]:
+    """Create a multi-stage assembly-line pipeline as dependency-chained jobs:
+    plan (report-only) -> implement (delivers on work_branch) -> review (report-only
+    on the work branch). Each stage receives the previous stage's final response as
+    context. stages: comma-separated subset of plan,implement,review (implement
+    required). Returns the created job ids in execution order."""
+    cfg = _cfg()
+    if not repo_path_allowed(repo, cfg):
+        raise ValueError(f"repo path not in allowlist: {repo}")
+    wanted = [s.strip().lower() for s in stages.split(",") if s.strip()]
+    unknown = [s for s in wanted if s not in _PIPELINE_STAGES]
+    if unknown:
+        raise ValueError(f"unknown stages: {', '.join(unknown)} (allowed: {', '.join(_PIPELINE_STAGES)})")
+    ordered = [s for s in _PIPELINE_STAGES if s in wanted]
+    if "implement" not in ordered:
+        raise ValueError("the implement stage is required")
+    if delivery_mode == "pull-request" and not pr_target:
+        pr_target = base_branch
+    base_id = (id or "").strip() or re.sub(r"[^a-z0-9_.-]+", "-", title.lower()).strip("-._") or "pipeline"
+    specs = _pipeline_stage_specs(base_id, repo, title, body, stages=ordered,
+                                  work_branch=work_branch, base_branch=base_branch,
+                                  pr_target=pr_target, delivery_mode=delivery_mode)
+    store = _store()
+    clashes = [s["id"] for s in specs if store.get(s["id"]) is not None]
+    if clashes:
+        raise ValueError(f"job ids already exist: {', '.join(clashes)}")
+    created = [store.put(spec) for spec in specs]
+    return {"pipeline": base_id, "jobs": [{"id": r["id"], "state": r["state"]} for r in created]}
 
 
 @mcp.tool()

@@ -113,6 +113,39 @@ def _fail_or_requeue(store: JobStore, cfg: Config, job_id: str, *, reason: str,
     return "blocked"
 
 
+_CONTEXT_EXCERPT_CHARS = 4000
+
+
+def inject_upstream_context(store: JobStore, record: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach completed upstream jobs' final responses (spec.context_from) to the
+    record so job_prompt renders them. Missing/unfinished upstream jobs are noted
+    rather than fatal — dependencies gating should normally prevent that."""
+    spec = record.get("spec") if isinstance(record.get("spec"), dict) else {}
+    upstream_ids = [str(j).strip() for j in spec.get("context_from") or [] if str(j).strip()]
+    if not upstream_ids:
+        return record
+    entries = []
+    for upstream_id in upstream_ids:
+        upstream = store.get(upstream_id)
+        if upstream is None:
+            entries.append({"job_id": upstream_id, "note": "upstream job not found"})
+            continue
+        response = str(((upstream.get("result") or {}).get("final_response")) or "").strip()
+        entries.append({
+            "job_id": upstream_id,
+            "title": ((upstream.get("spec") or {}).get("request") or {}).get("title"),
+            "state": upstream.get("state"),
+            "final_response": response[:_CONTEXT_EXCERPT_CHARS] or "(no final response recorded)",
+        })
+    prepared = dict(record)
+    prepared_spec = dict(spec)
+    metadata = dict(prepared_spec.get("metadata") or {})
+    metadata["upstream_context"] = entries
+    prepared_spec["metadata"] = metadata
+    prepared["spec"] = prepared_spec
+    return prepared
+
+
 def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
     """Execute one already-claimed (running) job to completion/failure."""
     job_id = str(record.get("id") or "")
@@ -135,6 +168,7 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
             # Persist worktree location on the record so the MCP fix-tools can find
             # the worktree of a blocked/failed job (kept on failure).
             store.transition(job_id, "running", reason="workspace-recorded", updates={"worktree": worktree_info})
+        prepared_record = inject_upstream_context(store, prepared_record)
         prompt = job_prompt(prepared_record)
         workspace_path = str((worktree_info or {}).get("worktree_path") or "") or str((prepared_record.get("spec") or {}).get("repo", {}).get("path") or "")
         _append_log(job_id, f"PROMPT:\n{prompt}")
@@ -203,6 +237,10 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
         logger.warning("Job %s failed (%s): %s", job_id, outcome, exc)
 
 
+def _repo_key(record: Dict[str, Any]) -> str:
+    return str((((record.get("spec") or {}).get("repo")) or {}).get("key") or "").strip()
+
+
 def _reconcile_safely(store: JobStore, cfg: Config) -> None:
     try:
         report = reconcile(store, cfg)
@@ -240,13 +278,18 @@ def worker_loop(stop: threading.Event) -> None:
                         logger.info("Spend back under budget ($%.2f < $%.2f/24h); resuming claims",
                                     spend, cfg.daily_budget_usd)
                         budget_paused = False
-                running = len(store.list(states=["running"]))
-                slots = max(0, cfg.max_in_progress - running)
+                running_records = store.list(states=["running"])
+                slots = max(0, cfg.max_in_progress - len(running_records))
+                # serialize per repo: two jobs on the same repo can collide on
+                # branches/remotes even in separate worktrees
+                active_repo_keys = {_repo_key(r) for r in running_records if _repo_key(r)} if cfg.serialize_per_repo else set()
                 for _ in range(slots):
-                    record = store.claim_next(owner=_OWNER)
+                    record = store.claim_next(owner=_OWNER, active_repo_keys=active_repo_keys)
                     if not record:
                         break
                     logger.info("Claimed job %s", record.get("id"))
+                    if cfg.serialize_per_repo and _repo_key(record):
+                        active_repo_keys.add(_repo_key(record))
                     pool.submit(run_job, store, cfg, record)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Worker loop error: %s", exc)

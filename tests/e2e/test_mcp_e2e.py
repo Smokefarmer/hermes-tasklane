@@ -97,8 +97,8 @@ def test_lifecycle_tools_over_mcp(mcp_http, git_repo):
                 await session.initialize()
 
                 tools = {t.name for t in (await session.list_tools()).tools}
-                assert {"create_task", "list_tasks", "get_task", "retry_task",
-                        "cancel_task", "reconcile_jobs", "task_events"} <= tools
+                assert {"create_task", "create_pipeline", "list_tasks", "get_task", "retry_task",
+                        "cancel_task", "reconcile_jobs", "metrics", "task_events"} <= tools
 
                 created = tool_payload(await session.call_tool("create_task", {
                     "repo": str(git_repo), "title": "e2e mcp", "body": "body",
