@@ -472,6 +472,41 @@ def metrics() -> dict[str, Any]:
 
 @mcp.tool()
 @audited
+def register_project(
+    path: str,
+    name: str,
+    test_command: str | None = None,
+    build_command: str | None = None,
+    docs: list[str] | None = None,
+    base_branch: str = "main",
+    default_model: str | None = None,
+    merge_policy: str = "manual",
+) -> dict[str, Any]:
+    """Register/update a project profile so every job on this repo is told its
+    test/build commands and which authoritative docs (CLAUDE.md, ADRs, rules dirs)
+    it MUST read. path must be an absolute git-repo path within the allowlist.
+    merge_policy (manual|auto) is informational. Returns the stored profile."""
+    from tasklane.projects import register_project as _register
+
+    cfg = _cfg()
+    if not repo_path_allowed(path, cfg):
+        raise ValueError(f"repo path not in allowlist: {path}")
+    return _register(path, name=name, test_command=test_command, build_command=build_command,
+                     docs=docs, base_branch=base_branch, default_model=default_model,
+                     merge_policy=merge_policy)
+
+
+@mcp.tool()
+@audited
+def list_projects() -> dict[str, Any]:
+    """List all registered project profiles as {repo_path: profile}."""
+    from tasklane.projects import list_projects as _list
+
+    return _list()
+
+
+@mcp.tool()
+@audited
 def reconcile_jobs() -> dict[str, Any]:
     """Recover orphaned running jobs (dead worker process) and remove stale claim
     locks. Safe to run anytime; the worker also runs this periodically."""

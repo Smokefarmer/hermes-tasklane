@@ -27,3 +27,8 @@ public_hostnames: []                # e.g. [tasklane.example.com] — required w
 allowed_origins: []                 # extra browser Origins to accept (usually empty)
 enable_admin_exec: false            # server-level shell tool, OFF by default
 exec_timeout_seconds: 600
+
+# --- project registry ---
+# Per-project profiles (test/build commands + authoritative docs every job must
+# read) live in a sibling file: $TASKLANE_HOME/projects.yaml. Manage it with the
+# register_project / list_projects MCP tools. See the "Project registry" README section.
