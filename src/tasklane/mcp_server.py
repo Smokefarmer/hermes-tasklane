@@ -91,6 +91,18 @@ from tasklane.mcp.ops import (  # noqa: F401
     test_deployment,
     worker_status,
 )
+from tasklane.mcp.integration_tools import (  # noqa: F401
+    disconnect_integration,
+    github_create_issue,
+    github_get_issue,
+    github_issue_to_task,
+    github_list_issues,
+    integration_status,
+    linear_get_issue,
+    linear_list_issues,
+    linear_to_github_issue,
+    set_integration_token,
+)
 from tasklane.mcp.status import _status_data, _status_html  # noqa: F401
 from tasklane.mcp.auth import AuthMiddleware
 

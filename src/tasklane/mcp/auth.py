@@ -9,6 +9,7 @@ from tasklane import oauth, pairing
 from tasklane.mcp.core import (
     _audit, _MAX_CLIENT_NAME_LENGTH, _MAX_PAIR_BODY_BYTES, logger,
 )
+from tasklane.mcp.connections import ConnectionsPage
 from tasklane.mcp.oauth_routes import OAuthEndpoints, issuer_from
 from tasklane.mcp.status import _status_data, _status_html
 
@@ -57,6 +58,7 @@ class AuthMiddleware:
         self.pairing_enabled = pairing_enabled
         self.oauth_enabled = oauth_enabled
         self.oauth_endpoints = OAuthEndpoints(app_token=token, enabled=oauth_enabled)
+        self.connections_page = ConnectionsPage(app_token=token)
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
@@ -73,6 +75,8 @@ class AuthMiddleware:
             return await self.oauth_endpoints.handle(scope, receive, send, headers, client_ip)
         if path == "/pair":
             return await self._pair(scope, receive, send, client_ip)
+        if path == ConnectionsPage.PATH:
+            return await self.connections_page.handle(scope, receive, send, client_ip)
         if path == "/status":
             # browser-friendly: token via ?token= or Authorization header
             from urllib.parse import parse_qs
