@@ -33,9 +33,12 @@ logger = logging.getLogger("tasklane.fanout")
 # Hard cap on drafts created from a single completion (budget/queue guard).
 PROPOSED_TASKS_CAP = 20
 
-# Matches a ```proposed_tasks fenced block; the opening fence may carry trailing
-# text (ignored) and the payload is captured up to the closing fence.
-_FENCE_RE = re.compile(r"```proposed_tasks[^\n]*\n(.*?)```", re.DOTALL)
+# Matches a real ```proposed_tasks fenced block: the fence must start a line
+# (optionally indented) and the tag must be followed only by optional whitespace
+# until the newline. This deliberately does NOT match an inline mention like
+# "...a fenced ```proposed_tasks``` block..." in prose (where backticks follow the
+# tag), so instructional text before the real block can't be captured by mistake.
+_FENCE_RE = re.compile(r"^[ \t]*```proposed_tasks[ \t]*\r?\n(.*?)```", re.DOTALL | re.MULTILINE)
 
 
 def extract_proposed_tasks_block(text: str | None) -> str | None:
@@ -74,11 +77,20 @@ def _draft_spec(parent: Mapping[str, Any], entry: Mapping[str, Any], draft_id: s
         raise ValueError("parent job has no repo.path; cannot target the same repo")
 
     title = str(entry.get("title") or "").strip()
-    body = str(entry.get("body") or entry.get("description") or entry.get("prompt") or "").strip()
+    # `look_for`/`goal` tolerated as body aliases (older audit-prompt habit).
+    body = str(
+        entry.get("body")
+        or entry.get("description")
+        or entry.get("prompt")
+        or entry.get("look_for")
+        or entry.get("goal")
+        or ""
+    ).strip()
     request_type = str(entry.get("type") or "task-small").strip() or "task-small"
 
     source: dict[str, Any] = {"proposed_by": str(parent.get("id") or "")}
-    severity = str(entry.get("severity") or "").strip()
+    # `severity_rationale` tolerated as a severity alias.
+    severity = str(entry.get("severity") or entry.get("severity_rationale") or "").strip()
     if severity:
         source["severity"] = severity
 

@@ -57,16 +57,21 @@ exhaustively here. Survey broadly, then propose scoped child audits (report-only
 investigations) so each agent can read every relevant line in its slice. Good slices
 follow the surface: auth, session handling, database/query layer, frontend/XSS
 surface, API input validation, secrets/config handling, dependency CVEs. Emit a
-single fenced block tagged `proposed_tasks` — a JSON array, each object exactly:
+single fenced block tagged `proposed_tasks` — a **JSON array**, each object exactly
+these fields (the draft fan-out parses this shape):
 
 ```proposed_tasks
-[{{"title":"precise audit title","allowed_paths":["src/auth","src/session.py"],"look_for":"what classes of vulnerability to hunt for in this slice","severity_rationale":"why this slice matters and how bad a hit here would be"}}]
+[{{"title": "Audit the authentication flow", "body": "Read every line under src/auth. Hunt for: missing authz checks, timing-unsafe token compares, session fixation, password/token handling. Report findings in the structured JSON contract; do not modify code. Rationale: a hit here is account takeover.", "type": "task-small", "allowed_paths": ["src/auth", "src/session.py"], "severity": "high"}}]
 ```
 
-Rules for proposed child audits: each is **report-only** (read, never modify),
-scoped tightly via `allowed_paths` to files/dirs an agent can fully read, and
-focused on one concern. Still report any findings you are already certain of in the
-JSON findings block below — decomposition does not excuse sitting on a known bug.
+Each object MUST have: `title`, `body` (a self-contained brief — the slice to read,
+the vulnerability classes to hunt, and why it matters; enough for a fresh agent),
+`type` (`task-small`), `allowed_paths` (tight enough to read every line), and
+`severity` (`critical`|`high`|`medium`|`low`, your worst-case rating for the slice).
+Emit valid JSON, not a bullet list. Each proposed child is **report-only** (read,
+never modify), scoped to one concern. Still report any findings you are already
+certain of in the JSON findings block below — decomposition does not excuse sitting
+on a known bug.
 
 Findings format (parent and every child use the SAME contract as the review role, so
 security findings flow into the same downstream machinery). Emit a single fenced JSON

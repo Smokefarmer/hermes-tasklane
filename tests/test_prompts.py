@@ -204,9 +204,10 @@ def test_job_prompt_audit_role_has_owasp_decomposition_and_rules():
     assert "OWASP Top 10" in prompt
     assert "survey" in prompt.lower() and "attack surface" in prompt.lower()
     # decomposition: proposed_tasks contract with its scoped-child fields
+    # (canonical fan-out shape: title/body/type/allowed_paths/severity)
     assert "proposed_tasks" in prompt
     assert "allowed_paths" in prompt
-    assert "severity_rationale" in prompt
+    assert '"body"' in prompt and '"severity"' in prompt
     # same JSON findings contract as the review role (rendered, braces un-escaped)
     assert '"severity":"critical|high|medium|low"' in prompt
     assert '"suggestion"' in prompt

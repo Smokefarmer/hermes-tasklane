@@ -80,18 +80,22 @@ and import-graph inspection rather than assuming the layout.
 2. Commit and deliver the review document per the delivery rules above. The
    review document IS the deliverable — it arrives as a reviewable branch.
 3. **End your final response with a fenced ```proposed_tasks``` block** of
-   remediation tasks distilled from your findings. The draft fan-out from
-   the base branch parses this block, so emit it exactly. Each task is one
-   bullet: a concrete, scoped remediation with the target file(s) and the
-   severity it addresses. Order by risk (highest first). Shape:
+   remediation tasks distilled from your findings. The draft fan-out parses
+   this block as a **JSON array**, so emit it exactly in this shape — one
+   object per remediation, ordered by risk (highest first):
 
    ```proposed_tasks
-   - [high] Break god-module src/foo/bar.py (820 lines) into focused units: extract X, Y, Z.
-   - [high] Remove circular import between core and infra: invert the dependency at src/a.py:120.
-   - [medium] Add a repository boundary around the raw DB calls scattered in src/svc/*.py.
-   - [low] Delete dead code: unreferenced helpers in src/util/legacy.py.
+   [{{"title": "Break up the god-module src/foo/bar.py", "body": "src/foo/bar.py is 820 lines mixing X, Y, Z. Extract each concern into its own focused module under src/foo/, keep the public API stable, and add/move tests accordingly.", "type": "refactor-large", "allowed_paths": ["src/foo/"], "severity": "high"}},
+    {{"title": "Remove circular import between core and infra", "body": "core imports infra and vice-versa at src/a.py:120. Invert the dependency (define an interface in core, implement it in infra).", "type": "refactor-large", "allowed_paths": ["src/a.py", "src/infra/"], "severity": "high"}},
+    {{"title": "Delete dead code in src/util/legacy.py", "body": "These helpers are unreferenced. Remove them and any now-dead imports.", "type": "task-small", "allowed_paths": ["src/util/legacy.py"], "severity": "low"}}]
    ```
 
-Do not invent remediation tasks beyond what your findings support. If a
-pass surfaces nothing, say so explicitly rather than padding. Deliver the
+   Each object MUST have: `title` (concise), `body` (a self-contained brief — what
+   to change and why, enough for a fresh agent), `type`
+   (`bug-small`|`task-small`|`feature-large`|`refactor-large`), `allowed_paths`
+   (the files/dirs in scope), and `severity` (`critical`|`high`|`medium`|`low`).
+   Emit valid JSON (double-quoted keys/strings), not a bullet list.
+
+Do not invent remediation tasks beyond what your findings support. If a pass
+surfaces nothing, emit an empty array `[]` rather than padding. Deliver the
 written review and end with the ```proposed_tasks``` block.

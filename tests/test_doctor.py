@@ -1,9 +1,20 @@
 """Unit tests for the ``tasklane doctor`` diagnostics command."""
 
 import os
+import subprocess
 
 import pytest
 import yaml
+
+
+def _dead_pid() -> int:
+    """PID of a child that has exited and been reaped — guaranteed not alive.
+
+    Avoids magic constants like 999999 that can be a live PID on a busy host.
+    """
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
 
 from tasklane import cli
 from tasklane.config import Config
@@ -127,7 +138,7 @@ def test_check_orphaned_jobs_warns_on_dead_claimant(tmp_path):
         "delivery_mode": "report-only",
     }
     store.put(spec)
-    store.claim_next(owner="worker-999999")  # PID that is not alive
+    store.claim_next(owner=f"worker-{_dead_pid()}")  # PID guaranteed not alive
     result = check_orphaned_jobs(store)
     assert result.status == WARN
     assert "job-1" in result.detail
