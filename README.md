@@ -145,7 +145,8 @@ competent operator:
 
 - **Lifecycle:** `create_task`, `create_pipeline`, `analyze_project`, `security_audit`, `list_tasks`,
   `get_task`, `task_events`, `task_logs`, `retry_task`, `cancel_task`, `run_task_now`
-- **Inspect & fix** (confined to the job's worktree): `get_diff`, `list_dir`, `read_file`,
+- **Inspect & fix** (operate on the job's worktree; `exec`/`git`/`run_tests` are cwd-scoped
+  shells, not a sandbox — see Security): `get_diff`, `list_dir`, `read_file`,
   `write_file`, `apply_patch`, `exec`, `git`, `run_tests`
 - **Pairing:** `pairing_requests`, `approve_client`, `reject_client`, `list_clients`,
   `revoke_client`
@@ -276,8 +277,16 @@ It never mutates state; run `tasklane reconcile` to act on stale locks / orphane
 - Bound to `127.0.0.1`; expose only through a proxy/tunnel. Every request needs the bearer token
   (constant-time compare); unauthorized attempts are audit-logged with client IP. DNS-rebinding
   protection is on. Add a second gate (e.g. Cloudflare Access) for defense in depth.
-- `exec`/`write_file`/`apply_patch` are confined to a job's worktree (path traversal rejected).
-- `admin_exec` (unconfined server shell) is disabled unless explicitly enabled.
+- `write_file`/`apply_patch`/`read_file`/`list_dir` are path-confined to a job's worktree
+  (traversal outside it is rejected), and mutating tools refuse to run on a job with no live
+  worktree (they never touch your original checkout).
+- `exec`/`git`/`run_tests` set their **cwd** to the worktree but run a full `bash -lc` shell —
+  they are **not a sandbox**: an absolute path or `cd ..` can reach the rest of the filesystem
+  as the server user. They are gated only by the bearer token. Treat any paired/token-holding
+  client as able to run code on the host. Real confinement would need an OS sandbox
+  (bubblewrap / firejail / unshare / a container) — see the roadmap.
+- `admin_exec` (explicitly unconfined server shell, not even cwd-scoped) is disabled unless
+  `enable_admin_exec: true`.
 - Jobs run via `claude -p` on your Claude subscription (legitimate Claude Code usage).
 
 > ⚠️ This is a remote code-execution control plane by design. Keep `app_token` secret and rotate

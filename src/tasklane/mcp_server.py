@@ -117,14 +117,39 @@ def _get_record(job_id: str) -> dict[str, Any]:
     return record
 
 
-def _worktree_dir(record: dict[str, Any]) -> Path:
+def _live_worktree(record: dict[str, Any]) -> Path | None:
+    """The job's isolated worktree if it still exists on disk, else None."""
     wt = (record.get("worktree") or {}).get("worktree_path")
     if wt and Path(wt).is_dir():
         return Path(wt)
+    return None
+
+
+def _worktree_dir(record: dict[str, Any]) -> Path:
+    """Directory for a MUTATING fix tool. Strictly the job's isolated worktree —
+    NEVER falls back to spec.repo.path (the user's real checkout). A job with no
+    live worktree (draft / report-only / completed-and-cleaned) refuses to be
+    mutated rather than silently editing the original repository."""
+    live = _live_worktree(record)
+    if live is not None:
+        return live
+    raise FileNotFoundError(
+        f"job {record.get('id')} has no live worktree (state={record.get('state')}); "
+        "refusing to operate on the original checkout"
+    )
+
+
+def _readable_dir(record: dict[str, Any]) -> tuple[Path, bool]:
+    """Directory for a READ-ONLY tool. Prefers the live worktree; falls back to
+    the original checkout when none exists. Returns (path, is_original) so callers
+    can label that they are reading the user's real repo, not a sandbox."""
+    live = _live_worktree(record)
+    if live is not None:
+        return live, False
     repo = ((record.get("spec") or {}).get("repo") or {}).get("path")
     if repo and Path(repo).expanduser().is_dir():
-        return Path(repo).expanduser()
-    raise FileNotFoundError(f"no worktree available for job {record.get('id')} (state={record.get('state')})")
+        return Path(repo).expanduser(), True
+    raise FileNotFoundError(f"no worktree or repo path available for job {record.get('id')} (state={record.get('state')})")
 
 
 def _safe_path(base: Path, rel: str) -> Path:
@@ -516,9 +541,10 @@ def reject_draft(job_id: str, reason: str = "") -> dict[str, Any]:
 @audited
 def get_diff(job_id: str) -> dict[str, Any]:
     """Show the job worktree's git state: status, unstaged diff, and staged diff."""
-    wt = _worktree_dir(_get_record(job_id))
+    wt, is_original = _readable_dir(_get_record(job_id))
     return {
         "worktree": str(wt),
+        "target": "original-repo" if is_original else "worktree",
         "status": _run(["git", "status", "--porcelain", "--branch"], cwd=wt, timeout=30),
         "diff": _run(["git", "diff"], cwd=wt, timeout=30),
         "staged_diff": _run(["git", "diff", "--cached"], cwd=wt, timeout=30),
@@ -528,8 +554,8 @@ def get_diff(job_id: str) -> dict[str, Any]:
 @mcp.tool()
 @audited
 def list_dir(job_id: str, path: str = ".") -> dict[str, Any]:
-    """List a directory inside the job worktree."""
-    wt = _worktree_dir(_get_record(job_id))
+    """List a directory inside the job worktree (or the original repo if no worktree)."""
+    wt, is_original = _readable_dir(_get_record(job_id))
     target = _safe_path(wt, path)
     if not target.is_dir():
         raise NotADirectoryError(f"not a directory: {path}")
@@ -537,19 +563,21 @@ def list_dir(job_id: str, path: str = ".") -> dict[str, Any]:
     for child in sorted(target.iterdir()):
         entries.append({"name": child.name, "type": "dir" if child.is_dir() else "file",
                         "size": child.stat().st_size if child.is_file() else None})
-    return {"path": str(target.relative_to(wt.resolve())), "entries": entries}
+    return {"path": str(target.relative_to(wt.resolve())),
+            "target": "original-repo" if is_original else "worktree", "entries": entries}
 
 
 @mcp.tool()
 @audited
 def read_file(job_id: str, path: str) -> dict[str, Any]:
-    """Read a file inside the job worktree (truncated to 200KB)."""
-    wt = _worktree_dir(_get_record(job_id))
+    """Read a file inside the job worktree (or the original repo if no worktree; truncated to 200KB)."""
+    wt, is_original = _readable_dir(_get_record(job_id))
     target = _safe_path(wt, path)
     if not target.is_file():
         raise FileNotFoundError(f"not a file: {path}")
     data = target.read_bytes()[:_MAX_READ_BYTES]
     return {"path": path, "truncated": target.stat().st_size > _MAX_READ_BYTES,
+            "target": "original-repo" if is_original else "worktree",
             "content": data.decode("utf-8", errors="replace")}
 
 
@@ -580,7 +608,9 @@ def apply_patch(job_id: str, unified_diff: str) -> dict[str, Any]:
 @mcp.tool()
 @audited
 def exec(job_id: str, command: str, timeout: int | None = None) -> dict[str, Any]:
-    """Run a shell command inside the job worktree (bash -lc). Full power within the worktree."""
+    """Run a shell command with cwd set to the job worktree (bash -lc). NOT a sandbox:
+    cwd-scoped only — absolute paths or `cd ..` reach the rest of the filesystem as the
+    server user. Gated by the bearer token. Refuses jobs with no live worktree."""
     wt = _worktree_dir(_get_record(job_id))
     t = int(timeout or _cfg().exec_timeout_seconds)
     return _run(["bash", "-lc", command], cwd=wt, timeout=t)
@@ -589,7 +619,9 @@ def exec(job_id: str, command: str, timeout: int | None = None) -> dict[str, Any
 @mcp.tool()
 @audited
 def git(job_id: str, args: str) -> dict[str, Any]:
-    """Run a git command inside the job worktree, e.g. args='status --short' or 'commit -am fix'."""
+    """Run a git command with cwd set to the job worktree (e.g. args='status --short').
+    Like `exec`, this is a cwd-scoped `bash -lc` shell, NOT a sandbox. Refuses jobs with
+    no live worktree."""
     wt = _worktree_dir(_get_record(job_id))
     return _run(["bash", "-lc", f"git {args}"], cwd=wt, timeout=120)
 
