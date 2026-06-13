@@ -92,6 +92,26 @@ claude mcp add --transport http tasklane https://tasklane.<your-domain>/mcp \
 A browser status page is available at `https://tasklane.<your-domain>/status?token=<app_token>`
 (worker health + recent jobs, auto-refresh).
 
+### From claude.ai / Claude mobile + desktop (OAuth connector)
+
+The `--header` form above works for Claude Code (CLI), which can send a static bearer token.
+The Claude **apps** (web / mobile / desktop) can't store a header — they speak the MCP OAuth
+flow. TaskLane is a full OAuth 2.1 authorization + resource server (`oauth_enabled: true`), so
+you add it as a **custom connector**:
+
+1. In Claude, add a custom connector with URL `https://tasklane.<your-domain>/mcp`.
+2. Claude discovers the OAuth metadata (`/.well-known/oauth-protected-resource` →
+   `/.well-known/oauth-authorization-server`), registers itself (Dynamic Client Registration),
+   and opens TaskLane's **consent page** in your browser.
+3. The consent page is the operator gate: **enter your `app_token` to approve** the connector.
+4. Claude receives an OAuth token (short-lived access + rotating refresh) and stores it itself —
+   no token to copy. It works from your phone, the web, and the desktop app thereafter.
+
+Security: PKCE (S256) is required, redirect URIs are matched exactly, access tokens are
+audience-bound to this server and stored only as SHA-256 hashes. Revoke a connector with
+`oauth.revoke_client_tokens(client_id)` (or disable the whole flow with `oauth_enabled: false`).
+The legacy `app_token` header and the pairing flow keep working alongside it.
+
 ### Connecting a new client (pairing)
 
 Instead of sharing the `app_token`, a new client can request its own credential

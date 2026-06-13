@@ -50,6 +50,7 @@ class Config:
     enable_admin_exec: bool = False  # server-level shell (off by default)
     exec_timeout_seconds: int = 600
     pairing_enabled: bool = True  # allow clients to request pairing via POST /pair (operator approval required)
+    oauth_enabled: bool = True  # OAuth 2.1 connector flow for claude.ai/mobile/desktop (operator approves with app_token)
 
 
 _DEFAULTS_COMMENT = """\
@@ -86,6 +87,7 @@ def _coerce(data: dict[str, Any]) -> Config:
         enable_admin_exec=bool(data.get("enable_admin_exec", defaults.enable_admin_exec)),
         exec_timeout_seconds=int(data.get("exec_timeout_seconds", defaults.exec_timeout_seconds)),
         pairing_enabled=bool(data.get("pairing_enabled", defaults.pairing_enabled)),
+        oauth_enabled=bool(data.get("oauth_enabled", defaults.oauth_enabled)),
     )
 
 
@@ -113,6 +115,7 @@ def _write_default() -> Config:
         "enable_admin_exec": False,
         "exec_timeout_seconds": 600,
         "pairing_enabled": True,
+        "oauth_enabled": True,
     }
     path.write_text(_DEFAULTS_COMMENT + yaml.safe_dump(body, sort_keys=False), encoding="utf-8")
     os.chmod(path, 0o600)

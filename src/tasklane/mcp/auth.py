@@ -5,10 +5,11 @@ from __future__ import annotations
 import hmac
 import json
 
-from tasklane import pairing
+from tasklane import oauth, pairing
 from tasklane.mcp.core import (
     _audit, _MAX_CLIENT_NAME_LENGTH, _MAX_PAIR_BODY_BYTES, logger,
 )
+from tasklane.mcp.oauth_routes import OAuthEndpoints, issuer_from
 from tasklane.mcp.status import _status_data, _status_html
 
 
@@ -48,11 +49,14 @@ class AuthMiddleware:
     """Pure-ASGI gate: app bearer token or approved paired-client token,
     plus Origin validation (anti DNS-rebind)."""
 
-    def __init__(self, app, *, token: str, allowed_origins: set[str], pairing_enabled: bool = False):
+    def __init__(self, app, *, token: str, allowed_origins: set[str], pairing_enabled: bool = False,
+                 oauth_enabled: bool = False):
         self.app = app
         self.token = token
         self.allowed_origins = allowed_origins
         self.pairing_enabled = pairing_enabled
+        self.oauth_enabled = oauth_enabled
+        self.oauth_endpoints = OAuthEndpoints(app_token=token, enabled=oauth_enabled)
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
@@ -62,6 +66,11 @@ class AuthMiddleware:
         if path == "/health":
             return await self._json(send, 200, {"status": "ok"})
         client_ip = headers.get("cf-connecting-ip") or (headers.get("x-forwarded-for", "").split(",")[0].strip()) or "?"
+        # OAuth connector flow (discovery, DCR, authorize, token) — public, pre-auth.
+        # Always routed: the handler returns 404 when oauth is disabled, so these
+        # known routes never fall through to the bearer-token 401.
+        if path in OAuthEndpoints.PATHS:
+            return await self.oauth_endpoints.handle(scope, receive, send, headers, client_ip)
         if path == "/pair":
             return await self._pair(scope, receive, send, client_ip)
         if path == "/status":
@@ -87,24 +96,36 @@ class AuthMiddleware:
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         if not self._authorized(token):
             _audit("auth", {"ip": client_ip, "path": path, "reason": "bad-token"}, "rejected")
-            return await self._json(send, 401, {"error": "invalid or missing bearer token"})
+            # RFC 9728: point unauthenticated clients at the resource metadata so
+            # they can discover the OAuth flow (this is what triggers the connector
+            # login in claude.ai / the Claude apps).
+            extra = []
+            if self.oauth_enabled:
+                meta = f'{issuer_from(headers)}/.well-known/oauth-protected-resource'
+                extra = [(b"www-authenticate", f'Bearer resource_metadata="{meta}"'.encode("latin-1"))]
+            return await self._json(send, 401, {"error": "invalid or missing bearer token"}, extra_headers=extra)
         return await self.app(scope, receive, send)
 
     def _authorized(self, token: str) -> bool:
-        """True for the legacy app token or an approved, non-revoked paired client.
+        """True for the legacy app token, an approved paired client, or a valid
+        OAuth access token.
 
-        Fails closed: any error in the pairing path denies (clean 401) rather
-        than propagating out of the ASGI middleware as a 500.
+        Fails closed: any error in the pairing/oauth path denies (clean 401)
+        rather than propagating out of the ASGI middleware as a 500.
         """
         if self.token and hmac.compare_digest(token, self.token):
             return True
-        if not self.pairing_enabled or not token:
+        if not token:
             return False
         try:
-            return pairing.authenticate(token) is not None
+            if self.pairing_enabled and pairing.authenticate(token) is not None:
+                return True
+            if self.oauth_enabled and oauth.authenticate(token) is not None:
+                return True
         except Exception:  # noqa: BLE001 — auth must never 500
-            logger.warning("pairing.authenticate raised; denying", exc_info=True)
+            logger.warning("token authentication raised; denying", exc_info=True)
             return False
+        return False
 
     async def _pair(self, scope, receive, send, client_ip: str) -> None:
         """Public pairing endpoint: POST {"name": ...} -> pending client + one-time token."""
@@ -128,10 +149,11 @@ class AuthMiddleware:
         return await self._json(send, 200, result)
 
     @staticmethod
-    async def _json(send, status: int, payload: dict) -> None:
+    async def _json(send, status: int, payload: dict, *, extra_headers=None) -> None:
         body = json.dumps(payload).encode()
-        await send({"type": "http.response.start", "status": status,
-                    "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]
+        headers += extra_headers or []
+        await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 
     @staticmethod
