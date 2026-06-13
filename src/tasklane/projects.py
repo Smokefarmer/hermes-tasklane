@@ -28,6 +28,7 @@ to the prompt.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from tasklane.config import Config, load_config
@@ -38,6 +39,7 @@ class ProjectProfile:
     """Immutable test/deploy profile for one project."""
 
     key: str
+    repo: Optional[str] = None
     env_file: Optional[str] = None
     local_test_command: Optional[str] = None
     staging_url: Optional[str] = None
@@ -66,12 +68,44 @@ def profile_from_mapping(key: str, data: Mapping[str, Any]) -> ProjectProfile:
     """Build a :class:`ProjectProfile` from a raw config mapping."""
     return ProjectProfile(
         key=key,
+        repo=_optional_str(data.get("repo")),
         env_file=_optional_str(data.get("env_file")),
         local_test_command=_optional_str(data.get("local_test_command")),
         staging_url=_optional_str(data.get("staging_url")),
         staging_url_command=_optional_str(data.get("staging_url_command")),
         test_notes=_optional_str(data.get("test_notes")),
     )
+
+
+def _resolve(path_text: str) -> Optional[Path]:
+    try:
+        return Path(path_text).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def find_project_for_repo(repo: Any, cfg: Optional[Config] = None) -> Optional[ProjectProfile]:
+    """Return the project profile whose ``repo`` field resolves to *repo*, or ``None``.
+
+    Used by the credential-intake tools to bind a repo path (which a remote client
+    knows) to its registered project profile (which holds the secret env file). A
+    project is *registered for a repo* only when its config entry carries a matching
+    ``repo:`` path.
+    """
+    target_text = _optional_str(repo)
+    if not target_text:
+        return None
+    target = _resolve(target_text)
+    if target is None:
+        return None
+    config = cfg if cfg is not None else load_config()
+    for key, data in (config.projects or {}).items():
+        if not isinstance(data, Mapping):
+            continue
+        candidate = _optional_str(data.get("repo"))
+        if candidate and _resolve(candidate) == target:
+            return profile_from_mapping(key, data)
+    return None
 
 
 def load_project_profile(project_key: Any, cfg: Optional[Config] = None) -> Optional[ProjectProfile]:

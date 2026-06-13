@@ -190,6 +190,30 @@ so the agent reads them from `os.environ` / `$VAR` but no value can leak into a 
 staging/test resources and test accounts only, no destructive operations against shared data,
 never print a secret value, and FAIL with a diagnosis rather than skip verification.
 
+**Conversational credential intake.** Credentials don't have to be hand-edited into
+`config.yaml` ahead of time — a connected client can capture them in the conversation.
+Three audited MCP tools manage a project's secret env file, and they only ever expose
+**KEY NAMES**, never values:
+
+- `list_project_secret_keys(repo)` — the names currently stored (e.g. `["TEST_PASSWORD", "TEST_USER"]`).
+- `set_project_secrets(repo, secrets)` — merge `{KEY: VALUE}` pairs into the project's
+  `env_file`. Keys must be `SCREAMING_SNAKE_CASE`; values non-empty, ≤4096 chars, ≤50 per call.
+  If the project has no `env_file` yet, one is created at `~/.tasklane/secrets/<project>.env`
+  (directory `0700`, file `0600`) and the registry entry is auto-linked to it.
+- `delete_project_secret(repo, key)` — drop one key (others untouched).
+
+The repo must be allowlisted **and** registered in the project registry — i.e. a `projects:`
+entry whose `repo:` matches the path. The typical flow: before launching a tester or a
+`…,test` pipeline, the client runs `list_project_secret_keys`; if `TEST_USER` / `TEST_PASSWORD`
+are missing it asks the human *"Is there a login? Please give me a demo/test user so I can
+verify the changes for you"*, stores the answer via `set_project_secrets`, and **never repeats
+the values back** in chat or job text.
+
+Security: `set_project_secrets` is exempt from the usual kwargs audit-logging — the audit
+entry records only the repo and the sorted **key names**, so a secret value never lands in
+`audit.log`. The values reach the secret file (mode 600) and, at run time, the tester
+subprocess env — nothing else.
+
 ## Delivery modes
 
 - `report-only` (`branch_mode: detached-review`) — analysis only; **no edits** (a dirty worktree fails).

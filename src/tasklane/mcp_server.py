@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -22,8 +23,15 @@ from typing import Any, Callable
 from mcp.server.fastmcp import FastMCP
 
 from tasklane import pairing
-from tasklane.config import Config, load_config, repo_path_allowed
+from tasklane.config import Config, load_config, repo_path_allowed, update_project_env_file
 from tasklane.paths import audit_log_path, logs_root, worktrees_root
+from tasklane.projects import ProjectProfile, find_project_for_repo
+from tasklane.secrets import (
+    default_secret_file_path,
+    load_env_file,
+    validate_secret_pairs,
+    write_secret_file,
+)
 from tasklane.store import JobStore
 from tasklane.worktree import cleanup_worktree
 
@@ -36,7 +44,47 @@ _MAX_OUT = 20_000
 _MAX_PAIR_BODY_BYTES = 4_096
 _MAX_CLIENT_NAME_LENGTH = 120
 
-mcp = FastMCP("tasklane")
+USAGE = """\
+TaskLane is an autonomous coding-job control plane. You hand it a self-contained
+coding task; a server-side worker runs it with `claude -p` in an isolated git
+worktree, then commits / pushes / opens a PR. You stay the operator: brief jobs
+well, monitor them, and unblock the few that get stuck.
+
+WHEN TO DELEGATE: work that is >30 min of grind, parallelizable across repos, or
+best run overnight while you sleep (batch refactors, test backfill, dependency
+bumps, a queue of small bugfixes). DO NOT delegate tiny edits you can finish in
+the time it takes to write a brief, or anything needing live back-and-forth.
+
+ANATOMY OF A GOOD BRIEF (put it all in `body`): the goal; explicit acceptance
+criteria; how to verify (exact test/build command); explicit NON-goals / out of
+scope; and the files or modules in scope. Vague briefs produce blocked jobs.
+
+LIFECYCLE: create_task (one job) or create_pipeline (plan -> implement -> review,
+dependency-chained, each stage sees the prior stage's output). Then observe with
+get_task / task_events / task_logs. Terminal states: completed, blocked, failed,
+needs-human. BLOCKED means the job needs YOU: inspect with get_diff / read_file /
+exec, repair with write_file / apply_patch / git / run_tests inside the worktree,
+then retry_task (add `extra_instructions` to steer the next run).
+
+TESTER CREDENTIALS: a `test` stage (create_pipeline stages="...,test") or
+test_deployment verifies the app by RUNNING it, so it needs a test login. Before
+launching, call list_project_secret_keys(repo) — if it shows no TEST_USER /
+TEST_PASSWORD, ASK THE HUMAN: "Is there a login? Please give me a demo/test user
+so I can verify the changes for you", then store it with set_project_secrets(repo,
+{...}). NEVER repeat the values back in chat or job text; the server keeps them in
+a mode-600 file and exposes only the KEY NAMES. delete_project_secret removes one.
+
+ETIQUETTE: do NOT poll in a tight loop. Transient failures (workspace prep, agent
+errors) auto-retry with backoff; only `blocked` needs a human. Check back on your
+own cadence, or watch the /status page. Cancel with cancel_task; nudge a parked
+job with run_task_now.
+
+COST: each job records cost/tokens/turns on its record (get_task -> metrics).
+Store-wide spend and 24h totals come from the `metrics` tool. A configurable
+daily budget pauses new claims when reached, so queue deliberately.
+"""
+
+mcp = FastMCP("tasklane", instructions=USAGE)
 
 
 # --------------------------------------------------------------------------- #
@@ -61,7 +109,19 @@ def _audit(tool: str, info: dict[str, Any], status: str) -> None:
         logger.exception("audit write failed")
 
 
-def audited(fn: Callable) -> Callable:
+def audited(fn: Callable | None = None, *, redact: Callable[[dict], dict] | None = None) -> Callable:
+    """Wrap a tool so every call is audit-logged with its status.
+
+    By default the call's kwargs are logged verbatim. Tools that receive secret
+    material MUST pass ``redact=`` — a function that maps the raw kwargs to a
+    safe-to-persist subset (e.g. names without values) — because the audit log is a
+    plaintext file on disk. Positional args are never logged.
+    """
+    if fn is None:
+        return functools.partial(audited, redact=redact)
+
+    signature = inspect.signature(fn)
+
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         status = "ok"
@@ -71,7 +131,18 @@ def audited(fn: Callable) -> Callable:
             status = f"error:{type(exc).__name__}"
             return {"error": f"{type(exc).__name__}: {exc}"}
         finally:
-            _audit(fn.__name__, dict(kwargs), status)
+            # Bind args+kwargs to parameter names so the audit entry is identical
+            # whether the tool was called positionally (tests) or by keyword (MCP).
+            try:
+                info = dict(signature.bind_partial(*args, **kwargs).arguments)
+            except TypeError:
+                info = dict(kwargs)
+            if redact is not None:
+                try:
+                    info = redact(info)
+                except Exception:  # noqa: BLE001 — never let redaction failure leak raw kwargs
+                    info = {"redaction_error": True}
+            _audit(fn.__name__, info, status)
     return wrapper
 
 
@@ -497,6 +568,99 @@ def run_tests(job_id: str, command: str | None = None) -> dict[str, Any]:
         else:
             return {"error": "could not auto-detect a test command; pass command="}
     return _run(["bash", "-lc", cmd], cwd=wt, timeout=_cfg().exec_timeout_seconds)
+
+
+# --------------------------------------------------------------------------- #
+# project secret intake (conversational credential capture for TESTER roles)
+# --------------------------------------------------------------------------- #
+def _project_for_repo(repo: str) -> ProjectProfile:
+    """Resolve the registered project profile for *repo*, enforcing the allowlist."""
+    cfg = _cfg()
+    if not repo_path_allowed(repo, cfg):
+        raise ValueError(f"repo path not in allowlist: {repo}")
+    profile = find_project_for_repo(repo, cfg)
+    if profile is None:
+        raise ValueError(f"repo is not registered in the project registry: {repo}")
+    return profile
+
+
+def _read_existing_secrets(env_file: str | None) -> dict[str, str]:
+    """Load the current KEY=VALUE pairs from a project's env file (empty if unset/absent)."""
+    if not env_file:
+        return {}
+    path = Path(env_file).expanduser()
+    if not path.exists():
+        return {}
+    return load_env_file(path)
+
+
+def _redact_secret_kwargs(kwargs: dict) -> dict:
+    """Audit redactor for set_project_secrets: repo + sorted KEY NAMES only, never values."""
+    secrets = kwargs.get("secrets")
+    names = sorted(secrets) if isinstance(secrets, dict) else "<redacted>"
+    return {"repo": kwargs.get("repo"), "secret_keys": names}
+
+
+@mcp.tool()
+@audited(redact=_redact_secret_kwargs)
+def set_project_secrets(repo: str, secrets: dict[str, str]) -> dict[str, Any]:
+    """Store/merge test credentials for a project's TESTER roles (conversational intake).
+
+    repo must be allowlisted AND registered in the project registry (a project entry
+    whose repo: matches). secrets is a {KEY: VALUE} mapping: keys must be
+    SCREAMING_SNAKE_CASE (^[A-Z][A-Z0-9_]*$), values non-empty and <=4096 chars, at
+    most 50 keys. The pairs are merged into the project's env_file (mode 600); if the
+    project has none, a new file ~/.tasklane/secrets/<project>.env (dir 700, file 600)
+    is created and the registry entry is auto-linked to it.
+
+    SECURITY: never repeat the stored values back to the user. The audit log records
+    only repo + sorted KEY NAMES; the return value carries names only, never values."""
+    profile = _project_for_repo(repo)
+    validate_secret_pairs(secrets)
+    existing = _read_existing_secrets(profile.env_file)
+    merged = {**existing, **secrets}
+
+    linked = False
+    if profile.env_file:
+        target = write_secret_file(profile.env_file, merged)
+    else:
+        target = write_secret_file(default_secret_file_path(profile.key), merged, secure_parent=True)
+        update_project_env_file(profile.key, str(target))
+        linked = True
+
+    return {"project": profile.key, "env_file": str(target),
+            "keys_written": sorted(secrets), "key_names": sorted(merged),
+            "total_keys": len(merged), "registry_linked": linked}
+
+
+@mcp.tool()
+@audited
+def delete_project_secret(repo: str, key: str) -> dict[str, Any]:
+    """Remove a single secret KEY from a project's env file (other keys untouched).
+    Returns the remaining KEY NAMES (never values). No-op (removed=false) if the key
+    is absent. repo must be allowlisted and registered in the project registry."""
+    profile = _project_for_repo(repo)
+    if not profile.env_file:
+        raise FileNotFoundError(f"project {profile.key} has no secret env file")
+    existing = _read_existing_secrets(profile.env_file)
+    if key not in existing:
+        return {"project": profile.key, "removed": False, "key_names": sorted(existing)}
+    remaining = {k: v for k, v in existing.items() if k != key}
+    write_secret_file(profile.env_file, remaining)
+    return {"project": profile.key, "removed": True, "key_names": sorted(remaining)}
+
+
+@mcp.tool()
+@audited
+def list_project_secret_keys(repo: str) -> dict[str, Any]:
+    """List the secret KEY NAMES stored for a project (values are NEVER returned).
+    Use this before launching a tester/test stage: if TEST_USER/TEST_PASSWORD are
+    missing, ask the human for a demo/test login and store it with set_project_secrets.
+    repo must be allowlisted and registered in the project registry."""
+    profile = _project_for_repo(repo)
+    existing = _read_existing_secrets(profile.env_file)
+    return {"project": profile.key, "env_file": profile.env_file,
+            "key_names": sorted(existing)}
 
 
 # --------------------------------------------------------------------------- #

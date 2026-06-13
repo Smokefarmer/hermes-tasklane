@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List
@@ -139,6 +140,54 @@ def load_config() -> Config:
     if os.getenv("TASKLANE_APP_TOKEN"):
         cfg = Config(**{**cfg.__dict__, "app_token": os.environ["TASKLANE_APP_TOKEN"].strip()})
     return cfg
+
+
+def _leading_comment_block(text: str) -> str:
+    """Return the contiguous run of leading blank/``#`` comment lines (the file's
+    header), so a rewrite can preserve the security notes at the top of config.yaml."""
+    kept: list[str] = []
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#"):
+            kept.append(line)
+        else:
+            break
+    return "".join(kept)
+
+
+def update_project_env_file(project_key: str, env_file: str) -> None:
+    """Point the registry entry *project_key* at *env_file*, persisting config.yaml.
+
+    Used when conversational intake creates a brand-new secret file for a project
+    that had none. The whole config is round-tripped through YAML (inline comments
+    on individual keys are lost; the leading header block is preserved) and the file
+    is re-secured to mode ``0600``.
+    """
+    path = config_path()
+    raw_text = path.read_text(encoding="utf-8") if path.exists() else ""
+    data = yaml.safe_load(raw_text) if raw_text.strip() else {}
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a YAML mapping")
+    projects = dict(data.get("projects") or {})
+    entry = dict(projects.get(project_key) or {})
+    entry["env_file"] = env_file
+    projects[project_key] = entry
+    data = {**data, "projects": projects}
+    header = _leading_comment_block(raw_text)
+    body = header + yaml.safe_dump(data, sort_keys=False)
+    # Atomic write at mode 0600: the config holds the app token, so a reader must
+    # never observe a torn file or a momentarily world-readable one.
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".config-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
 
 
 def repo_path_allowed(repo_path: str, cfg: Config) -> bool:

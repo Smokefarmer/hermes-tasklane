@@ -35,9 +35,14 @@ pairing_enabled: true               # let new clients request access via POST /p
 # SECURITY: env_file is the ONLY place secrets live. The worker loads it (refusing it
 # unless mode 600 and owned by you) and injects the values into the claude subprocess;
 # the prompt only ever receives the KEY NAMES, never the values.
+# A `repo:` path binds the conversational intake tools (set_project_secrets /
+# list_project_secret_keys / delete_project_secret) to this project. The first
+# set_project_secrets call auto-creates ~/.tasklane/secrets/<project>.env (dir 700,
+# file 600) and fills in `env_file` below — so secrets need not be hand-edited here.
 projects: {}
 #   acme:
-#     env_file: /home/me/.secrets/acme.staging.env   # mode 600, owned by you, KEY=VALUE lines
+#     repo: /home/me/dev/acme                         # binds intake tools to this project
+#     env_file: /home/me/.secrets/acme.staging.env    # mode 600, owned by you, KEY=VALUE lines
 #     local_test_command: "npm run dev"
 #     staging_url: "https://staging.acme.example.com"
 #     staging_url_command: "railway domain --json"    # run to discover the URL
