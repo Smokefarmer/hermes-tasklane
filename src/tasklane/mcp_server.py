@@ -158,12 +158,14 @@ def create_task(
     return {"id": record["id"], "state": record["state"]}
 
 
-_PIPELINE_STAGES = ("plan", "implement", "review")
+_PIPELINE_STAGES = ("plan", "implement", "review", "test")
+# Stage name -> role template. The optional "test" stage uses the local TESTER role.
+_STAGE_ROLES = {"plan": "plan", "implement": "implement", "review": "review", "test": "test-local"}
 
 
 def _pipeline_stage_specs(base_id: str, repo: str, title: str, body: str, *, stages: list[str],
                           work_branch: str, base_branch: str, pr_target: str | None,
-                          delivery_mode: str) -> list[dict[str, Any]]:
+                          delivery_mode: str, project: str | None = None) -> list[dict[str, Any]]:
     specs: list[dict[str, Any]] = []
     prior_stage_id: str | None = None
     for stage in stages:
@@ -189,7 +191,7 @@ def _pipeline_stage_specs(base_id: str, repo: str, title: str, body: str, *, sta
                            "work_branch": work_branch, "pr_target": pr_target},
                 "delivery_mode": delivery_mode,
             }
-        else:  # review
+        elif stage == "review":
             spec = {
                 "id": stage_id,
                 "repo": {"path": repo},
@@ -202,8 +204,24 @@ def _pipeline_stage_specs(base_id: str, repo: str, title: str, body: str, *, sta
                 "branch": {"mode": "detached-review", "base_branch": work_branch},
                 "delivery_mode": "report-only",
             }
-        # Each pipeline stage selects its role-based prompt template (plan/implement/review).
-        spec["role"] = stage
+        else:  # test (local TESTER role): verify the implementation by running it
+            spec = {
+                "id": stage_id,
+                "repo": {"path": repo},
+                "request": {"type": "task-small", "title": f"[test] {title}",
+                            "body": (f"Test stage of a TaskLane pipeline. Verify the implementation on "
+                                     f"branch {work_branch} by actually RUNNING it (boot the app, exercise "
+                                     "the changed behaviour end-to-end). Report findings with severity and "
+                                     f"a PASS/FAIL verdict; do NOT modify any files.\n\nOriginal task:\n{body}")},
+                "branch": {"mode": "detached-review", "base_branch": work_branch},
+                "delivery_mode": "report-only",
+            }
+        # Each pipeline stage selects its role-based prompt template.
+        spec["role"] = _STAGE_ROLES[stage]
+        # The test stage needs the project profile to inject test credentials; other
+        # stages do not (and should not receive secrets they have no use for).
+        if stage == "test" and project:
+            spec["project"] = project
         if prior_stage_id:
             spec["dependencies"] = [prior_stage_id]
             spec["context_from"] = [prior_stage_id]
@@ -224,12 +242,16 @@ def create_pipeline(
     delivery_mode: str = "pull-request",
     id: str | None = None,
     stages: str = "plan,implement,review",
+    project: str | None = None,
 ) -> dict[str, Any]:
     """Create a multi-stage assembly-line pipeline as dependency-chained jobs:
     plan (report-only) -> implement (delivers on work_branch) -> review (report-only
-    on the work branch). Each stage receives the previous stage's final response as
-    context. stages: comma-separated subset of plan,implement,review (implement
-    required). Returns the created job ids in execution order."""
+    on the work branch) -> test (optional, report-only; verifies by running it). Each
+    stage receives the previous stage's final response as context. stages:
+    comma-separated subset of plan,implement,review,test (implement required); the
+    default omits test — pass stages="plan,implement,review,test" to opt in. project
+    (if set) selects the config project profile whose secret env file the test stage
+    uses for credentials. Returns the created job ids in execution order."""
     cfg = _cfg()
     if not repo_path_allowed(repo, cfg):
         raise ValueError(f"repo path not in allowlist: {repo}")
@@ -245,13 +267,64 @@ def create_pipeline(
     base_id = (id or "").strip() or re.sub(r"[^a-z0-9_.-]+", "-", title.lower()).strip("-._") or "pipeline"
     specs = _pipeline_stage_specs(base_id, repo, title, body, stages=ordered,
                                   work_branch=work_branch, base_branch=base_branch,
-                                  pr_target=pr_target, delivery_mode=delivery_mode)
+                                  pr_target=pr_target, delivery_mode=delivery_mode,
+                                  project=project)
     store = _store()
     clashes = [s["id"] for s in specs if store.get(s["id"]) is not None]
     if clashes:
         raise ValueError(f"job ids already exist: {', '.join(clashes)}")
     created = [store.put(spec) for spec in specs]
     return {"pipeline": base_id, "jobs": [{"id": r["id"], "state": r["state"]} for r in created]}
+
+
+_TEST_MODE_ROLES = {"staging": "test-staging", "local": "test-local"}
+
+
+@mcp.tool()
+@audited
+def test_deployment(
+    repo: str,
+    mode: str = "staging",
+    flows: str = "",
+    project: str | None = None,
+    id: str | None = None,
+) -> dict[str, Any]:
+    """Create a report-only TESTER job that verifies a deployment by running it.
+
+    mode: "staging" drives the deployed frontend with Playwright (test-staging role);
+    "local" boots the app in the worktree and exercises it (test-local role). flows is
+    free text listing the user flows to verify; it goes into the job body. project (if
+    given) selects the config project profile that provides the secret env file and
+    test commands. The job is detached-review + report-only (no commits/pushes)."""
+    cfg = _cfg()
+    if not repo_path_allowed(repo, cfg):
+        raise ValueError(f"repo path not in allowlist: {repo}")
+    normalized_mode = (mode or "staging").strip().lower()
+    role = _TEST_MODE_ROLES.get(normalized_mode)
+    if role is None:
+        raise ValueError(f"unknown mode: {mode} (allowed: {', '.join(sorted(_TEST_MODE_ROLES))})")
+
+    flows_text = (flows or "").strip()
+    where = "the deployed staging environment" if normalized_mode == "staging" else "a locally-booted instance"
+    body = (
+        f"Deployment verification job ({normalized_mode}). Verify the system against "
+        f"{where} by actually running it, per your TESTER role instructions.\n\n"
+        "User flows to verify:\n"
+        + (flows_text or "(none specified — exercise the core changed behaviour end-to-end)")
+    )
+    spec: dict[str, Any] = {
+        "repo": {"path": repo},
+        "request": {"type": "task-small", "title": f"[test-{normalized_mode}] verify deployment", "body": body},
+        "branch": {"mode": "detached-review"},
+        "delivery_mode": "report-only",
+        "role": role,
+    }
+    if project:
+        spec["project"] = project
+    if id:
+        spec["id"] = id
+    record = _store().put(spec)
+    return {"id": record["id"], "state": record["state"], "role": role, "mode": normalized_mode}
 
 
 @mcp.tool()

@@ -17,6 +17,7 @@ logger = logging.getLogger("tasklane.prompts.render")
 PLACEHOLDERS = (
     "job_id", "title", "body", "repo_path",
     "branch_contract", "upstream_context", "scope_contract", "delivery_contract",
+    "env_vars", "test_context",
 )
 
 
@@ -58,6 +59,47 @@ def _upstream_context_block(spec: Dict[str, Any]) -> str:
         header += f" [{entry.get('state') or '?'}] ---"
         lines += [header, str(entry.get("final_response") or entry.get("note") or ""), ""]
     return "\n".join(lines).rstrip("\n")
+
+
+def _env_vars_block(spec: Dict[str, Any]) -> str:
+    """List the env-var KEY NAMES available to the run — never the values.
+
+    The worker injects the secret values straight into the agent subprocess env;
+    only the sorted key names are surfaced here so a tester knows what credentials
+    it can use without any value ever touching a prompt or log.
+    """
+    names = (spec.get("metadata") or {}).get("env_var_names") or []
+    clean = sorted({str(name).strip() for name in names if str(name).strip()})
+    if not clean:
+        return (
+            "Environment variables: none injected for this job. Obtain any config "
+            "you need via the documented local_test_command / railway CLI (do not "
+            "invent credentials)."
+        )
+    return (
+        "Environment variables available (NAMES ONLY — the values are already in "
+        "your runtime environment; read them with os.environ / $VAR, and NEVER "
+        f"print or echo a value): {', '.join(clean)}"
+    )
+
+
+def _test_context_block(spec: Dict[str, Any]) -> str:
+    """Render the project's non-secret test/deploy context, or '' when absent."""
+    context = (spec.get("metadata") or {}).get("test_context") or {}
+    if not isinstance(context, dict) or not context:
+        return ""
+    labels = (
+        ("local_test_command", "Local test/boot command"),
+        ("staging_url", "Staging URL"),
+        ("staging_url_command", "Staging URL command (run to discover the URL)"),
+        ("test_notes", "Project test notes"),
+    )
+    lines: List[str] = ["Project test context:"]
+    for key, label in labels:
+        value = context.get(key)
+        if value:
+            lines.append(f"- {label}: {value}")
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def _scope_contract_block(scope: Dict[str, Any]) -> str:
@@ -111,6 +153,8 @@ def render_role_prompt(template: str, record: Dict[str, Any], spec: Dict[str, An
         "upstream_context": _upstream_context_block(spec),
         "scope_contract": _scope_contract_block(scope),
         "delivery_contract": _delivery_contract_block(request),
+        "env_vars": _env_vars_block(spec),
+        "test_context": _test_context_block(spec),
     }
     try:
         return template.format(**fields)

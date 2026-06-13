@@ -28,3 +28,17 @@ allowed_origins: []                 # extra browser Origins to accept (usually e
 enable_admin_exec: false            # server-level shell tool, OFF by default
 exec_timeout_seconds: 600
 pairing_enabled: true               # let new clients request access via POST /pair (each request still needs operator approval); false disables the endpoint and paired-token auth
+
+# --- project registry (for TESTER roles) ---
+# Per-project test/deploy profiles, keyed by the job's `project` name. A tester job
+# (role test-local / test-staging, or the optional pipeline `test` stage) uses these.
+# SECURITY: env_file is the ONLY place secrets live. The worker loads it (refusing it
+# unless mode 600 and owned by you) and injects the values into the claude subprocess;
+# the prompt only ever receives the KEY NAMES, never the values.
+projects: {}
+#   acme:
+#     env_file: /home/me/.secrets/acme.staging.env   # mode 600, owned by you, KEY=VALUE lines
+#     local_test_command: "npm run dev"
+#     staging_url: "https://staging.acme.example.com"
+#     staging_url_command: "railway domain --json"    # run to discover the URL
+#     test_notes: "Seeded test tenant only; never touch tenant prod-*."

@@ -121,8 +121,8 @@ Only the SHA-256 of each token is stored (`$TASKLANE_HOME/clients.json`). The le
 
 ## MCP tools
 
-- **Lifecycle:** `create_task`, `create_pipeline`, `list_tasks`, `get_task`, `task_events`,
-  `task_logs`, `retry_task`, `cancel_task`, `run_task_now`
+- **Lifecycle:** `create_task`, `create_pipeline`, `test_deployment`, `list_tasks`, `get_task`,
+  `task_events`, `task_logs`, `retry_task`, `cancel_task`, `run_task_now`
 - **Inspect & fix** (confined to the job's worktree): `get_diff`, `list_dir`, `read_file`,
   `write_file`, `apply_patch`, `exec`, `git`, `run_tests`
 - **Pairing:** `pairing_requests`, `approve_client`, `reject_client`, `list_clients`,
@@ -141,9 +141,54 @@ A typical operator flow: `create_task` → watch with `get_task`/`task_logs` →
 stage's final response (`context_from`), and a stage only becomes claimable once its
 predecessor completed (`dependencies`). `stages` selects a subset (implement is required).
 
+The default is `plan,implement,review`. Pass `stages="plan,implement,review,test"` to opt into
+an extra **test** stage (report-only, detached on the work branch, chained onto review) that
+verifies the change by actually running it — see **Tester roles** below.
+
 Parallelism: raise `max_in_progress` to run multiple jobs concurrently; `serialize_per_repo`
 (default true) ensures at most one job per repository at a time, so parallel jobs across
 different repos are safe while same-repo jobs queue behind each other.
+
+### Tester roles
+
+TESTER jobs verify an implementation by **actually running it**, not by reading the diff. Two
+modes, each a report-only role with its own prompt template:
+
+- **`test-local`** — boots the app in the worktree (via the project's `local_test_command` and
+  the pre-authenticated `railway` CLI), then exercises the changed behaviour end-to-end (API
+  calls, the app's e2e suite).
+- **`test-staging`** — drives the **deployed** staging frontend from the outside with
+  [Playwright](https://playwright.dev/) (`npx playwright`): discovers the URL (`staging_url` or
+  by running `staging_url_command`), logs in with the test account, and walks the named user flows.
+
+Create one ad-hoc with the `test_deployment` MCP tool
+(`test_deployment(repo, mode="staging"|"local", flows="...", project="...")`), or wire it into a
+pipeline with the `test` stage.
+
+**Secret env contract.** Credentials are never written into a job spec, prompt, log, or final
+response (all are persisted as plain files). Instead, per-project profiles in `config.yaml`
+point at a dotenv-style **secret file**:
+
+```yaml
+projects:
+  acme:
+    env_file: /home/me/.secrets/acme.staging.env   # mode 600, owned by you, KEY=VALUE lines
+    local_test_command: "npm run dev"
+    staging_url: "https://staging.acme.example.com"
+    staging_url_command: "railway domain --json"
+    test_notes: "Seeded test tenant only; never touch tenant prod-*."
+```
+
+The worker loads `env_file` (refusing it unless it is **mode 600 and owned by the current user**)
+and injects the values straight into the `claude` subprocess environment — *after* the usual
+`ANTHROPIC_*` stripping, and never logged. The prompt only ever receives the sorted **KEY NAMES**
+(e.g. `Environment variables available (NAMES ONLY ...): STAGING_URL, TEST_PASSWORD, TEST_USER`),
+so the agent reads them from `os.environ` / `$VAR` but no value can leak into a stored artifact.
+
+**Prerequisites:** the `railway` CLI authenticated on the server (config + local boot) and
+`npx playwright` available (staging browser flows). Hard rules baked into both templates:
+staging/test resources and test accounts only, no destructive operations against shared data,
+never print a secret value, and FAIL with a diagnosis rather than skip verification.
 
 ## Delivery modes
 

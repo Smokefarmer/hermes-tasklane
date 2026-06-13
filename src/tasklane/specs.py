@@ -30,7 +30,9 @@ BRANCH_MODES = {item.value for item in BranchMode}
 DELIVERY_MODES = {item.value for item in DeliveryMode}
 
 # Stage roles that select a role-based prompt template (see tasklane.prompts).
-ROLES = {"plan", "implement", "review", "fix"}
+# test-local / test-staging are TESTER roles that verify an implementation by
+# actually running it (locally or against a deployed staging environment).
+ROLES = {"plan", "implement", "review", "fix", "test-local", "test-staging"}
 
 _REQUEST_TYPE_ALIASES = {
     "bug": RequestType.BUG_SMALL.value,

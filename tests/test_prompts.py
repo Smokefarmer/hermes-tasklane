@@ -91,7 +91,7 @@ def test_load_template_for_every_role(role):
 
 
 def test_roles_constant_matches_templates():
-    assert set(ROLES) == {"plan", "implement", "review", "fix"}
+    assert set(ROLES) == {"plan", "implement", "review", "fix", "test-local", "test-staging"}
 
 
 def test_load_template_normalizes_role():

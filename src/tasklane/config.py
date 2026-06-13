@@ -51,6 +51,13 @@ class Config:
     exec_timeout_seconds: int = 600
     pairing_enabled: bool = True  # allow clients to request pairing via POST /pair (operator approval required)
 
+    # Project registry: per-project test/deploy profiles keyed by project name.
+    # Each value is a mapping consumed by tasklane.projects.ProjectProfile
+    # (env_file, local_test_command, staging_url[_command], test_notes).
+    # NOTE: env_file points at a mode-600 secret file; its VALUES never enter a
+    # job spec, prompt, or log — only the KEY NAMES are surfaced to the agent.
+    projects: dict = field(default_factory=dict)
+
 
 _DEFAULTS_COMMENT = """\
 # TaskLane configuration. Secrets live here — keep this file at mode 600.
@@ -86,6 +93,7 @@ def _coerce(data: dict[str, Any]) -> Config:
         enable_admin_exec=bool(data.get("enable_admin_exec", defaults.enable_admin_exec)),
         exec_timeout_seconds=int(data.get("exec_timeout_seconds", defaults.exec_timeout_seconds)),
         pairing_enabled=bool(data.get("pairing_enabled", defaults.pairing_enabled)),
+        projects=dict(data.get("projects") or {}),
     )
 
 

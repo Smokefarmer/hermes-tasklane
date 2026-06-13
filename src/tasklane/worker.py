@@ -23,8 +23,10 @@ from typing import Any, Dict
 from tasklane.config import Config, load_config
 from tasklane.metrics import merge_metrics, run_metrics, spend_last_24h
 from tasklane.paths import logs_root
+from tasklane.projects import ProjectProfile, load_project_profile
 from tasklane.reconcile import backoff_not_before, reconcile
 from tasklane.runner import run_claude_cli_job
+from tasklane.secrets import load_env_file
 from tasklane.store import JobStore
 from tasklane.worktree import (
     WorktreePreparationError,
@@ -146,6 +148,44 @@ def inject_upstream_context(store: JobStore, record: Dict[str, Any]) -> Dict[str
     return prepared
 
 
+def resolve_job_env(record: Dict[str, Any], cfg: Config) -> tuple[ProjectProfile | None, Dict[str, str]]:
+    """Resolve the job's project profile and load its secret env file (if any).
+
+    Returns ``(profile, env)`` where ``env`` is the ``{KEY: VALUE}`` mapping to
+    inject into the agent subprocess. The VALUES are returned for injection only —
+    they are deliberately NOT stored on the record and must never be logged. A
+    profile without ``env_file`` yields an empty env. ``load_env_file`` raises if
+    the secret file is insecurely stored, which fails the job loudly.
+    """
+    spec = record.get("spec") if isinstance(record.get("spec"), dict) else {}
+    profile = load_project_profile(spec.get("project"), cfg)
+    if profile is None or not profile.env_file:
+        return profile, {}
+    return profile, load_env_file(profile.env_file)
+
+
+def inject_test_context(record: Dict[str, Any], profile: ProjectProfile | None,
+                        env: Dict[str, str]) -> Dict[str, Any]:
+    """Attach the sorted env KEY NAMES and non-secret project test context to the
+    record's spec metadata so ``job_prompt`` can surface them. Secret VALUES are
+    never written here — only the names and the project's non-secret commands."""
+    if profile is None and not env:
+        return record
+    prepared = dict(record)
+    spec = prepared.get("spec") if isinstance(prepared.get("spec"), dict) else {}
+    prepared_spec = dict(spec)
+    metadata = dict(prepared_spec.get("metadata") or {})
+    if env:
+        metadata["env_var_names"] = sorted(env.keys())
+    if profile is not None:
+        context = profile.test_context()
+        if context:
+            metadata["test_context"] = context
+    prepared_spec["metadata"] = metadata
+    prepared["spec"] = prepared_spec
+    return prepared
+
+
 def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
     """Execute one already-claimed (running) job to completion/failure."""
     job_id = str(record.get("id") or "")
@@ -169,6 +209,14 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
             # the worktree of a blocked/failed job (kept on failure).
             store.transition(job_id, "running", reason="workspace-recorded", updates={"worktree": worktree_info})
         prepared_record = inject_upstream_context(store, prepared_record)
+        # Tester jobs: load the project's secret env file (if configured) and inject
+        # only the KEY NAMES into the prompt; the VALUES go straight to the subprocess.
+        profile, job_env = resolve_job_env(prepared_record, cfg)
+        prepared_record = inject_test_context(prepared_record, profile, job_env)
+        if job_env:
+            store.append_event(job_id, "job_env_injected", state="running",
+                               reason="secret-env-loaded",
+                               metadata={"env_var_names": sorted(job_env.keys())})  # names only
         prompt = job_prompt(prepared_record)
         workspace_path = str((worktree_info or {}).get("worktree_path") or "") or str((prepared_record.get("spec") or {}).get("repo", {}).get("path") or "")
         _append_log(job_id, f"PROMPT:\n{prompt}")
@@ -180,6 +228,7 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
                 model=cfg.default_model,
                 permission_mode=cfg.permission_mode,
                 timeout_seconds=cfg.timeout_seconds,
+                extra_env=job_env or None,
             )
             collected_runs.append(run_metrics(result))
             return result
