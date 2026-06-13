@@ -58,7 +58,7 @@ def test_analyze_project_rejects_disallowed_repo(tmp_path, monkeypatch):
     from tasklane import config, mcp_server
 
     cfg = config.Config(repos_allowlist=["/allowed/only"])
-    monkeypatch.setattr(mcp_server, "_cfg", lambda: cfg)
+    monkeypatch.setattr("tasklane.mcp.lifecycle._cfg", lambda: cfg)
 
     result = mcp_server.analyze_project(repo="/tmp/forbidden-repo")
     assert "error" in result

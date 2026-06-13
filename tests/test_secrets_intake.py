@@ -103,6 +103,6 @@ def test_too_many_keys_rejected(home, tmp_path):
 def test_allowlist_enforced(home, tmp_path, monkeypatch):
     from tasklane.config import Config
     repo = _registered_repo(tmp_path)
-    monkeypatch.setattr(mcp_server, "_cfg", lambda: Config(repos_allowlist=["/elsewhere"]))
+    monkeypatch.setattr("tasklane.mcp.ops._cfg", lambda: Config(repos_allowlist=["/elsewhere"]))
     out = mcp_server.set_project_secrets(repo=repo, secrets={"K": "v"})
     assert "error" in out and "allowlist" in out["error"]

@@ -29,7 +29,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
-packages = ["tasklane", "tasklane.prompts"]
+packages = ["tasklane", "tasklane.prompts", "tasklane.mcp"]
 
 [tool.setuptools.package-data]
 "tasklane.prompts" = ["*.md"]

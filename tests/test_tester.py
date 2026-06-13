@@ -136,6 +136,6 @@ def test_test_deployment_unknown_mode_errors(home, tmp_path):
 
 def test_test_deployment_enforces_allowlist(home, tmp_path, monkeypatch):
     from tasklane.config import Config
-    monkeypatch.setattr(mcp_server, "_cfg", lambda: Config(repos_allowlist=["/some/other/place"]))
+    monkeypatch.setattr("tasklane.mcp.ops._cfg", lambda: Config(repos_allowlist=["/some/other/place"]))
     out = mcp_server.test_deployment(repo=_git_repo(tmp_path), mode="staging")
     assert "error" in out and "allowlist" in out["error"]
