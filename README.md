@@ -154,8 +154,14 @@ different repos are safe while same-repo jobs queue behind each other.
 ## CLI (local ops without MCP)
 
 ```bash
-tasklane {submit|list|show|events|logs|retry|cancel|reconcile|stats}   # after `pip install -e .`
+tasklane {submit|list|show|events|logs|retry|cancel|reconcile|stats|doctor}   # after `pip install -e .`
 ```
+
+`tasklane doctor` runs read-only environment diagnostics — TASKLANE_HOME writability,
+`config.yaml` parse/`app_token`/mode 600, job store dirs, `claude`/`git`/`gh` on PATH,
+stale claim locks, orphaned running jobs, free disk space, and worktrees-root size — printing
+an aligned `OK`/`WARN`/`FAIL` table (exit 1 if any check FAILs) or `--json` for the raw report.
+It never mutates state; run `tasklane reconcile` to act on stale locks / orphaned jobs.
 
 ## Security
 
