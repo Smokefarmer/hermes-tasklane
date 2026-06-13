@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from mcp.server.fastmcp import FastMCP
 
+from tasklane import pairing
 from tasklane.config import Config, load_config, repo_path_allowed
 from tasklane.paths import audit_log_path, logs_root, worktrees_root
 from tasklane.store import JobStore
@@ -32,6 +33,8 @@ logger = logging.getLogger("tasklane.mcp")
 _WORKER_SERVICE = "tasklane-worker.service"
 _MAX_READ_BYTES = 200_000
 _MAX_OUT = 20_000
+_MAX_PAIR_BODY_BYTES = 4_096
+_MAX_CLIENT_NAME_LENGTH = 120
 
 mcp = FastMCP("tasklane")
 
@@ -422,6 +425,44 @@ def run_tests(job_id: str, command: str | None = None) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# client pairing (connection approval)
+# --------------------------------------------------------------------------- #
+@mcp.tool()
+@audited
+def pairing_requests() -> list[dict[str, Any]]:
+    """List unexpired pending pairing requests (pairing_code, client name, requested_at)."""
+    return pairing.pending_requests()
+
+
+@mcp.tool()
+@audited
+def approve_client(pairing_code: str) -> dict[str, Any]:
+    """Approve a pending pairing request; the client's token starts authenticating immediately."""
+    return pairing.approve_client(pairing_code)
+
+
+@mcp.tool()
+@audited
+def reject_client(pairing_code: str) -> dict[str, Any]:
+    """Reject a pending pairing request and discard its client record."""
+    return pairing.reject_client(pairing_code)
+
+
+@mcp.tool()
+@audited
+def list_clients() -> list[dict[str, Any]]:
+    """List all paired clients (pending, approved, revoked); token hashes are never returned."""
+    return pairing.list_clients()
+
+
+@mcp.tool()
+@audited
+def revoke_client(client_id: str) -> dict[str, Any]:
+    """Revoke a paired client; its token stops authenticating immediately."""
+    return pairing.revoke_client(client_id)
+
+
+# --------------------------------------------------------------------------- #
 # worker / system ops (guardrailed)
 # --------------------------------------------------------------------------- #
 @mcp.tool()
@@ -545,13 +586,44 @@ td,th{{border-bottom:1px solid #eee;padding:6px 10px;text-align:left;font-size:1
 # --------------------------------------------------------------------------- #
 # ASGI auth middleware + entrypoint
 # --------------------------------------------------------------------------- #
-class AuthMiddleware:
-    """Pure-ASGI gate: app bearer token + Origin validation (anti DNS-rebind)."""
+async def _read_body(receive) -> bytes:
+    """Drain an ASGI request body, stopping just past the /pair size cap."""
+    body = b""
+    while True:
+        message = await receive()
+        body += message.get("body", b"")
+        if len(body) > _MAX_PAIR_BODY_BYTES or not message.get("more_body"):
+            return body
 
-    def __init__(self, app, *, token: str, allowed_origins: set[str]):
+
+def _parse_pair_name(body: bytes) -> str | None:
+    """Extract a valid client name from a /pair JSON body, or None if invalid."""
+    if len(body) > _MAX_PAIR_BODY_BYTES:
+        return None
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    name = payload.get("name")
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if not name or len(name) > _MAX_CLIENT_NAME_LENGTH:
+        return None
+    return name
+
+
+class AuthMiddleware:
+    """Pure-ASGI gate: app bearer token or approved paired-client token,
+    plus Origin validation (anti DNS-rebind)."""
+
+    def __init__(self, app, *, token: str, allowed_origins: set[str], pairing_enabled: bool = False):
         self.app = app
         self.token = token
         self.allowed_origins = allowed_origins
+        self.pairing_enabled = pairing_enabled
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
@@ -561,6 +633,8 @@ class AuthMiddleware:
         if path == "/health":
             return await self._json(send, 200, {"status": "ok"})
         client_ip = headers.get("cf-connecting-ip") or (headers.get("x-forwarded-for", "").split(",")[0].strip()) or "?"
+        if path == "/pair":
+            return await self._pair(scope, receive, send, client_ip)
         if path == "/status":
             # browser-friendly: token via ?token= or Authorization header
             from urllib.parse import parse_qs
@@ -582,10 +656,39 @@ class AuthMiddleware:
             return await self._json(send, 403, {"error": "origin not allowed"})
         auth = headers.get("authorization", "")
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
-        if not self.token or not hmac.compare_digest(token, self.token):
+        if not self._authorized(token):
             _audit("auth", {"ip": client_ip, "path": path, "reason": "bad-token"}, "rejected")
             return await self._json(send, 401, {"error": "invalid or missing bearer token"})
         return await self.app(scope, receive, send)
+
+    def _authorized(self, token: str) -> bool:
+        """True for the legacy app token or an approved, non-revoked paired client."""
+        if self.token and hmac.compare_digest(token, self.token):
+            return True
+        if not self.pairing_enabled or not token:
+            return False
+        return pairing.authenticate(token) is not None
+
+    async def _pair(self, scope, receive, send, client_ip: str) -> None:
+        """Public pairing endpoint: POST {"name": ...} -> pending client + one-time token."""
+        if not self.pairing_enabled:
+            _audit("pair", {"ip": client_ip, "reason": "disabled"}, "rejected")
+            return await self._json(send, 404, {"error": "pairing is disabled"})
+        if scope.get("method") != "POST":
+            _audit("pair", {"ip": client_ip, "reason": "method"}, "rejected")
+            return await self._json(send, 405, {"error": "use POST"})
+        name = _parse_pair_name(await _read_body(receive))
+        if name is None:
+            _audit("pair", {"ip": client_ip, "reason": "bad-body"}, "rejected")
+            return await self._json(send, 400, {"error": 'expected JSON body {"name": "<client name>"}'})
+        try:
+            result = pairing.request_pairing(name)
+        except ValueError as exc:  # pending cap reached
+            _audit("pair", {"ip": client_ip, "name": name, "reason": "pending-cap"}, "rejected")
+            return await self._json(send, 429, {"error": str(exc)})
+        _audit("pair", {"ip": client_ip, "name": name, "client_id": result["client_id"],
+                        "pairing_code": result["pairing_code"]}, "ok")
+        return await self._json(send, 200, result)
 
     @staticmethod
     async def _json(send, status: int, payload: dict) -> None:
@@ -619,9 +722,15 @@ def build_app(cfg: Config):
         allowed_hosts=allowed_hosts,
         allowed_origins=cfg.allowed_origins or [f"https://{h}" for h in cfg.public_hostnames],
     )
+    # FastMCP caches its StreamableHTTP session manager, but a session manager's
+    # run() works only once per instance — a second build_app (tests, in-process
+    # restarts) would fail at startup. Reset the cache so every built app gets
+    # its own manager.
+    mcp._session_manager = None
     app = mcp.streamable_http_app()
     allowed = set(cfg.allowed_origins)
-    return AuthMiddleware(app, token=cfg.app_token, allowed_origins=allowed)
+    return AuthMiddleware(app, token=cfg.app_token, allowed_origins=allowed,
+                          pairing_enabled=cfg.pairing_enabled)
 
 
 def main() -> None:

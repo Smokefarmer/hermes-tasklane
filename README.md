@@ -92,12 +92,41 @@ claude mcp add --transport http tasklane https://tasklane.<your-domain>/mcp \
 A browser status page is available at `https://tasklane.<your-domain>/status?token=<app_token>`
 (worker health + recent jobs, auto-refresh).
 
+### Connecting a new client (pairing)
+
+Instead of sharing the `app_token`, a new client can request its own credential
+(OpenClaw-style connection approval; on by default, `pairing_enabled: false` disables it):
+
+1. The client requests pairing — public endpoint, no auth:
+
+   ```bash
+   curl -X POST https://tasklane.<your-domain>/pair -d '{"name": "my-laptop"}'
+   # -> {"client_id": "my-laptop-a1b2c3", "pairing_code": "ABCD2345",
+   #     "token": "<save this — shown exactly once>", "status": "pending"}
+   ```
+
+2. The operator approves the pairing code — either from an **already-trusted MCP client**
+   (`pairing_requests` lists pending codes, then `approve_client`), or directly on the server:
+
+   ```bash
+   python -c 'from tasklane import pairing; print(pairing.approve_client("ABCD2345"))'
+   ```
+
+3. The client's token now authenticates against `/mcp` exactly like the app token.
+
+Pending requests expire after 15 minutes and are capped at 10 (`/pair` returns 429 beyond
+that). `list_clients` shows every client; `revoke_client(client_id)` cuts one off immediately.
+Only the SHA-256 of each token is stored (`$TASKLANE_HOME/clients.json`). The legacy
+`app_token` keeps working regardless of pairing.
+
 ## MCP tools
 
 - **Lifecycle:** `create_task`, `create_pipeline`, `list_tasks`, `get_task`, `task_events`,
   `task_logs`, `retry_task`, `cancel_task`, `run_task_now`
 - **Inspect & fix** (confined to the job's worktree): `get_diff`, `list_dir`, `read_file`,
   `write_file`, `apply_patch`, `exec`, `git`, `run_tests`
+- **Pairing:** `pairing_requests`, `approve_client`, `reject_client`, `list_clients`,
+  `revoke_client`
 - **Ops:** `worker_status`, `restart_worker`, `prune_worktrees`, `reconcile_jobs`, `metrics`,
   `admin_exec` (gated by config)
 

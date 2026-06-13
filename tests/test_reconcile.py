@@ -22,7 +22,11 @@ from tasklane.store import JobStore
 from tasklane.worker import _fail_or_requeue
 
 # Past the claim-grace window so reconcile judges freshly claimed test jobs.
-LATER = datetime.now(timezone.utc) + timedelta(seconds=CLAIM_GRACE_SECONDS + 5)
+# Computed per call: a module-level constant is fixed at collection time, so once
+# the whole suite runs longer than the grace window the constant predates the
+# test's own claims and these tests turn flaky.
+def later() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(seconds=CLAIM_GRACE_SECONDS + 5)
 
 
 def dead_pid() -> int:
@@ -80,7 +84,7 @@ def test_retry_delay_doubles_per_attempt():
 
 def test_recover_orphans_requeues_dead_claimant(store):
     claim_as(store, "job-1", f"worker-{dead_pid()}")
-    actions = recover_orphans(store, Config(max_attempts=3), now=LATER)
+    actions = recover_orphans(store, Config(max_attempts=3), now=later())
     assert len(actions) == 1
     assert actions[0]["action"] == "requeued"
     record = store.get("job-1")
@@ -92,14 +96,14 @@ def test_recover_orphans_requeues_dead_claimant(store):
 
 def test_recover_orphans_blocks_at_attempt_cap(store):
     claim_as(store, "job-1", f"worker-{dead_pid()}")
-    actions = recover_orphans(store, Config(max_attempts=1), now=LATER)
+    actions = recover_orphans(store, Config(max_attempts=1), now=later())
     assert actions[0]["action"] == "blocked"
     assert store.get("job-1")["state"] == "blocked"
 
 
 def test_recover_orphans_leaves_live_claimant_alone(store):
     claim_as(store, "job-1", f"worker-{os.getpid()}")
-    assert recover_orphans(store, Config(), now=LATER) == []
+    assert recover_orphans(store, Config(), now=later()) == []
     assert store.get("job-1")["state"] == "running"
 
 
@@ -114,7 +118,7 @@ def test_recover_orphans_skips_when_lock_held(store):
     claim_as(store, "job-1", f"worker-{dead_pid()}")
     lock = store._acquire_claim_lock("job-1", owner="someone-else")
     try:
-        actions = recover_orphans(store, Config(), now=LATER)
+        actions = recover_orphans(store, Config(), now=later())
     finally:
         store._release_claim_lock(lock)
     assert actions == [{"job_id": "job-1", "action": "skipped", "reason": "claim-lock-held"}]
@@ -123,7 +127,7 @@ def test_recover_orphans_skips_when_lock_held(store):
 
 def test_recover_orphans_flags_unknown_claimant_within_ceiling(store):
     claim_as(store, "job-1", "mystery-owner")
-    actions = recover_orphans(store, Config(), now=LATER)
+    actions = recover_orphans(store, Config(), now=later())
     assert actions[0]["action"] == "flagged"
     assert store.get("job-1")["state"] == "running"
 
