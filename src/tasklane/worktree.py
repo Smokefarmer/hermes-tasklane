@@ -19,7 +19,13 @@ from typing import Any, Dict, List
 
 from tasklane.paths import worktrees_root
 from tasklane.prompts import load_template
-from tasklane.prompts.render import render_role_prompt
+from tasklane.prompts.render import (
+    _branch_contract_block,
+    _delivery_contract_block,
+    _scope_contract_block,
+    _upstream_context_block,
+    render_role_prompt,
+)
 from tasklane.projects import render_profile_block
 
 logger = logging.getLogger("tasklane.worktree")
@@ -288,14 +294,14 @@ def job_prompt(record: Dict[str, Any]) -> str:
 
 
 def _generic_job_prompt(record: Dict[str, Any]) -> str:
+    """The role-less prompt. Composed from the SAME block builders the role
+    templates use (tasklane.prompts.render), so the branch / scope / delivery /
+    upstream sections have one source of truth and cannot drift between paths."""
     spec = record.get("spec") if isinstance(record.get("spec"), dict) else {}
     request = spec.get("request") if isinstance(spec.get("request"), dict) else {}
     repo = spec.get("repo") if isinstance(spec.get("repo"), dict) else {}
     branch = spec.get("branch") if isinstance(spec.get("branch"), dict) else {}
     scope = spec.get("scope") if isinstance(spec.get("scope"), dict) else {}
-    allowed_paths = scope.get("allowed_paths") or []
-    denied_paths = scope.get("denied_paths") or []
-    acceptance = request.get("acceptance_criteria") or []
     delivery_mode = spec.get("delivery_mode") or "pull-request"
     workspace = (spec.get("metadata") or {}).get("workspace") or {}
     lines = [
@@ -316,54 +322,19 @@ def _generic_job_prompt(record: Dict[str, Any]) -> str:
         f"Title: {request.get('title') or ''}",
         f"Task:\n{request.get('body') or request.get('title') or ''}",
         "",
-        "Branch contract:",
-        f"- mode: {branch.get('mode') or ''}",
-        f"- base_branch: {branch.get('base_branch') or ''}",
-        f"- work_branch: {branch.get('work_branch') or ''}",
-        f"- pr_target: {branch.get('pr_target') or ''}",
-        f"- delivery_mode: {delivery_mode}",
+        _branch_contract_block(branch, delivery_mode, workspace, repo),
         "",
     ]
-    if workspace.get("isolated"):
-        lines += [
-            "Workspace isolation:",
-            "- TaskLane prepared an isolated git worktree for this job.",
-            f"- original_repo_path: {workspace.get('original_repo_path') or ''}",
-            f"- worktree_path: {workspace.get('worktree_path') or repo.get('path') or ''}",
-            "- Work only in the repo path above; do not edit the original checkout.",
-            "",
-        ]
     profile_block = render_profile_block((spec.get("metadata") or {}).get("project_profile"), repo.get("path") or "")
     if profile_block:
         lines += [profile_block, ""]
-    upstream = (spec.get("metadata") or {}).get("upstream_context") or []
-    if upstream:
-        lines += ["Context from upstream pipeline jobs (read before planning):", ""]
-        for entry in upstream:
-            if not isinstance(entry, dict):
-                continue
-            header = f"--- upstream job {entry.get('job_id')}"
-            if entry.get("title"):
-                header += f" ({entry['title']})"
-            header += f" [{entry.get('state') or '?'}] ---"
-            lines += [header, str(entry.get("final_response") or entry.get("note") or ""), ""]
+    upstream_block = _upstream_context_block(spec)
+    if upstream_block:
+        lines += [upstream_block, ""]
     lines += [
-        "Scope contract:",
-        f"- allowed_paths: {', '.join(map(str, allowed_paths)) if allowed_paths else '(none declared)'}",
-        f"- denied_paths: {', '.join(map(str, denied_paths)) if denied_paths else '(none declared)'}",
-        f"- allow_unlisted_paths: {scope.get('allow_unlisted_paths', True)}",
+        _scope_contract_block(scope),
         "",
-        "Acceptance criteria:",
-        *(f"- {item}" for item in acceptance),
-        "",
-        "Operational rules:",
-        "- Use the repo path above; do not work outside the target repo.",
-        "- If branch mode is new-branch, create/switch to work_branch from base_branch.",
-        "- If delivery mode is pull-request, commit, push work_branch, and open a PR against pr_target.",
-        "- If delivery mode is direct-push, commit and push the target work_branch only.",
-        "- If delivery mode is report-only, do not commit or push; return findings only.",
-        "- Never modify denied paths. If allow_unlisted_paths is false, modify only allowed_paths.",
-        "- End with changed files, verification performed, delivery URL/branch, and residual risks.",
+        _delivery_contract_block(request),
     ]
     return "\n".join(lines)
 

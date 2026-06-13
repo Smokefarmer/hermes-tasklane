@@ -40,8 +40,6 @@ Scope contract:
 - denied_paths: (none declared)
 - allow_unlisted_paths: True
 
-Acceptance criteria:
-
 Operational rules:
 - Use the repo path above; do not work outside the target repo.
 - If branch mode is new-branch, create/switch to work_branch from base_branch.
@@ -236,3 +234,24 @@ def test_job_prompt_unknown_role_falls_back_to_generic():
     rec = _snapshot_record()
     rec["spec"]["role"] = "architect"  # no template for this role
     assert job_prompt(rec) == _GENERIC_SNAPSHOT
+
+
+def test_generic_and_role_share_block_builders_no_drift():
+    """The scope/delivery/branch blocks must be byte-identical between the generic
+    prompt and a role prompt — proving they come from one source (render.py),
+    so an edit to operational rules can never apply to only one path."""
+    from tasklane.prompts.render import (
+        _branch_contract_block, _delivery_contract_block, _scope_contract_block,
+    )
+
+    spec = validate_job_spec({
+        "id": "drift", "repo": {"path": "/tmp/x"},
+        "request": {"type": "task", "title": "t", "body": "b"},
+        "branch": {"mode": "new-branch", "base_branch": "main", "work_branch": "wb", "pr_target": "main"},
+        "delivery_mode": "pull-request",
+    })
+    generic = job_prompt({"id": "drift", "spec": spec})
+    # every builder's output is a substring of the generic prompt
+    assert _scope_contract_block(spec["scope"]) in generic
+    assert _delivery_contract_block(spec["request"]) in generic
+    assert _branch_contract_block(spec["branch"], "pull-request", {}, spec["repo"]) in generic
