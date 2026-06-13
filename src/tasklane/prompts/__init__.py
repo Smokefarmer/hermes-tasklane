@@ -13,8 +13,8 @@ from typing import Any, Optional
 
 from tasklane.paths import tasklane_home
 
-#: Roles that have a stage template (kept in sync with specs._ROLES).
-ROLES: tuple[str, ...] = ("plan", "implement", "review", "fix")
+#: Roles that have a stage template (kept in sync with specs.ROLES).
+ROLES: tuple[str, ...] = ("plan", "implement", "review", "fix", "analyze")
 
 
 def normalize_role(value: Any) -> str:

@@ -121,7 +121,7 @@ Only the SHA-256 of each token is stored (`$TASKLANE_HOME/clients.json`). The le
 
 ## MCP tools
 
-- **Lifecycle:** `create_task`, `create_pipeline`, `list_tasks`, `get_task`, `task_events`,
+- **Lifecycle:** `create_task`, `create_pipeline`, `analyze_project`, `list_tasks`, `get_task`, `task_events`,
   `task_logs`, `retry_task`, `cancel_task`, `run_task_now`
 - **Inspect & fix** (confined to the job's worktree): `get_diff`, `list_dir`, `read_file`,
   `write_file`, `apply_patch`, `exec`, `git`, `run_tests`
@@ -144,6 +144,31 @@ predecessor completed (`dependencies`). `stages` selects a subset (implement is 
 Parallelism: raise `max_in_progress` to run multiple jobs concurrently; `serialize_per_repo`
 (default true) ensures at most one job per repository at a time, so parallel jobs across
 different repos are safe while same-repo jobs queue behind each other.
+
+## Architecture analysis
+
+`analyze_project(repo, base_branch="main", id=None)` creates a single architecture-audit
+job: role `analyze`, a fresh review branch (`tasklane/architecture-review`, or
+`tasklane/architecture-review-<id>` when `id` is given), delivered `direct-push` so the
+**review document itself arrives as a reviewable branch** rather than mutating your code.
+
+The audit agent reviews the *whole* repo against best practices **and the project's own
+documented intent** — the antidote to AI-era code accretion. It runs four explicit passes:
+
+1. **Map** — directory/module structure, dependency direction, entry points; bounded
+   contexts and context bleed (domain importing infrastructure, shared mutable models,
+   circular imports).
+2. **Intent** — reads `CLAUDE.md`, `docs/adr/**`, and rules files; lists where code
+   contradicts documented decisions and which de-facto decisions deserve a new ADR.
+3. **Patterns** — right pattern in the right place vs. cargo-culted ceremony.
+4. **Accretion hotspots** — oversized files, god-modules, duplication, dead code, and
+   test deserts, ranked by risk.
+
+It writes `docs/architecture-review.md` (context map, findings by severity, ADR drafts under
+`docs/adr/proposed/`, and a suggested `CLAUDE.md` if absent) and ends its final response with
+a ```` ```proposed_tasks` ```` block of ranked remediation tasks. **Those remediation tasks land
+as drafts requiring approval** — the draft fan-out parses the block; nothing is acted on
+automatically. Review the branch, then approve the remediation tasks you want to run.
 
 ## Delivery modes
 
