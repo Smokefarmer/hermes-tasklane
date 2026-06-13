@@ -55,6 +55,10 @@ def _canonical_key(path: str) -> str:
     return str(expanded.resolve())
 
 
+def _opt_str(value: Any) -> str | None:
+    return (str(value).strip() or None) if value else None
+
+
 def _normalize_entry(
     *,
     name: Any,
@@ -64,19 +68,36 @@ def _normalize_entry(
     base_branch: Any,
     default_model: Any,
     merge_policy: Any,
+    env_file: Any = None,
+    local_test_command: Any = None,
+    staging_url: Any = None,
+    staging_url_command: Any = None,
+    test_notes: Any = None,
 ) -> Dict[str, Any]:
-    """Coerce raw fields into a validated, JSON/YAML-safe profile dict."""
+    """Coerce raw fields into a validated, JSON/YAML-safe profile dict.
+
+    The ``env_file`` / ``*_test_command`` / ``staging_*`` / ``test_notes`` fields
+    drive TESTER roles (test-local / test-staging). ``env_file`` is the ONLY place
+    a project's test secrets live; the worker injects its values into the job
+    subprocess and exposes only KEY NAMES to the prompt (see worker / secrets).
+    """
     policy = str(merge_policy or "manual").strip().lower()
     if policy not in _MERGE_POLICIES:
         policy = "manual"
     return {
         "name": str(name).strip() if name else "",
-        "test_command": (str(test_command).strip() or None) if test_command else None,
-        "build_command": (str(build_command).strip() or None) if build_command else None,
+        "test_command": _opt_str(test_command),
+        "build_command": _opt_str(build_command),
         "docs": [str(d).strip() for d in (docs or []) if str(d).strip()],
         "base_branch": str(base_branch).strip() if base_branch else "main",
-        "default_model": (str(default_model).strip() or None) if default_model else None,
+        "default_model": _opt_str(default_model),
         "merge_policy": policy,
+        # tester fields (all optional)
+        "env_file": _opt_str(env_file),
+        "local_test_command": _opt_str(local_test_command),
+        "staging_url": _opt_str(staging_url),
+        "staging_url_command": _opt_str(staging_url_command),
+        "test_notes": _opt_str(test_notes),
     }
 
 
@@ -122,28 +143,56 @@ def register_project(
     base_branch: str = "main",
     default_model: str | None = None,
     merge_policy: str = "manual",
+    env_file: str | None = None,
+    local_test_command: str | None = None,
+    staging_url: str | None = None,
+    staging_url_command: str | None = None,
+    test_notes: str | None = None,
 ) -> Dict[str, Any]:
     """Create or update a project profile. ``path`` must be a git repository.
 
     Returns the stored entry with its canonical registry key under ``"path"``.
-    Raises ``ValueError`` if ``path`` is not a git repository.
+    Raises ``ValueError`` if ``path`` is not a git repository. Re-registering a
+    project merges over its existing entry, so tester fields set later (e.g. by
+    ``set_project_env_file``) survive a plain re-register that omits them.
     """
     top = _git_toplevel(Path(str(path)).expanduser())
     if not top:
         raise ValueError(f"not a git repository: {path}")
+    existing = _load_registry().get(top, {})
     entry = _normalize_entry(
-        name=name or Path(top).name,
-        test_command=test_command,
-        build_command=build_command,
-        docs=docs,
-        base_branch=base_branch,
-        default_model=default_model,
-        merge_policy=merge_policy,
+        name=name or existing.get("name") or Path(top).name,
+        test_command=test_command if test_command is not None else existing.get("test_command"),
+        build_command=build_command if build_command is not None else existing.get("build_command"),
+        docs=docs if docs is not None else existing.get("docs"),
+        base_branch=base_branch if base_branch is not None else existing.get("base_branch") or "main",
+        default_model=default_model if default_model is not None else existing.get("default_model"),
+        merge_policy=merge_policy if merge_policy is not None else existing.get("merge_policy") or "manual",
+        env_file=env_file if env_file is not None else existing.get("env_file"),
+        local_test_command=local_test_command if local_test_command is not None else existing.get("local_test_command"),
+        staging_url=staging_url if staging_url is not None else existing.get("staging_url"),
+        staging_url_command=staging_url_command if staging_url_command is not None else existing.get("staging_url_command"),
+        test_notes=test_notes if test_notes is not None else existing.get("test_notes"),
     )
     projects = _load_registry()
     projects[top] = entry
     _write_registry(projects)
     return {"path": top, **entry}
+
+
+def set_project_env_file(path: str, env_file: str) -> Dict[str, Any]:
+    """Point a registered project's ``env_file`` at ``env_file`` (used by the
+    set_project_secrets intake tool). The project must already be registered.
+    Returns the updated entry with its canonical key under ``"path"``."""
+    top = _git_toplevel(Path(str(path)).expanduser())
+    if not top:
+        raise ValueError(f"not a git repository: {path}")
+    projects = _load_registry()
+    if top not in projects:
+        raise ValueError(f"project not registered: {top} (call register_project first)")
+    projects[top] = {**projects[top], "env_file": str(env_file).strip() or None}
+    _write_registry(projects)
+    return {"path": top, **projects[top]}
 
 
 def get_project(path: str) -> Dict[str, Any] | None:

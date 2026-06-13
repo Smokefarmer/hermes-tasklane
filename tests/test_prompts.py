@@ -80,7 +80,8 @@ def _role_record(role: str, body: str = "Do the snap thing."):
 # --------------------------------------------------------------------------- #
 # template loading
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("role", ["plan", "implement", "review", "fix", "analyze", "audit"])
+@pytest.mark.parametrize("role", ["plan", "implement", "review", "fix", "analyze", "audit",
+                                  "test-local", "test-staging"])
 def test_load_template_for_every_role(role):
     template = load_template(role)
     assert template is not None
@@ -91,7 +92,8 @@ def test_load_template_for_every_role(role):
 
 
 def test_roles_constant_matches_templates():
-    assert set(ROLES) == {"plan", "implement", "review", "fix", "analyze", "audit"}
+    assert set(ROLES) == {"plan", "implement", "review", "fix", "analyze", "audit",
+                          "test-local", "test-staging"}
 
 
 def test_load_template_normalizes_role():

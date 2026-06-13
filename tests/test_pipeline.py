@@ -142,3 +142,24 @@ def test_pipeline_stage_specs_implement_only():
     assert len(specs) == 1
     only = validate_job_spec(specs[0])
     assert only["dependencies"] == [] and only["context_from"] == []
+
+
+def test_pipeline_with_test_stage_chains_tester_role():
+    """The optional `test` stage uses the test-local tester role, runs report-only
+    on the work branch, and depends on review."""
+    from tasklane.mcp_server import _pipeline_stage_specs
+
+    specs = _pipeline_stage_specs(
+        "feat", "/tmp/repo", "Feature", "build it",
+        stages=["plan", "implement", "review", "test"],
+        work_branch="tasklane/feat", base_branch="main",
+        pr_target="main", delivery_mode="pull-request",
+    )
+    assert [s["id"] for s in specs] == ["feat-plan", "feat-implement", "feat-review", "feat-test"]
+    test = validate_job_spec(specs[3])
+    assert test["role"] == "test-local"
+    assert test["delivery_mode"] == "report-only"
+    assert test["branch"]["mode"] == "detached-review"
+    assert test["branch"]["base_branch"] == "tasklane/feat"
+    assert test["dependencies"] == ["feat-review"]
+    assert test["context_from"] == ["feat-review"]

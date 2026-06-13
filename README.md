@@ -143,8 +143,9 @@ competent operator:
 
 ## MCP tools
 
-- **Lifecycle:** `create_task`, `create_pipeline`, `analyze_project`, `security_audit`, `list_tasks`,
-  `get_task`, `task_events`, `task_logs`, `retry_task`, `cancel_task`, `run_task_now`
+- **Lifecycle:** `create_task`, `create_pipeline`, `analyze_project`, `security_audit`,
+  `test_deployment`, `list_tasks`, `get_task`, `task_events`, `task_logs`, `retry_task`,
+  `cancel_task`, `run_task_now`
 - **Inspect & fix** (operate on the job's worktree; `exec`/`git`/`run_tests` are cwd-scoped
   shells, not a sandbox — see Security): `get_diff`, `list_dir`, `read_file`,
   `write_file`, `apply_patch`, `exec`, `git`, `run_tests`
@@ -152,7 +153,8 @@ competent operator:
   `revoke_client`
 - **Ops:** `worker_status`, `restart_worker`, `prune_worktrees`, `reconcile_jobs`, `metrics`,
   `admin_exec` (gated by config)
-- **Project registry:** `register_project`, `list_projects`
+- **Project registry & secrets:** `register_project`, `list_projects`, `set_project_secrets`,
+  `list_project_secret_keys`, `delete_project_secret`
 
 A typical operator flow: `create_task` → watch with `get_task`/`task_logs` → if it blocks,
 `get_diff` + `exec` to find the problem, `write_file`/`apply_patch` to fix, `retry_task`.
@@ -253,6 +255,35 @@ contract as the **review** role (`severity` / `file` / `line` / `issue` / `sugge
 flow into the same downstream machinery. Audits are strictly **report-only**: the agent never
 exploits, never exfiltrates, and never modifies code, and flags any hardcoded secret as
 **CRITICAL** with rotation advice.
+
+## Tester roles
+
+TESTER jobs verify an implementation by **actually running it**, not by reading the diff.
+Two report-only roles, each with its own prompt template:
+
+- **`test-local`** — boots the app in the worktree (the project's `local_test_command`) and
+  exercises the changed behaviour end-to-end.
+- **`test-staging`** — drives the deployed staging frontend from the outside with
+  [Playwright](https://playwright.dev/) (`npx playwright`): discovers the URL (`staging_url`
+  or `staging_url_command`), logs in with the test account, and walks the named user flows.
+
+Create one ad-hoc with `test_deployment(repo, mode="staging"|"local", flows="…")`, or add the
+optional `test` stage to a pipeline (`stages="plan,implement,review,test"`).
+
+**Secret contract.** Credentials never appear in a job spec, prompt, log, or final response.
+A project profile's `env_file` (a mode-600 `KEY=VALUE` file — refused if not 600 / not owned by
+you) is the only place they live. The worker loads it and injects the **values** straight into
+the `claude` subprocess (after the usual `ANTHROPIC_*` stripping, never logged); the prompt only
+ever receives the sorted **KEY NAMES**. Store credentials conversationally with
+`set_project_secrets(repo, {"TEST_USER": "...", "TEST_PASSWORD": "..."})` — the audit log records
+only repo + key names. When a client asks for a pipeline with a `test` stage and
+`list_project_secret_keys` shows no login, it should ask you for a demo/test user, store it via
+`set_project_secrets`, and never echo the values back.
+
+**Prerequisites:** the `railway` CLI (config/local boot) and `npx playwright` (staging flows)
+available on the server. Hard rules in both templates: staging/test resources and test accounts
+only, nothing destructive, never print a secret value, and FAIL with a diagnosis rather than
+skip verification.
 
 ## Delivery modes
 

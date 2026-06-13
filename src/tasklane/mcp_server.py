@@ -17,6 +17,7 @@ import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Callable
 
 from mcp.server.fastmcp import FastMCP
@@ -96,6 +97,25 @@ def _audit(tool: str, info: dict[str, Any], status: str) -> None:
         logger.exception("audit write failed")
 
 
+# Kwargs whose VALUES must never reach the audit log. A dict-valued sensitive arg
+# (e.g. set_project_secrets(secrets=...)) is logged as its sorted KEY NAMES only;
+# a scalar one is logged as "<redacted>". Names are safe (and useful) to audit.
+_SENSITIVE_ARGS = {"secrets"}
+
+
+def _redact_audit_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if key in _SENSITIVE_ARGS:
+            if isinstance(value, Mapping):
+                safe[key] = {"<redacted_keys>": sorted(str(k) for k in value)}
+            else:
+                safe[key] = "<redacted>"
+        else:
+            safe[key] = value
+    return safe
+
+
 def audited(fn: Callable) -> Callable:
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -106,7 +126,7 @@ def audited(fn: Callable) -> Callable:
             status = f"error:{type(exc).__name__}"
             return {"error": f"{type(exc).__name__}: {exc}"}
         finally:
-            _audit(fn.__name__, dict(kwargs), status)
+            _audit(fn.__name__, _redact_audit_kwargs(dict(kwargs)), status)
     return wrapper
 
 
@@ -218,7 +238,7 @@ def create_task(
     return {"id": record["id"], "state": record["state"]}
 
 
-_PIPELINE_STAGES = ("plan", "implement", "review")
+_PIPELINE_STAGES = ("plan", "implement", "review", "test")
 
 
 def _pipeline_stage_specs(base_id: str, repo: str, title: str, body: str, *, stages: list[str],
@@ -249,7 +269,7 @@ def _pipeline_stage_specs(base_id: str, repo: str, title: str, body: str, *, sta
                            "work_branch": work_branch, "pr_target": pr_target},
                 "delivery_mode": delivery_mode,
             }
-        else:  # review
+        elif stage == "review":
             spec = {
                 "id": stage_id,
                 "repo": {"path": repo},
@@ -262,8 +282,22 @@ def _pipeline_stage_specs(base_id: str, repo: str, title: str, body: str, *, sta
                 "branch": {"mode": "detached-review", "base_branch": work_branch},
                 "delivery_mode": "report-only",
             }
-        # Each pipeline stage selects its role-based prompt template (plan/implement/review).
-        spec["role"] = stage
+        else:  # test — verify the work branch by running it (report-only)
+            spec = {
+                "id": stage_id,
+                "repo": {"path": repo},
+                "request": {"type": "task-small", "title": f"[test] {title}",
+                            "body": (f"Test stage of a TaskLane pipeline. The change is on branch "
+                                     f"{work_branch}. Verify it by ACTUALLY RUNNING it per your tester "
+                                     "role (boot the app / exercise the changed behaviour end-to-end), "
+                                     "using the project's test commands and the credentials named in "
+                                     f"your prompt. Report PASS/FAIL with evidence; modify nothing.\n\n"
+                                     f"Original task:\n{body}")},
+                "branch": {"mode": "detached-review", "base_branch": work_branch},
+                "delivery_mode": "report-only",
+            }
+        # Each stage selects its role template; the test stage uses the test-local tester role.
+        spec["role"] = "test-local" if stage == "test" else stage
         if prior_stage_id:
             spec["dependencies"] = [prior_stage_id]
             spec["context_from"] = [prior_stage_id]
@@ -287,9 +321,10 @@ def create_pipeline(
 ) -> dict[str, Any]:
     """Create a multi-stage assembly-line pipeline as dependency-chained jobs:
     plan (report-only) -> implement (delivers on work_branch) -> review (report-only
-    on the work branch). Each stage receives the previous stage's final response as
-    context. stages: comma-separated subset of plan,implement,review (implement
-    required). Returns the created job ids in execution order."""
+    on the work branch) -> test (optional; report-only tester role that RUNS the work
+    branch). Each stage receives the previous stage's final response as context.
+    stages: comma-separated subset of plan,implement,review,test (implement required;
+    default 'plan,implement,review'). Returns the created job ids in execution order."""
     cfg = _cfg()
     if not repo_path_allowed(repo, cfg):
         raise ValueError(f"repo path not in allowlist: {repo}")
@@ -762,6 +797,138 @@ def list_projects() -> dict[str, Any]:
     from tasklane.projects import list_projects as _list
 
     return _list()
+
+
+# --------------------------------------------------------------------------- #
+# tester roles + conversational credential intake
+# --------------------------------------------------------------------------- #
+_TEST_MODE_ROLES = {"staging": "test-staging", "local": "test-local"}
+
+
+@mcp.tool()
+@audited
+def test_deployment(repo: str, mode: str = "staging", flows: str = "", id: str | None = None) -> dict[str, Any]:
+    """Create a report-only TESTER job that verifies a deployment by RUNNING it.
+
+    mode: "staging" drives the deployed frontend with Playwright (test-staging role);
+    "local" boots the app in the worktree and exercises it (test-local role). flows is
+    free text listing the user flows to verify (goes into the job body). The job's
+    project profile (test commands, staging URL, and the secret env_file) is resolved
+    automatically from the repo path if the repo is registered. The job is
+    detached-review + report-only (never commits or pushes)."""
+    cfg = _cfg()
+    if not repo_path_allowed(repo, cfg):
+        raise ValueError(f"repo path not in allowlist: {repo}")
+    normalized_mode = (mode or "staging").strip().lower()
+    role = _TEST_MODE_ROLES.get(normalized_mode)
+    if role is None:
+        raise ValueError(f"unknown mode: {mode} (allowed: {', '.join(sorted(_TEST_MODE_ROLES))})")
+    flows_text = (flows or "").strip()
+    where = "the deployed staging environment" if normalized_mode == "staging" else "a locally-booted instance"
+    body = (
+        f"Deployment verification job ({normalized_mode}). Verify the system against "
+        f"{where} by actually running it, per your TESTER role instructions.\n\n"
+        "User flows to verify:\n"
+        + (flows_text or "(none specified — exercise the core changed behaviour end-to-end)")
+    )
+    spec: dict[str, Any] = {
+        "repo": {"path": repo},
+        "request": {"type": "task-small", "title": f"[test-{normalized_mode}] verify deployment", "body": body},
+        "branch": {"mode": "detached-review"},
+        "delivery_mode": "report-only",
+        "role": role,
+    }
+    if id:
+        spec["id"] = id
+    record = _store().put(spec)
+    return {"id": record["id"], "state": record["state"], "role": role, "mode": normalized_mode}
+
+
+def _require_registered(repo: str) -> dict[str, Any]:
+    """Return (canonical) profile for an allowlisted, registered repo or raise."""
+    cfg = _cfg()
+    if not repo_path_allowed(repo, cfg):
+        raise ValueError(f"repo path not in allowlist: {repo}")
+    from tasklane.projects import get_project
+
+    profile = get_project(repo)
+    if profile is None:
+        raise ValueError(f"project not registered: {repo} (call register_project first)")
+    return profile
+
+
+@mcp.tool()
+@audited
+def set_project_secrets(repo: str, secrets: dict[str, str]) -> dict[str, Any]:
+    """Store/merge test credentials for a project's TESTER roles (conversational intake).
+
+    repo must be allowlisted AND registered. secrets is a {KEY: VALUE} mapping: keys
+    SCREAMING_SNAKE_CASE (^[A-Z][A-Z0-9_]*$), values non-empty and <=4096 chars, at
+    most 50 keys. Pairs are merged into the project's env_file (mode 600); if the
+    project has none, ~/.tasklane/secrets/<name>.env (dir 700, file 600) is created
+    and the registry entry auto-linked to it.
+
+    SECURITY: never repeat the stored values back to the user. The audit log records
+    only repo + sorted KEY NAMES; the return value carries names only, never values."""
+    from tasklane.projects import set_project_env_file
+    from tasklane.secrets import (
+        default_secret_file_path, load_env_file, validate_secret_pairs, write_secret_file,
+    )
+
+    profile = _require_registered(repo)
+    validate_secret_pairs(secrets)
+    env_file = profile.get("env_file")
+    existing: dict[str, str] = {}
+    if env_file:
+        try:
+            existing = load_env_file(env_file)
+        except (FileNotFoundError, PermissionError, ValueError, OSError):
+            existing = {}
+    merged = {**existing, **{str(k): str(v) for k, v in secrets.items()}}
+    linked = False
+    if env_file:
+        target = write_secret_file(env_file, merged)
+    else:
+        target = write_secret_file(default_secret_file_path(profile.get("name") or "project"), merged, secure_parent=True)
+        set_project_env_file(repo, str(target))
+        linked = True
+    return {"repo": repo, "env_file": str(target), "keys_written": sorted(secrets),
+            "key_names": sorted(merged), "total_keys": len(merged), "registry_linked": linked}
+
+
+@mcp.tool()
+@audited
+def list_project_secret_keys(repo: str) -> dict[str, Any]:
+    """List the KEY NAMES (never values) stored in a registered project's env_file."""
+    from tasklane.secrets import load_env_file
+
+    profile = _require_registered(repo)
+    env_file = profile.get("env_file")
+    if not env_file:
+        return {"repo": repo, "env_file": None, "key_names": []}
+    try:
+        values = load_env_file(env_file)
+    except (FileNotFoundError, PermissionError, ValueError, OSError) as exc:
+        return {"repo": repo, "env_file": env_file, "key_names": [], "error": str(exc)}
+    return {"repo": repo, "env_file": env_file, "key_names": sorted(values)}
+
+
+@mcp.tool()
+@audited
+def delete_project_secret(repo: str, key: str) -> dict[str, Any]:
+    """Remove a single secret KEY from a registered project's env_file."""
+    from tasklane.secrets import load_env_file, write_secret_file
+
+    profile = _require_registered(repo)
+    env_file = profile.get("env_file")
+    if not env_file:
+        raise ValueError(f"project has no env_file: {repo}")
+    values = load_env_file(env_file)
+    if key not in values:
+        return {"repo": repo, "env_file": env_file, "removed": False, "key_names": sorted(values)}
+    del values[key]
+    write_secret_file(env_file, values)
+    return {"repo": repo, "env_file": env_file, "removed": True, "key_names": sorted(values)}
 
 
 @mcp.tool()

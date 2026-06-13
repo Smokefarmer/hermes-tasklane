@@ -31,5 +31,16 @@ pairing_enabled: true               # let new clients request access via POST /p
 
 # --- project registry ---
 # Per-project profiles (test/build commands + authoritative docs every job must
-# read) live in a sibling file: $TASKLANE_HOME/projects.yaml. Manage it with the
-# register_project / list_projects MCP tools. See the "Project registry" README section.
+# read) live in a sibling file: $TASKLANE_HOME/projects.yaml, keyed by repo path.
+# Manage it with the register_project / list_projects MCP tools.
+#
+# A profile may also carry TESTER fields used by the test-local / test-staging
+# roles and the optional pipeline `test` stage:
+#   env_file:            absolute path to a mode-600 KEY=VALUE secrets file. This is
+#                        the ONLY place test credentials live; the worker injects the
+#                        values into the job subprocess and the prompt only ever sees
+#                        the KEY NAMES. Manage with the set_project_secrets MCP tool.
+#   local_test_command:  how to boot/exercise the app locally (test-local).
+#   staging_url / staging_url_command: the deployed URL, or a command to discover it (test-staging).
+#   test_notes:          operator guidance (e.g. "seeded test tenant only").
+# See the "Project registry" and "Tester roles" README sections.

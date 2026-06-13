@@ -25,6 +25,7 @@ from tasklane.fanout import create_proposed_drafts
 from tasklane.metrics import merge_metrics, run_metrics, spend_last_24h
 from tasklane.paths import logs_root
 from tasklane.projects import inject_project_profile
+from tasklane.secrets import load_env_file
 from tasklane.reconcile import backoff_not_before, reconcile
 from tasklane.runner import run_claude_cli_job
 from tasklane.store import JobStore
@@ -162,6 +163,36 @@ def _fanout_proposals(store: JobStore, completed: Dict[str, Any], final_response
         store.append_event(job_id, "job_fanout_error", reason=str(exc))
 
 
+def _load_tester_secrets(record: Dict[str, Any], job_id: str) -> tuple[Dict[str, Any], Dict[str, str]]:
+    """Load the project profile's env_file (if any) for injection into the job
+    subprocess. Returns (record_with_env_var_names, secret_values).
+
+    The prompt only ever sees the sorted KEY NAMES (stored on
+    spec.metadata.env_var_names); the values go to the subprocess env, never to a
+    spec/prompt/log. A bad env_file (missing, wrong mode, malformed) is recorded
+    and skipped — the tester job then runs without secrets and will report it
+    cannot authenticate, rather than the worker crashing or leaking a value."""
+    spec = record.get("spec") if isinstance(record.get("spec"), dict) else {}
+    profile = (spec.get("metadata") or {}).get("project_profile") or {}
+    env_file = str(profile.get("env_file") or "").strip()
+    if not env_file:
+        return record, {}
+    try:
+        values = load_env_file(env_file)
+    except (FileNotFoundError, PermissionError, ValueError, OSError) as exc:
+        # never include the path's contents; the message references the path only
+        _append_log(job_id, f"SECRET ENV LOAD FAILED: {exc}")
+        logger.warning("Job %s could not load env_file: %s", job_id, exc)
+        return record, {}
+    prepared = dict(record)
+    prepared_spec = dict(spec)
+    metadata = dict(prepared_spec.get("metadata") or {})
+    metadata["env_var_names"] = sorted(values.keys())  # NAMES ONLY — never values
+    prepared_spec["metadata"] = metadata
+    prepared["spec"] = prepared_spec
+    return prepared, values
+
+
 def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
     """Execute one already-claimed (running) job to completion/failure."""
     job_id = str(record.get("id") or "")
@@ -186,6 +217,7 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
             store.transition(job_id, "running", reason="workspace-recorded", updates={"worktree": worktree_info})
         prepared_record = inject_upstream_context(store, prepared_record)
         prepared_record = inject_project_profile(prepared_record)
+        prepared_record, secret_env = _load_tester_secrets(prepared_record, job_id)
         prompt = job_prompt(prepared_record)
         workspace_path = str((worktree_info or {}).get("worktree_path") or "") or str((prepared_record.get("spec") or {}).get("repo", {}).get("path") or "")
         _append_log(job_id, f"PROMPT:\n{prompt}")
@@ -197,6 +229,7 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
                 model=cfg.default_model,
                 permission_mode=cfg.permission_mode,
                 timeout_seconds=cfg.timeout_seconds,
+                extra_env=secret_env or None,
             )
             collected_runs.append(run_metrics(result))
             return result

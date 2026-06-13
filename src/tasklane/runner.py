@@ -20,7 +20,7 @@ import json
 import os
 import shutil
 import subprocess
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # An inherited Anthropic key would make the CLI bill against API credits (which
 # the subscription user does not have) instead of the Claude subscription OAuth.
@@ -35,12 +35,18 @@ def claude_cli_available() -> Optional[str]:
     return shutil.which("claude")
 
 
-def _build_env() -> dict:
+def _build_env(extra_env: Optional[Dict[str, str]] = None) -> dict:
     env = dict(os.environ)
     for var in _STRIP_ENV_VARS:
         env.pop(var, None)
     if not env.get("HOME"):
         env["HOME"] = os.path.expanduser("~")
+    # Tester-job secrets are injected AFTER the ANTHROPIC_* strip and are never
+    # logged. The strip is unconditional: a secret file must not be able to
+    # resurrect an inherited API key (which would bill API credits instead of the
+    # subscription OAuth), so those keys are filtered out of extra_env too.
+    if extra_env:
+        env.update({str(k): str(v) for k, v in extra_env.items() if k not in _STRIP_ENV_VARS})
     return env
 
 
@@ -52,6 +58,7 @@ def run_claude_cli_job(
     permission_mode: str = _DEFAULT_PERMISSION_MODE,
     timeout_seconds: int = 3600,
     extra_dirs: Optional[List[str]] = None,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> dict:
     """Execute one coding job via ``claude -p`` and return its result.
 
@@ -98,7 +105,7 @@ def run_claude_cli_job(
         proc = subprocess.run(
             cmd,
             cwd=work_dir,
-            env=_build_env(),
+            env=_build_env(extra_env),
             capture_output=True,
             text=True,
             timeout=max(_MIN_TIMEOUT_SECONDS, int(timeout_seconds)),

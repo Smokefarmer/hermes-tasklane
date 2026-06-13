@@ -96,6 +96,14 @@ def main() -> None:
             out("Repair pass: removed the uncommitted file.")
         junk.write_text("uncommitted\n")
         out("Done (left an uncommitted file behind).")
+    elif scenario == "check_env":
+        # Tester scenario: assert the injected secrets ARE in our process env, and
+        # record only the NAMES we saw (never values) so the test can verify
+        # injection without the value ever leaving the subprocess.
+        seen = [k for k in ("TEST_USER", "TEST_PASSWORD", "STAGING_URL") if os.environ.get(k)]
+        if state_dir:
+            (Path(state_dir) / "env-names-seen.txt").write_text(",".join(sorted(seen)))
+        out(f"Verified deployment. Saw credentials for {len(seen)} variable(s).")
     else:
         out(f"unknown FAKE_CLAUDE_SCENARIO: {scenario}", is_error=True)
 

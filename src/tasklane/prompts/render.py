@@ -90,6 +90,38 @@ def _delivery_contract_block(request: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _env_vars_block(spec: Dict[str, Any]) -> str:
+    """KEY NAMES ONLY of the secrets the worker injected — never values. Tester
+    roles read the values from os.environ / $VAR at runtime; the prompt (a
+    persisted artifact) must only ever name them."""
+    names = (spec.get("metadata") or {}).get("env_var_names") or []
+    names = [str(n) for n in names if str(n).strip()]
+    if not names:
+        return "Environment variables available: (none configured for this project)"
+    return (
+        "Environment variables available (NAMES ONLY — read the values from the "
+        "environment, they are not in this prompt): " + ", ".join(sorted(names))
+    )
+
+
+def _test_context_block(spec: Dict[str, Any]) -> str:
+    """Tester-relevant fields from the project profile: how to boot locally, the
+    staging URL (or how to discover it), and operator test notes."""
+    profile = (spec.get("metadata") or {}).get("project_profile") or {}
+    lines: List[str] = []
+    if profile.get("local_test_command"):
+        lines.append(f"- local_test_command: {profile['local_test_command']}")
+    if profile.get("staging_url"):
+        lines.append(f"- staging_url: {profile['staging_url']}")
+    if profile.get("staging_url_command"):
+        lines.append(f"- staging_url_command (run to discover the URL): {profile['staging_url_command']}")
+    if profile.get("test_notes"):
+        lines.append(f"- test_notes: {profile['test_notes']}")
+    if not lines:
+        return "Test context: (no project test profile registered — discover how to run the app yourself)"
+    return "Test context:\n" + "\n".join(lines)
+
+
 def render_role_prompt(template: str, record: Dict[str, Any], spec: Dict[str, Any]) -> Optional[str]:
     """Fill a role template's ``{placeholder}`` fields from the job record.
 
@@ -111,6 +143,9 @@ def render_role_prompt(template: str, record: Dict[str, Any], spec: Dict[str, An
         "upstream_context": _upstream_context_block(spec),
         "scope_contract": _scope_contract_block(scope),
         "delivery_contract": _delivery_contract_block(request),
+        # tester-role fields (ignored by templates that don't reference them)
+        "env_vars": _env_vars_block(spec),
+        "test_context": _test_context_block(spec),
     }
     try:
         return template.format(**fields)
