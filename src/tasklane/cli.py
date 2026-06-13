@@ -105,6 +105,17 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from tasklane.doctor import FAIL, build_report, format_table
+
+    report = build_report()
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(format_table(report))
+    return 1 if report["overall"] == FAIL else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tasklane", description="TaskLane job control")
     sub = p.add_subparsers(dest="command", required=True)
@@ -130,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("cancel", help="cancel a job"); s.add_argument("id"); s.set_defaults(func=cmd_cancel)
     s = sub.add_parser("reconcile", help="recover orphaned jobs and stale locks"); s.set_defaults(func=cmd_reconcile)
     s = sub.add_parser("stats", help="cost/usage telemetry report"); s.set_defaults(func=cmd_stats)
+    s = sub.add_parser("doctor", help="run environment diagnostics"); s.add_argument("--json", action="store_true", help="print the raw JSON report"); s.set_defaults(func=cmd_doctor)
     return p
 
 
