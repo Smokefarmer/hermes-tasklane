@@ -123,3 +123,71 @@ def test_parse_timestamp():
     assert aware is not None and aware.tzinfo is not None
     naive = parse_timestamp("2026-06-12T00:00:00")
     assert naive is not None and naive.tzinfo is not None  # coerced to UTC
+
+
+# --------------------------------------------------------------------------- #
+# transition locking (concurrency integrity)
+# --------------------------------------------------------------------------- #
+def test_concurrent_transitions_leave_record_in_one_state(store):
+    """Many threads transitioning one job concurrently must never leave the
+    record present in two state dirs (the pre-lock corruption mode)."""
+    import threading
+
+    store.put(make_spec("race"))
+    states = ["ready", "running", "blocked", "completed", "failed", "needs-human"]
+    errors: list[Exception] = []
+
+    def flip(target: str) -> None:
+        try:
+            for _ in range(8):
+                store.transition("race", target, reason="stress")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=flip, args=(s,)) for s in states]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"transition raised under contention: {errors}"
+    # the record must live in exactly ONE state dir
+    present = [s for s in states if (store.root / s / "race.json").exists()]
+    assert len(present) == 1, f"record present in multiple state dirs: {present}"
+    assert store.get("race")["state"] in states
+
+
+def test_transition_lock_times_out_when_held(store):
+    """A transition fails closed (TimeoutError) rather than corrupting state when
+    the per-job lock is held by someone else past the timeout."""
+    import tasklane.store as store_mod
+
+    store.put(make_spec("held"))
+    lock_path = store._transition_lock_path("held")
+    lock_path.write_text("{}")  # simulate a held (fresh) lock
+    try:
+        orig = store_mod.TRANSITION_LOCK_TIMEOUT
+        store_mod.TRANSITION_LOCK_TIMEOUT = 0.3  # read at call time now
+        # keep the lock "fresh" so the stale-breaker (separate, larger threshold)
+        # does not steal it
+        import os, time as _t
+        os.utime(lock_path, (_t.time(), _t.time()))
+        with pytest.raises(TimeoutError):
+            store.transition("held", "running", reason="should-block")
+    finally:
+        store_mod.TRANSITION_LOCK_TIMEOUT = orig
+        lock_path.unlink(missing_ok=True)
+
+
+def test_transition_steals_stale_lock(store):
+    """A transition lock older than the timeout is debris from a crash and is stolen."""
+    import os, time as _t
+
+    store.put(make_spec("stale"))
+    lock_path = store._transition_lock_path("stale")
+    lock_path.write_text("{}")
+    old = _t.time() - 3600
+    os.utime(lock_path, (old, old))
+    # should steal the stale lock and succeed
+    updated = store.transition("stale", "running", reason="after-steal")
+    assert updated["state"] == "running"

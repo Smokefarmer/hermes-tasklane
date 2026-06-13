@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -23,6 +25,15 @@ JOB_STATES = {
 }
 TERMINAL_JOB_STATES = {"completed", "failed"}
 ACTIVE_JOB_STATES = {"running"}
+
+# Per-job transition lock. Transitions are sub-millisecond, so a short acquire
+# timeout is ample. Staleness is a SEPARATE, larger threshold: a lock older than
+# it is debris from a crashed process and is stolen. Keeping the two distinct
+# means a merely-contended (but live) lock within the acquire window is never
+# mistaken for stale.
+TRANSITION_LOCK_TIMEOUT = 10.0
+TRANSITION_LOCK_STALE_SECONDS = 60.0
+TRANSITION_LOCK_POLL = 0.02
 
 
 def default_jobs_root() -> Path:
@@ -100,22 +111,29 @@ class JobStore:
         reason: str,
         updates: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        # Serialize read->write-new->unlink-old per job. Without this, concurrent
+        # transitions (reconciler vs worker complete/fail vs MCP retry/cancel) can
+        # each write their own state dir and unlink the other's old path, leaving
+        # the record present in TWO state dirs (get() then returns a nondeterministic
+        # state). The transition lock is distinct from the claim lock, so a caller
+        # holding the claim lock (claim_next, reconcile) does not self-deadlock.
         self.ensure_dirs()
-        record = self.get(job_id)
-        if record is None:
-            raise FileNotFoundError(f"Job not found: {job_id}")
-        old_state = normalize_job_state(record.get("state"))
-        new_state = normalize_job_state(state)
-        updated = dict(record)
-        updated.update(dict(updates or {}))
-        updated["state"] = new_state
-        updated["updated_at"] = utc_now()
-        old_path = self.root / old_state / f"{validate_job_id(job_id)}.json"
-        self._write_record(updated)
-        if old_path != self._record_path(updated):
-            old_path.unlink(missing_ok=True)
-        self.append_event(job_id, "job_state_changed", state=new_state, reason=reason, metadata={"from": old_state})
-        return updated
+        with self._transition_lock(job_id):
+            record = self.get(job_id)
+            if record is None:
+                raise FileNotFoundError(f"Job not found: {job_id}")
+            old_state = normalize_job_state(record.get("state"))
+            new_state = normalize_job_state(state)
+            updated = dict(record)
+            updated.update(dict(updates or {}))
+            updated["state"] = new_state
+            updated["updated_at"] = utc_now()
+            old_path = self.root / old_state / f"{validate_job_id(job_id)}.json"
+            self._write_record(updated)
+            if old_path != self._record_path(updated):
+                old_path.unlink(missing_ok=True)
+            self.append_event(job_id, "job_state_changed", state=new_state, reason=reason, metadata={"from": old_state})
+            return updated
 
     def ready_jobs(
         self,
@@ -309,6 +327,48 @@ class JobStore:
 
     def _claim_lock_path(self, job_id: str) -> Path:
         return self.locks_dir / f"{validate_job_id(job_id)}.lock"
+
+    def _transition_lock_path(self, job_id: str) -> Path:
+        return self.locks_dir / f"{validate_job_id(job_id)}.txlock"
+
+    @contextmanager
+    def _transition_lock(self, job_id: str, *, timeout: float | None = None):
+        """Blocking per-job lock around a state transition.
+
+        Polls an O_EXCL lock file until acquired or *timeout* elapses (raising
+        ``TimeoutError`` — callers fail closed rather than corrupt state). A lock
+        older than ``TRANSITION_LOCK_STALE_SECONDS`` is debris from a crashed
+        process and is stolen (the reconciler's stale-lock sweep only touches
+        claim locks, not these). Module globals are read at call time so they can
+        be tuned/monkeypatched.
+        """
+        timeout = TRANSITION_LOCK_TIMEOUT if timeout is None else timeout
+        path = self._transition_lock_path(job_id)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        deadline = time.monotonic() + timeout
+        acquired = False
+        while True:
+            try:
+                fd = os.open(path, flags, 0o600)
+                os.close(fd)
+                acquired = True
+                break
+            except FileExistsError:
+                try:
+                    age = time.time() - path.stat().st_mtime
+                except OSError:
+                    age = 0.0
+                if age > TRANSITION_LOCK_STALE_SECONDS:
+                    path.unlink(missing_ok=True)  # steal a crashed holder's lock
+                    continue
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"transition lock busy for {job_id} after {timeout}s")
+                time.sleep(TRANSITION_LOCK_POLL)
+        try:
+            yield
+        finally:
+            if acquired:
+                path.unlink(missing_ok=True)
 
     def _acquire_claim_lock(self, job_id: str, *, owner: str) -> Path | None:
         self.ensure_dirs()
