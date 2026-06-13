@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from tasklane.atomicio import atomic_write_json
 from tasklane.paths import jobs_root as _jobs_root
 
 from tasklane.specs import validate_job_spec
@@ -308,22 +309,7 @@ class JobStore:
         return self.root / normalize_job_state(record.get("state")) / f"{validate_job_id(record.get('id'))}.json"
 
     def _write_record(self, record: Mapping[str, Any]) -> None:
-        path = self._record_path(record)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            json.dump(dict(record), handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-            temp_name = handle.name
-        os.replace(temp_name, path)
+        atomic_write_json(self._record_path(record), dict(record))
 
     def _claim_lock_path(self, job_id: str) -> Path:
         return self.locks_dir / f"{validate_job_id(job_id)}.lock"

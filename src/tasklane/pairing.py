@@ -18,14 +18,15 @@ import json
 import os
 import re
 import secrets
-import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from tasklane.atomicio import atomic_write_json
 from tasklane.paths import tasklane_home
+from tasklane.store import parse_timestamp, utc_now
 
 # A-Z minus I/O plus 2-9: no characters that read ambiguously when spoken or typed.
 PAIRING_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -52,7 +53,7 @@ def request_pairing(name: str) -> dict[str, Any]:
             raise ValueError(f"too many pending pairing requests (cap {PENDING_CAP})")
         client_id = _new_client_id(clean_name, data)
         pairing_code = _new_pairing_code(data)
-        now = _utc_now()
+        now = utc_now()
         data["clients"][client_id] = {
             "name": clean_name,
             "token_sha256": _token_digest(token),
@@ -88,7 +89,7 @@ def approve_client(pairing_code: str) -> dict[str, Any]:
         record = data["clients"].get(client_id)
         if record is None:
             raise ValueError("unknown or expired pairing code")
-        record["approved_at"] = _utc_now()
+        record["approved_at"] = utc_now()
         _save(data)
         return _public(client_id, record)
 
@@ -143,7 +144,7 @@ def authenticate(token: str) -> dict[str, Any] | None:
     # The client is being seen right now, so the reported last_seen_at is `now`;
     # the throttle below only governs how often we PERSIST it, not what we report.
     seen = dict(matched_record)
-    seen["last_seen_at"] = _utc_now()
+    seen["last_seen_at"] = utc_now()
     _touch_last_seen(matched_id)
     return _public(matched_id, seen)
 
@@ -158,24 +159,13 @@ def _touch_last_seen(client_id: str, *, throttle_seconds: float = 60.0) -> None:
             record = data["clients"].get(client_id)
             if record is None or record.get("revoked_at"):
                 return
-            last = _parse_iso(record.get("last_seen_at"))
+            last = parse_timestamp(record.get("last_seen_at"))
             if last is not None and (datetime.now(timezone.utc) - last).total_seconds() < throttle_seconds:
                 return
-            record["last_seen_at"] = _utc_now()
+            record["last_seen_at"] = utc_now()
             _save(data)
     except (TimeoutError, OSError, ValueError):
         return  # best-effort only
-
-
-def _parse_iso(value: Any) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def list_clients() -> list[dict[str, Any]]:
@@ -204,7 +194,7 @@ def revoke_client(client_id: str) -> dict[str, Any]:
         record = data["clients"].get(safe_id)
         if record is None:
             raise ValueError(f"unknown client: {safe_id!r}")
-        record["revoked_at"] = _utc_now()
+        record["revoked_at"] = utc_now()
         _save(data)
         return _public(safe_id, record)
 
@@ -224,7 +214,7 @@ def _prune(data: dict[str, Any], ttl_seconds: float) -> list[str]:
     now = datetime.now(timezone.utc)
     pruned: list[str] = []
     for code, entry in list(data["pending"].items()):
-        requested_at = _parse_timestamp(entry.get("requested_at"))
+        requested_at = parse_timestamp(entry.get("requested_at"))
         if requested_at is not None and (now - requested_at).total_seconds() <= ttl_seconds:
             continue
         data["pending"].pop(code)
@@ -260,23 +250,6 @@ def _public(client_id: str, record: dict[str, Any]) -> dict[str, Any]:
     return {"client_id": client_id, **public}
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _parse_timestamp(value: Any) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
 def _load() -> dict[str, Any]:
     path = clients_path()
     if not path.exists():
@@ -293,23 +266,8 @@ def _load() -> dict[str, Any]:
 
 
 def _save(data: dict[str, Any]) -> None:
-    path = clients_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        json.dump(data, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        temp_name = handle.name
-    os.chmod(temp_name, 0o600)
-    os.replace(temp_name, path)
+    # mode 0600: the client registry holds token hashes — never world-readable.
+    atomic_write_json(clients_path(), data, mode=0o600)
 
 
 @contextmanager
