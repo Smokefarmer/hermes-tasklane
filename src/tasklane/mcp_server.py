@@ -338,6 +338,49 @@ def analyze_project(repo: str, base_branch: str = "main", id: str | None = None)
 
 @mcp.tool()
 @audited
+def security_audit(
+    repo: str,
+    base_branch: str = "main",
+    scope: str | None = None,
+    id: str | None = None,
+) -> dict[str, Any]:
+    """Create ONE report-only security audit job (role 'audit', detached-review).
+
+    The audit agent surveys the attack surface against the OWASP Top 10, then either
+    reports findings directly (small codebase) or emits a `proposed_tasks` block of
+    scoped, report-only child audits an operator can approve. It never modifies code.
+    repo must be an absolute path within the configured allowlist. scope optionally
+    narrows the survey (e.g. "backend auth only"). Returns the new job id+state."""
+    cfg = _cfg()
+    if not repo_path_allowed(repo, cfg):
+        raise ValueError(f"repo path not in allowlist: {repo}")
+    focus = (scope or "").strip()
+    title = f"Security audit: {focus}" if focus else "Security audit"
+    body = (
+        "Perform a security audit of this repository. Survey the attack surface "
+        "(entry points, trust boundaries, authn/authz, data stores, third-party "
+        "calls, secrets handling) using the OWASP Top 10 as the checklist spine. "
+        "Then EITHER report findings directly if the codebase is small enough to "
+        "read exhaustively, OR propose focused, report-only child audits via a "
+        "proposed_tasks block. Never exploit, never exfiltrate, never modify code."
+    )
+    if focus:
+        body += f"\n\nScope / focus for this audit: {focus}"
+    spec: dict[str, Any] = {
+        "repo": {"path": repo},
+        "request": {"type": "task-small", "title": title, "body": body},
+        "branch": {"mode": "detached-review", "base_branch": base_branch},
+        "delivery_mode": "report-only",
+        "role": "audit",
+    }
+    if id:
+        spec["id"] = id
+    record = _store().put(spec)
+    return {"id": record["id"], "state": record["state"], "role": "audit"}
+
+
+@mcp.tool()
+@audited
 def list_tasks(state: str | None = None) -> list[dict[str, Any]]:
     """List jobs, optionally filtered by state (ready|running|blocked|completed|failed|needs-human|draft)."""
     states = [state] if state else None

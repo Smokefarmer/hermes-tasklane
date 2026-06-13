@@ -143,8 +143,8 @@ competent operator:
 
 ## MCP tools
 
-- **Lifecycle:** `create_task`, `create_pipeline`, `analyze_project`, `list_tasks`, `get_task`, `task_events`,
-  `task_logs`, `retry_task`, `cancel_task`, `run_task_now`
+- **Lifecycle:** `create_task`, `create_pipeline`, `analyze_project`, `security_audit`, `list_tasks`,
+  `get_task`, `task_events`, `task_logs`, `retry_task`, `cancel_task`, `run_task_now`
 - **Inspect & fix** (confined to the job's worktree): `get_diff`, `list_dir`, `read_file`,
   `write_file`, `apply_patch`, `exec`, `git`, `run_tests`
 - **Pairing:** `pairing_requests`, `approve_client`, `reject_client`, `list_clients`,
@@ -227,6 +227,31 @@ When the worker runs a job it looks up the original repo path; if a profile is
 found it injects a **"Project profile:"** prompt section listing the commands
 ("verify with exactly this command") and, for each doc that actually exists in the
 worktree, a `MANDATORY: read <path>` line. `merge_policy` is informational for now.
+
+## Security audits
+
+`security_audit(repo, base_branch="main", scope=None, id=None)` creates ONE report-only
+job (role `audit`, `branch_mode: detached-review`) whose primary output is **decomposition**.
+The agent first **surveys the attack surface** — entry points, trust boundaries, authn/authz
+flows, data stores, third-party calls, secrets/config handling — using the **OWASP Top 10** as
+its checklist spine. Then it either:
+
+- **reports findings directly** when the codebase is small enough to read every relevant line, or
+- **drafts focused child audits** — a fenced ` ```proposed_tasks ` block of scoped,
+  report-only investigations (auth, session handling, database/query layer, frontend/XSS surface,
+  API input validation, secrets/config handling, dependency CVEs). Each child carries a precise
+  title, `allowed_paths` tight enough that an agent can read every line in scope, what to look
+  for, and a severity rationale.
+
+The recommended flow is **survey → draft children → approve → focused audits**: run
+`security_audit` (optionally narrowing with `scope`, e.g. `"backend auth only"`), read the
+parent's survey and `proposed_tasks` block, then approve the children you want by creating them
+(`create_task` with `branch_mode: detached-review`, `delivery_mode: report-only`) — each scoped
+to its `allowed_paths`. Findings from both parent and children use the same structured JSON
+contract as the **review** role (`severity` / `file` / `line` / `issue` / `suggestion`), so they
+flow into the same downstream machinery. Audits are strictly **report-only**: the agent never
+exploits, never exfiltrates, and never modifies code, and flags any hardcoded secret as
+**CRITICAL** with rotation advice.
 
 ## Delivery modes
 
