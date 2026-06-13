@@ -175,6 +175,9 @@ competent operator:
   `admin_exec` (gated by config)
 - **Project registry & secrets:** `register_project`, `list_projects`, `set_project_secrets`,
   `list_project_secret_keys`, `delete_project_secret`
+- **Integrations (GitHub + Linear):** `set_integration_token`, `integration_status`,
+  `disconnect_integration`, `github_create_issue`, `github_list_issues`, `github_get_issue`,
+  `linear_list_issues`, `linear_get_issue`, `linear_to_github_issue`, `github_issue_to_task`
 
 A typical operator flow: `create_task` → watch with `get_task`/`task_logs` → if it blocks,
 `get_diff` + `exec` to find the problem, `write_file`/`apply_patch` to fix, `retry_task`.
@@ -275,6 +278,33 @@ contract as the **review** role (`severity` / `file` / `line` / `issue` / `sugge
 flow into the same downstream machinery. Audits are strictly **report-only**: the agent never
 exploits, never exfiltrates, and never modifies code, and flags any hardcoded secret as
 **CRITICAL** with rotation advice.
+
+## GitHub & Linear integrations
+
+The Claude apps have no GitHub connector — so TaskLane carries it. Because your Claude app
+already reaches TaskLane over the OAuth connector, GitHub and Linear come through that one
+connection as MCP tools; nothing extra to wire in the app.
+
+Connect each service once — either from a browser at
+`https://tasklane.<your-domain>/connections?token=<app_token>` (paste a token, set a GitHub
+default repo), or by telling a connected Claude to call `set_integration_token`. Tokens are
+stored mode-600 and never echoed (status shows a masked hint only); the audit log redacts them.
+
+- **GitHub** — a fine-grained PAT with Issues read/write. Tools: `github_create_issue`,
+  `github_list_issues`, `github_get_issue`.
+- **Linear** — a personal API key. Tools: `linear_list_issues`, `linear_get_issue`.
+
+**The Linear → GitHub → TaskLane flow**, from one Claude conversation (or chained tools):
+
+```
+linear_to_github_issue("ENG-123")          # Linear ticket  -> GitHub issue (with back-link)
+github_issue_to_task(number=42,            # GitHub issue   -> TaskLane coding job
+    repo_path="/abs/local/checkout",       #   (LOCAL git checkout the job runs in; allowlisted)
+    work_branch="tasklane/issue-42")       #   delivers a PR that Closes #42
+```
+
+`github_issue_to_task` keeps the GitHub repo (for the issue) and the local repo path (where the
+job runs) separate, and records the issue URL on the job's `source` for traceability.
 
 ## Tester roles
 

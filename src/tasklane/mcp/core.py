@@ -100,7 +100,7 @@ def _audit(tool: str, info: dict[str, Any], status: str) -> None:
 # Kwargs whose VALUES must never reach the audit log. A dict-valued sensitive arg
 # (e.g. set_project_secrets(secrets=...)) is logged as its sorted KEY NAMES only;
 # a scalar one is logged as "<redacted>". Names are safe (and useful) to audit.
-_SENSITIVE_ARGS = {"secrets"}
+_SENSITIVE_ARGS = {"secrets", "token"}
 
 
 def _redact_audit_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
