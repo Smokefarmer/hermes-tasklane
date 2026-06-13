@@ -129,6 +129,7 @@ Only the SHA-256 of each token is stored (`$TASKLANE_HOME/clients.json`). The le
   `revoke_client`
 - **Ops:** `worker_status`, `restart_worker`, `prune_worktrees`, `reconcile_jobs`, `metrics`,
   `admin_exec` (gated by config)
+- **Project registry:** `register_project`, `list_projects`
 
 A typical operator flow: `create_task` → watch with `get_task`/`task_logs` → if it blocks,
 `get_diff` + `exec` to find the problem, `write_file`/`apply_patch` to fix, `retry_task`.
@@ -169,6 +170,41 @@ It writes `docs/architecture-review.md` (context map, findings by severity, ADR 
 a ```` ```proposed_tasks` ```` block of ranked remediation tasks. **Those remediation tasks land
 as drafts requiring approval** — the draft fan-out parses the block; nothing is acted on
 automatically. Review the branch, then approve the remediation tasks you want to run.
+
+## Project registry
+
+A job's prompt is generic, but every repo has its own test/build commands and
+authoritative rule files (`CLAUDE.md`, ADRs, `rules/` dirs). Register a **project
+profile** once and every job targeting that repo is told its commands and which
+docs it MUST read before planning:
+
+```bash
+# via the register_project MCP tool (or tasklane.projects.register_project)
+register_project(
+  path="/abs/repo/path", name="my-service",
+  test_command=".venv/bin/python -m pytest -q", build_command="make build",
+  docs=["CLAUDE.md", "docs/adr/", "rules/"], base_branch="main",
+  default_model=null, merge_policy="manual")
+```
+
+Profiles live in `$TASKLANE_HOME/projects.yaml` (keyed by the repo's git toplevel):
+
+```yaml
+projects:
+  "/abs/repo/path":
+    name: my-service
+    test_command: ".venv/bin/python -m pytest -q"
+    build_command: "make build"
+    docs: [CLAUDE.md, docs/adr/, rules/]      # the repo's authoritative rules
+    base_branch: main
+    default_model: null
+    merge_policy: manual                      # manual|auto — informational for now
+```
+
+When the worker runs a job it looks up the original repo path; if a profile is
+found it injects a **"Project profile:"** prompt section listing the commands
+("verify with exactly this command") and, for each doc that actually exists in the
+worktree, a `MANDATORY: read <path>` line. `merge_policy` is informational for now.
 
 ## Delivery modes
 

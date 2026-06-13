@@ -28,3 +28,8 @@ allowed_origins: []                 # extra browser Origins to accept (usually e
 enable_admin_exec: false            # server-level shell tool, OFF by default
 exec_timeout_seconds: 600
 pairing_enabled: true               # let new clients request access via POST /pair (each request still needs operator approval); false disables the endpoint and paired-token auth
+
+# --- project registry ---
+# Per-project profiles (test/build commands + authoritative docs every job must
+# read) live in a sibling file: $TASKLANE_HOME/projects.yaml. Manage it with the
+# register_project / list_projects MCP tools. See the "Project registry" README section.

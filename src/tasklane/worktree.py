@@ -20,6 +20,7 @@ from typing import Any, Dict, List
 from tasklane.paths import worktrees_root
 from tasklane.prompts import load_template
 from tasklane.prompts.render import render_role_prompt
+from tasklane.projects import render_profile_block
 
 logger = logging.getLogger("tasklane.worktree")
 
@@ -332,6 +333,9 @@ def _generic_job_prompt(record: Dict[str, Any]) -> str:
             "- Work only in the repo path above; do not edit the original checkout.",
             "",
         ]
+    profile_block = render_profile_block((spec.get("metadata") or {}).get("project_profile"), repo.get("path") or "")
+    if profile_block:
+        lines += [profile_block, ""]
     upstream = (spec.get("metadata") or {}).get("upstream_context") or []
     if upstream:
         lines += ["Context from upstream pipeline jobs (read before planning):", ""]

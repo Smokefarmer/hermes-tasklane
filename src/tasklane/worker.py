@@ -24,6 +24,7 @@ from tasklane.config import Config, load_config
 from tasklane.fanout import create_proposed_drafts
 from tasklane.metrics import merge_metrics, run_metrics, spend_last_24h
 from tasklane.paths import logs_root
+from tasklane.projects import inject_project_profile
 from tasklane.reconcile import backoff_not_before, reconcile
 from tasklane.runner import run_claude_cli_job
 from tasklane.store import JobStore
@@ -184,6 +185,7 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
             # the worktree of a blocked/failed job (kept on failure).
             store.transition(job_id, "running", reason="workspace-recorded", updates={"worktree": worktree_info})
         prepared_record = inject_upstream_context(store, prepared_record)
+        prepared_record = inject_project_profile(prepared_record)
         prompt = job_prompt(prepared_record)
         workspace_path = str((worktree_info or {}).get("worktree_path") or "") or str((prepared_record.get("spec") or {}).get("repo", {}).get("path") or "")
         _append_log(job_id, f"PROMPT:\n{prompt}")
