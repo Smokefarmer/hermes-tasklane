@@ -120,7 +120,8 @@ def build_app(cfg: Config):
     app = mcp.streamable_http_app()
     allowed = set(cfg.allowed_origins)
     return AuthMiddleware(app, token=cfg.app_token, allowed_origins=allowed,
-                          pairing_enabled=cfg.pairing_enabled)
+                          pairing_enabled=cfg.pairing_enabled,
+                          oauth_enabled=cfg.oauth_enabled)
 
 
 def main() -> None:

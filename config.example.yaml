@@ -28,6 +28,7 @@ allowed_origins: []                 # extra browser Origins to accept (usually e
 enable_admin_exec: false            # server-level shell tool, OFF by default
 exec_timeout_seconds: 600
 pairing_enabled: true               # let new clients request access via POST /pair (each request still needs operator approval); false disables the endpoint and paired-token auth
+oauth_enabled: true                 # OAuth 2.1 connector flow so claude.ai / Claude mobile+desktop can add TaskLane as a custom connector (you approve in-browser with app_token); false disables it
 
 # --- project registry ---
 # Per-project profiles (test/build commands + authoritative docs every job must
