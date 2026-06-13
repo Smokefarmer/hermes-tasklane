@@ -883,12 +883,20 @@ class AuthMiddleware:
         return await self.app(scope, receive, send)
 
     def _authorized(self, token: str) -> bool:
-        """True for the legacy app token or an approved, non-revoked paired client."""
+        """True for the legacy app token or an approved, non-revoked paired client.
+
+        Fails closed: any error in the pairing path denies (clean 401) rather
+        than propagating out of the ASGI middleware as a 500.
+        """
         if self.token and hmac.compare_digest(token, self.token):
             return True
         if not self.pairing_enabled or not token:
             return False
-        return pairing.authenticate(token) is not None
+        try:
+            return pairing.authenticate(token) is not None
+        except Exception:  # noqa: BLE001 — auth must never 500
+            logger.warning("pairing.authenticate raised; denying", exc_info=True)
+            return False
 
     async def _pair(self, scope, receive, send, client_ip: str) -> None:
         """Public pairing endpoint: POST {"name": ...} -> pending client + one-time token."""

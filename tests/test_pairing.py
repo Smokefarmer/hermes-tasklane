@@ -157,3 +157,70 @@ def test_list_clients_and_pending_have_no_hashes(pairing_home):
 def test_request_pairing_rejects_blank_name(pairing_home):
     with pytest.raises(ValueError):
         pairing.request_pairing("   ")
+
+
+# --------------------------------------------------------------------------- #
+# authenticate: read-only decision, throttled last_seen, fail-closed (B-fix)
+# --------------------------------------------------------------------------- #
+def _approved_token(pairing_home) -> tuple[str, str]:
+    req = pairing.request_pairing("client")
+    pairing.approve_client(req["pairing_code"])
+    return req["client_id"], req["token"]
+
+
+def test_authenticate_does_not_rewrite_on_throttle(pairing_home):
+    """Two quick authentications must not rewrite clients.json the second time
+    (last_seen stamp is throttled) — auth is not a hot-path writer."""
+    client_id, token = _approved_token(pairing_home)
+    assert pairing.authenticate(token) is not None  # first stamps last_seen
+    path = pairing_home / "clients.json"
+    before = path.stat().st_mtime_ns
+    import time
+    time.sleep(0.01)
+    assert pairing.authenticate(token) is not None  # throttled — no rewrite
+    assert path.stat().st_mtime_ns == before
+
+
+def test_authenticate_stamps_last_seen_after_throttle_window(pairing_home):
+    client_id, token = _approved_token(pairing_home)
+    pairing.authenticate(token)
+    # backdate last_seen beyond the throttle window
+    data = read_store(pairing_home)
+    old = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+    data["clients"][client_id]["last_seen_at"] = old
+    (pairing_home / "clients.json").write_text(json.dumps(data), encoding="utf-8")
+    assert pairing.authenticate(token) is not None
+    assert read_store(pairing_home)["clients"][client_id]["last_seen_at"] != old
+
+
+def test_authenticate_succeeds_under_lock_contention(pairing_home):
+    """A held write-lock must NOT break authentication — the decision is lock-free
+    and the last_seen stamp is best-effort (this is the 500-vs-401 fix)."""
+    client_id, token = _approved_token(pairing_home)
+    # hold the pairing lock so any stamp attempt would time out
+    lock_path = pairing_home / "clients.json.lock"
+    import os
+    fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.utime(lock_path, None)  # fresh, not stealable
+        result = pairing.authenticate(token)  # must not raise, must authenticate
+        assert result is not None and result["client_id"] == client_id
+    finally:
+        os.close(fd)
+        lock_path.unlink(missing_ok=True)
+
+
+def test_authenticate_fails_closed_on_unreadable_store(pairing_home, monkeypatch):
+    client_id, token = _approved_token(pairing_home)
+
+    def boom():
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(pairing, "_load", boom)
+    assert pairing.authenticate(token) is None  # denies, does not raise
+
+
+def test_revoked_client_denied(pairing_home):
+    client_id, token = _approved_token(pairing_home)
+    pairing.revoke_client(client_id)
+    assert pairing.authenticate(token) is None

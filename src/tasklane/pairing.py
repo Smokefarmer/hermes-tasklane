@@ -113,24 +113,69 @@ def reject_client(pairing_code: str) -> dict[str, Any]:
 
 
 def authenticate(token: str) -> dict[str, Any] | None:
-    """Return the matching approved, non-revoked client record, or None."""
+    """Return the matching approved, non-revoked client record, or None.
+
+    The auth DECISION is read-only and lock-free (``clients.json`` is written
+    atomically, so a plain read is consistent) and fails CLOSED — any read error
+    denies rather than propagating. ``last_seen_at`` is stamped best-effort and
+    throttled (see :func:`_touch_last_seen`), so a read/auth never mutates state
+    on the hot path nor serializes behind the write lock.
+    """
     text = str(token or "")
     if not text:
         return None
     digest = _token_digest(text)
-    with _locked():
+    try:
         data = _load()
-        for client_id, record in data["clients"].items():
-            stored = str(record.get("token_sha256") or "")
-            matched = hmac.compare_digest(stored, digest)
-            if not matched:
-                continue
-            if not record.get("approved_at") or record.get("revoked_at"):
-                return None
+    except Exception:  # noqa: BLE001 — fail closed: an unreadable store denies
+        return None
+    matched_id: str | None = None
+    matched_record: dict[str, Any] | None = None
+    for client_id, record in data["clients"].items():
+        if not hmac.compare_digest(str(record.get("token_sha256") or ""), digest):
+            continue
+        if not record.get("approved_at") or record.get("revoked_at"):
+            return None
+        matched_id, matched_record = client_id, record
+        break
+    if matched_id is None or matched_record is None:
+        return None
+    # The client is being seen right now, so the reported last_seen_at is `now`;
+    # the throttle below only governs how often we PERSIST it, not what we report.
+    seen = dict(matched_record)
+    seen["last_seen_at"] = _utc_now()
+    _touch_last_seen(matched_id)
+    return _public(matched_id, seen)
+
+
+def _touch_last_seen(client_id: str, *, throttle_seconds: float = 60.0) -> None:
+    """Best-effort, throttled ``last_seen_at`` stamp. Never raises, never blocks
+    auth: skips the write if last_seen is fresh, and swallows lock contention /
+    IO errors (a missed timestamp is harmless; failing auth over it is not)."""
+    try:
+        with _locked(timeout=0.5):
+            data = _load()
+            record = data["clients"].get(client_id)
+            if record is None or record.get("revoked_at"):
+                return
+            last = _parse_iso(record.get("last_seen_at"))
+            if last is not None and (datetime.now(timezone.utc) - last).total_seconds() < throttle_seconds:
+                return
             record["last_seen_at"] = _utc_now()
             _save(data)
-            return _public(client_id, record)
-    return None
+    except (TimeoutError, OSError, ValueError):
+        return  # best-effort only
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def list_clients() -> list[dict[str, Any]]:
