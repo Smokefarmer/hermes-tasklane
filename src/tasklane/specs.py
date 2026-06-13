@@ -29,6 +29,9 @@ REQUEST_TYPES = {item.value for item in RequestType}
 BRANCH_MODES = {item.value for item in BranchMode}
 DELIVERY_MODES = {item.value for item in DeliveryMode}
 
+# Stage roles that select a role-based prompt template (see tasklane.prompts).
+ROLES = {"plan", "implement", "review", "fix"}
+
 _REQUEST_TYPE_ALIASES = {
     "bug": RequestType.BUG_SMALL.value,
     "bugfix": RequestType.BUG_SMALL.value,
@@ -92,6 +95,7 @@ def normalize_job_spec(raw: dict) -> dict:
         "repo": repo,
         "request": request,
         "branch": branch,
+        "role": _normalize_role(payload.get("role")),
         "delivery_mode": delivery_mode,
         "dependencies": _normalize_dependencies(payload.get("dependencies"), field="dependencies"),
         # upstream job ids whose final responses are injected into this job's prompt
@@ -285,6 +289,21 @@ def _normalize_request_type(value: Any) -> str:
     raise ValueError(
         f"Invalid request.type {value!r}; expected one of: {', '.join(sorted(REQUEST_TYPES))}"
     )
+
+
+def _normalize_role(value: Any) -> str:
+    """Normalize an optional stage role to lowercase; '' when absent.
+
+    Validated against the known stage roles so a typo fails fast rather than
+    silently selecting the generic prompt.
+    """
+    text = _optional_string(value)
+    if text is None:
+        return ""
+    role = text.lower()
+    if role not in ROLES:
+        raise ValueError(f"Invalid role {value!r}; expected one of: {', '.join(sorted(ROLES))} or empty")
+    return role
 
 
 def _normalize_branch_mode(value: Any) -> str | None:

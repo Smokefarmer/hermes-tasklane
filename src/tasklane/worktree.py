@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from tasklane.paths import worktrees_root
+from tasklane.prompts import load_template
+from tasklane.prompts.render import render_role_prompt
 
 logger = logging.getLogger("tasklane.worktree")
 
@@ -271,6 +273,20 @@ def cleanup_worktree(worktree_info: Dict[str, Any] | None, *, keep: bool) -> Non
 
 
 def job_prompt(record: Dict[str, Any]) -> str:
+    """Build the job prompt: a role-based stage template if the spec selects one,
+    otherwise the generic prompt (backward compatible)."""
+    spec = record.get("spec") if isinstance(record.get("spec"), dict) else {}
+    role = spec.get("role") if isinstance(spec, dict) else ""
+    if role:
+        template = load_template(role)
+        if template is not None:
+            rendered = render_role_prompt(template, record, spec)
+            if rendered is not None:
+                return rendered
+    return _generic_job_prompt(record)
+
+
+def _generic_job_prompt(record: Dict[str, Any]) -> str:
     spec = record.get("spec") if isinstance(record.get("spec"), dict) else {}
     request = spec.get("request") if isinstance(spec.get("request"), dict) else {}
     repo = spec.get("repo") if isinstance(spec.get("repo"), dict) else {}

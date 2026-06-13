@@ -202,6 +202,8 @@ def _pipeline_stage_specs(base_id: str, repo: str, title: str, body: str, *, sta
                 "branch": {"mode": "detached-review", "base_branch": work_branch},
                 "delivery_mode": "report-only",
             }
+        # Each pipeline stage selects its role-based prompt template (plan/implement/review).
+        spec["role"] = stage
         if prior_stage_id:
             spec["dependencies"] = [prior_stage_id]
             spec["context_from"] = [prior_stage_id]
