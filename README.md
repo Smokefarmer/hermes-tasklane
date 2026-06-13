@@ -119,6 +119,28 @@ that). `list_clients` shows every client; `revoke_client(client_id)` cuts one of
 Only the SHA-256 of each token is stored (`$TASKLANE_HOME/clients.json`). The legacy
 `app_token` keeps working regardless of pairing.
 
+## Teach your Claude
+
+TaskLane ships its own operating doctrine so any connecting client becomes a
+competent operator:
+
+- **Built-in:** the MCP server advertises a compact usage doctrine via FastMCP
+  `instructions` (see `USAGE` in [`src/tasklane/mcp_server.py`](src/tasklane/mcp_server.py)) —
+  loaded into the client's context on connect.
+- **Skill:** [`skills/tasklane/SKILL.md`](skills/tasklane/SKILL.md) is a Claude Code
+  skill with the full playbook (delegation decision, good-vs-bad briefs, pipelines,
+  monitoring, the blocked-job repair flow, stacked reviews). Install it:
+
+  ```bash
+  cp -r skills/tasklane ~/.claude/skills/
+  ```
+
+- **Recipes:** copy-pasteable, end-to-end flows in [`docs/recipes/`](docs/recipes/):
+  - [overnight-batch.md](docs/recipes/overnight-batch.md) — queue a backlog, review in the morning.
+  - [fire-and-forget-bugfix.md](docs/recipes/fire-and-forget-bugfix.md) — hand off one bug, repair it if it blocks.
+  - [pr-review-bot.md](docs/recipes/pr-review-bot.md) — report-only review gate, single or stacked branches.
+  - [feature-pipeline.md](docs/recipes/feature-pipeline.md) — plan → implement → review for meatier features.
+
 ## MCP tools
 
 - **Lifecycle:** `create_task`, `create_pipeline`, `analyze_project`, `list_tasks`, `get_task`, `task_events`,

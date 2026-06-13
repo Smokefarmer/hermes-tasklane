@@ -36,7 +36,42 @@ _MAX_OUT = 20_000
 _MAX_PAIR_BODY_BYTES = 4_096
 _MAX_CLIENT_NAME_LENGTH = 120
 
-mcp = FastMCP("tasklane")
+# Self-teaching doctrine surfaced to every connecting MCP client (FastMCP
+# `instructions`). Keep it compact (<= 60 lines): it loads into the client's
+# context on connect, so it must earn its tokens.
+USAGE = """\
+TaskLane is an autonomous coding-job control plane. You hand it a self-contained
+coding task; a server-side worker runs it with `claude -p` in an isolated git
+worktree, then commits / pushes / opens a PR. You stay the operator: brief jobs
+well, monitor them, and unblock the few that get stuck.
+
+WHEN TO DELEGATE: work that is >30 min of grind, parallelizable across repos, or
+best run overnight while you sleep (batch refactors, test backfill, dependency
+bumps, a queue of small bugfixes). DO NOT delegate tiny edits you can finish in
+the time it takes to write a brief, or anything needing live back-and-forth.
+
+ANATOMY OF A GOOD BRIEF (put it all in `body`): the goal; explicit acceptance
+criteria; how to verify (exact test/build command); explicit NON-goals / out of
+scope; and the files or modules in scope. Vague briefs produce blocked jobs.
+
+LIFECYCLE: create_task (one job) or create_pipeline (plan -> implement -> review,
+dependency-chained, each stage sees the prior stage's output). Then observe with
+get_task / task_events / task_logs. Terminal states: completed, blocked, failed,
+needs-human. BLOCKED means the job needs YOU: inspect with get_diff / read_file /
+exec, repair with write_file / apply_patch / git / run_tests inside the worktree,
+then retry_task (add `extra_instructions` to steer the next run).
+
+ETIQUETTE: do NOT poll in a tight loop. Transient failures (workspace prep, agent
+errors) auto-retry with backoff; only `blocked` needs a human. Check back on your
+own cadence, or watch the /status page. Cancel with cancel_task; nudge a parked
+job with run_task_now.
+
+COST: each job records cost/tokens/turns on its record (get_task -> metrics).
+Store-wide spend and 24h totals come from the `metrics` tool. A configurable
+daily budget pauses new claims when reached, so queue deliberately.
+"""
+
+mcp = FastMCP("tasklane", instructions=USAGE)
 
 
 # --------------------------------------------------------------------------- #
