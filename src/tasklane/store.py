@@ -70,8 +70,12 @@ class JobStore:
         safe_id = validate_job_id(job_id)
         for state in JOB_STATES:
             path = self.root / state / f"{safe_id}.json"
-            if path.exists():
+            try:
                 return read_json(path)
+            except FileNotFoundError:
+                # Not in this state dir, or a concurrent transition moved the
+                # record between dirs while we were reading — keep scanning.
+                continue
         return None
 
     def list(self, *, states: Iterable[str] | None = None) -> list[dict[str, Any]]:
