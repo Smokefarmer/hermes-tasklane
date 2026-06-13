@@ -254,6 +254,53 @@ def create_pipeline(
     return {"pipeline": base_id, "jobs": [{"id": r["id"], "state": r["state"]} for r in created]}
 
 
+def _analyze_job_spec(repo: str, *, base_branch: str, id: str | None) -> dict[str, Any]:
+    """Build the spec for an architecture-audit job.
+
+    One job, role ``analyze``, on a fresh review branch delivered direct-push so
+    the written review document arrives as a reviewable branch. request.type is
+    ``refactor-large`` (a whole-repo audit, not a small task)."""
+    job_id = (id or "").strip() or None
+    work_branch = f"tasklane/architecture-review-{job_id}" if job_id else "tasklane/architecture-review"
+    spec: dict[str, Any] = {
+        "repo": {"path": repo},
+        "request": {
+            "type": "refactor-large",
+            "title": "Architecture review",
+            "body": (
+                "Audit this entire repository as an architecture reviewer. Run the four "
+                "passes (Map, Intent, Patterns, Accretion hotspots) defined in your role "
+                "prompt, write docs/architecture-review.md with ADR drafts under "
+                "docs/adr/proposed/, and end with a proposed_tasks block of ranked "
+                "remediation tasks."
+            ),
+        },
+        "role": "analyze",
+        "branch": {"mode": "new-branch", "base_branch": base_branch, "work_branch": work_branch},
+        "delivery_mode": "direct-push",
+    }
+    if job_id:
+        spec["id"] = job_id
+    return spec
+
+
+@mcp.tool()
+@audited
+def analyze_project(repo: str, base_branch: str = "main", id: str | None = None) -> dict[str, Any]:
+    """Audit a whole repository's architecture against best practices and its own
+    documented intent. Creates one job with the analyze role on a fresh review
+    branch (tasklane/architecture-review[-id]), delivered direct-push, so the
+    written review (docs/architecture-review.md + ADR drafts) lands as a
+    reviewable branch. The review ends with a proposed_tasks block whose
+    remediation items land as drafts requiring approval. repo must be an absolute
+    path to a git repo within the configured allowlist. Returns the job id+state."""
+    cfg = _cfg()
+    if not repo_path_allowed(repo, cfg):
+        raise ValueError(f"repo path not in allowlist: {repo}")
+    record = _store().put(_analyze_job_spec(repo, base_branch=base_branch, id=id))
+    return {"id": record["id"], "state": record["state"]}
+
+
 @mcp.tool()
 @audited
 def list_tasks(state: str | None = None) -> list[dict[str, Any]]:
