@@ -5,4 +5,4 @@ a laptop's Claude over MCP) without depending on the Hermes gateway. Jobs execut
 via the Claude Code CLI (`claude -p`) on the user's subscription.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
