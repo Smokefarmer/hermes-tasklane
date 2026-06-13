@@ -30,7 +30,7 @@ BRANCH_MODES = {item.value for item in BranchMode}
 DELIVERY_MODES = {item.value for item in DeliveryMode}
 
 # Stage roles that select a role-based prompt template (see tasklane.prompts).
-ROLES = {"plan", "implement", "review", "fix"}
+ROLES = {"plan", "implement", "review", "fix", "audit"}
 
 _REQUEST_TYPE_ALIASES = {
     "bug": RequestType.BUG_SMALL.value,

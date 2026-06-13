@@ -80,7 +80,7 @@ def _role_record(role: str, body: str = "Do the snap thing."):
 # --------------------------------------------------------------------------- #
 # template loading
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("role", ["plan", "implement", "review", "fix"])
+@pytest.mark.parametrize("role", ["plan", "implement", "review", "fix", "audit"])
 def test_load_template_for_every_role(role):
     template = load_template(role)
     assert template is not None
@@ -91,7 +91,7 @@ def test_load_template_for_every_role(role):
 
 
 def test_roles_constant_matches_templates():
-    assert set(ROLES) == {"plan", "implement", "review", "fix"}
+    assert set(ROLES) == {"plan", "implement", "review", "fix", "audit"}
 
 
 def test_load_template_normalizes_role():
@@ -196,6 +196,31 @@ def test_job_prompt_implement_role_has_tdd_contract():
     prompt = job_prompt(_role_record("implement"))
     assert "failing test first" in prompt.lower()
     assert "never weaken a test" in prompt.lower()
+
+
+def test_job_prompt_audit_role_has_owasp_decomposition_and_rules():
+    prompt = job_prompt(_role_record("audit"))
+    # OWASP Top 10 spine + survey-first instruction
+    assert "OWASP Top 10" in prompt
+    assert "survey" in prompt.lower() and "attack surface" in prompt.lower()
+    # decomposition: proposed_tasks contract with its scoped-child fields
+    assert "proposed_tasks" in prompt
+    assert "allowed_paths" in prompt
+    assert "severity_rationale" in prompt
+    # same JSON findings contract as the review role (rendered, braces un-escaped)
+    assert '"severity":"critical|high|medium|low"' in prompt
+    assert '"suggestion"' in prompt
+    assert "VERDICT:" in prompt
+    # hard rules: never exploit / never exfiltrate / never modify, secrets = CRITICAL
+    lower = prompt.lower()
+    assert "never exploit" in lower
+    assert "never exfiltrate" in lower
+    assert "must not modify" in lower
+    assert "hardcoded secret" in lower and "rotat" in lower
+    # placeholders are all filled (no leftover braces from our field set)
+    for placeholder in ("{job_id}", "{body}", "{branch_contract}", "{scope_contract}",
+                        "{delivery_contract}", "{upstream_context}"):
+        assert placeholder not in prompt
 
 
 def test_job_prompt_without_role_matches_snapshot():
