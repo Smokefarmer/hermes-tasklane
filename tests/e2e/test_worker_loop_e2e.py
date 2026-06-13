@@ -78,3 +78,26 @@ def test_worker_loop_recovers_orphan_on_startup(tasklane_home, fake_claude, git_
     assert final["state"] == "completed", final.get("last_error")
     events = [e["event_type"] for e in store.events("e2e-orphan")]
     assert "job_orphan_detected" in events
+
+
+def test_worker_fans_out_proposed_drafts(tasklane_home, fake_claude, git_repo, monkeypatch, running_worker):
+    """A completed job whose final response proposes follow-ups creates DRAFT jobs
+    that the worker never claims (they stay draft until a human approves them)."""
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "propose")
+    store = JobStore()
+    store.ensure_dirs()
+    store.put(job_spec(git_repo, "e2e-propose"))
+
+    parent = wait_for_state(store, "e2e-propose", {"completed", "blocked", "failed"})
+    assert parent["state"] == "completed", parent.get("last_error")
+
+    draft = wait_for_state(store, "e2e-propose-p01", {"draft"})
+    assert draft["spec"]["source"]["proposed_by"] == "e2e-propose"
+    assert draft["spec"]["repo"]["path"] == str(git_repo)
+    assert draft["spec"]["branch"]["mode"] == "detached-review"
+    assert draft["spec"]["delivery_mode"] == "report-only"
+
+    # the draft must not be picked up by the running worker — give it time to try
+    time.sleep(1.0)
+    assert store.get("e2e-propose-p01")["state"] == "draft"
+    assert store.get("e2e-propose-p02")["state"] == "draft"

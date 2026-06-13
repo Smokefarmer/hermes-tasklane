@@ -70,6 +70,14 @@ def main() -> None:
 
     if scenario == "report_only":
         out("Analysis complete. No changes required.")
+    elif scenario == "propose":
+        # report-only run that proposes two follow-up jobs via a fenced block
+        proposals = json.dumps([
+            {"title": "Investigate flaky test", "body": "look into the retry",
+             "type": "task-small", "allowed_paths": ["tests"], "severity": "medium"},
+            {"title": "Harden input validation", "body": "validate the boundary"},
+        ])
+        out(f"Analysis complete. Proposing follow-ups:\n\n```proposed_tasks\n{proposals}\n```\n")
     elif scenario == "error":
         out("simulated agent failure", is_error=True)
     elif scenario == "commit_and_push":

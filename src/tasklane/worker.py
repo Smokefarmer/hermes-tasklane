@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from tasklane.config import Config, load_config
+from tasklane.fanout import create_proposed_drafts
 from tasklane.metrics import merge_metrics, run_metrics, spend_last_24h
 from tasklane.paths import logs_root
 from tasklane.reconcile import backoff_not_before, reconcile
@@ -146,6 +147,20 @@ def inject_upstream_context(store: JobStore, record: Dict[str, Any]) -> Dict[str
     return prepared
 
 
+def _fanout_proposals(store: JobStore, completed: Dict[str, Any], final_response: str) -> None:
+    """Create draft jobs from a completed job's proposed_tasks block (best-effort).
+
+    Fan-out must never turn a successfully completed job into a failure, so any
+    unexpected error is swallowed and recorded as an event rather than raised.
+    """
+    job_id = str(completed.get("id") or "")
+    try:
+        create_proposed_drafts(store, completed, final_response)
+    except Exception as exc:  # noqa: BLE001 — fan-out is best-effort post-completion
+        logger.warning("Job %s fan-out error: %s", job_id, exc)
+        store.append_event(job_id, "job_fanout_error", reason=str(exc))
+
+
 def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
     """Execute one already-claimed (running) job to completion/failure."""
     job_id = str(record.get("id") or "")
@@ -218,10 +233,11 @@ def run_job(store: JobStore, cfg: Config, record: Dict[str, Any]) -> None:
             return
 
         cleanup_worktree(worktree_info, keep=False)
-        store.complete(job_id, run_id=job_id,
-                       result={"final_response": final_response[:8000], "delivery_validation": validation},
-                       metrics=_job_metrics())
+        completed = store.complete(job_id, run_id=job_id,
+                                   result={"final_response": final_response[:8000], "delivery_validation": validation},
+                                   metrics=_job_metrics())
         logger.info("Job %s completed", job_id)
+        _fanout_proposals(store, completed, final_response)
 
     except WorktreePreparationError as exc:
         _append_log(job_id, f"WORKSPACE ERROR: {exc}")
